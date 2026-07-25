@@ -28,6 +28,7 @@ class E11Camera(E11Entity, Camera):
     _attr_use_stream_for_stills = False
 
     def __init__(self, runtime: E11RuntimeData) -> None:
+        Camera.__init__(self)
         super().__init__(runtime, "camera")
 
     @property

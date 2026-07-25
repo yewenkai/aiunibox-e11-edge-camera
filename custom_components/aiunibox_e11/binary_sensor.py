@@ -61,11 +61,11 @@ class E11BinarySensor(E11Entity, BinarySensorEntity):
         description: E11BinaryDescription,
     ) -> None:
         super().__init__(runtime, description.key)
-        self.entity_description = description
+        self._description = description
         self._attr_name = description.name
         self._attr_device_class = description.device_class
 
     @property
     def is_on(self) -> bool:
         """Return the current boolean state."""
-        return bool((self.coordinator.data or {}).get(self.entity_description.field))
+        return bool((self.coordinator.data or {}).get(self._description.field))

@@ -65,14 +65,15 @@ class E11Button(E11Entity, ButtonEntity):
         description: E11ButtonDescription,
     ) -> None:
         super().__init__(runtime, description.key)
-        self.entity_description = description
+        self._description = description
         self._attr_name = description.name
         self._attr_icon = description.icon
         self._attr_entity_category = description.category
+        self._attr_device_class = None
 
     async def async_press(self) -> None:
         """Execute the associated command."""
-        action = self.entity_description.action
+        action = self._description.action
         steps = round(DEFAULT_STEP_ANGLE * 2986 / 360)
         if action == "pan_left":
             await self.runtime.client.async_motor("left", steps, DEFAULT_SPEED)
