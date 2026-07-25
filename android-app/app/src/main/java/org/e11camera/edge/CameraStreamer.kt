@@ -138,17 +138,16 @@ class CameraStreamer(private val context: Context) {
         // 编码器 Surface（零拷贝主路径）
         val encSurface = h264Encoder?.inputSurface
 
-        // 组装输出 Surface：只用编码器 + 预览（去掉 ImageReader 省CPU）
+        // 组装输出 Surface：编码器零拷贝主路径 + 低频 JPEG 快照 + 本地预览。
+        // ImageReader 每帧只做快速丢弃，每 30 帧才压缩一张 JPEG，不回退到
+        // 早期“每帧 YUV 转 JPEG”的高 CPU 路径。
         val targets = ArrayList<Surface>()
         if (encSurface != null) targets.add(encSurface)
         previewSurface?.let { targets.add(it) }
-        // 如果编码器 Surface 不可用，回退到 ImageReader
-        if (encSurface == null) {
-            val reader = ImageReader.newInstance(WIDTH, HEIGHT, ImageFormat.YUV_420_888, 2)
-            reader.setOnImageAvailableListener({ onImage(it) }, handler)
-            imageReader = reader
-            targets.add(reader.surface)
-        }
+        val reader = ImageReader.newInstance(WIDTH, HEIGHT, ImageFormat.YUV_420_888, 2)
+        reader.setOnImageAvailableListener({ onImage(it) }, handler)
+        imageReader = reader
+        targets.add(reader.surface)
 
         try {
             c.createCaptureSession(
@@ -213,6 +212,24 @@ class CameraStreamer(private val context: Context) {
             closeCameraOnly()
             scheduleRetry(300)
         }
+    }
+
+    /** 隐私模式暂停采集；保留工作线程，使摄像头可以原地恢复。 */
+    fun pause() {
+        desiredRunning.set(false)
+        handler.removeCallbacks(retryRunnable)
+        closeCameraOnly()
+        h264Encoder?.stop()
+        h264Encoder = null
+        synchronized(this) {
+            latestJpeg = ByteArray(0)
+        }
+        Log.i(TAG, "摄像头已暂停")
+    }
+
+    /** 从隐私模式恢复采集。 */
+    fun resume() {
+        start()
     }
 
     private fun closeCameraOnly() {

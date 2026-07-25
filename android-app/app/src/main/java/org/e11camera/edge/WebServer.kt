@@ -3,6 +3,8 @@ package org.e11camera.edge
 import android.content.Context
 import android.util.Log
 import fi.iki.elonen.NanoHTTPD
+import org.json.JSONArray
+import org.json.JSONObject
 import java.io.ByteArrayInputStream
 import java.io.InputStream
 
@@ -24,6 +26,8 @@ class WebServer(
     private val context: Context,
     private val streamer: CameraStreamer,
     private val motor: MotorController,
+    private val state: DeviceStateStore,
+    private val security: ApiSecurity,
     port: Int = 8080
 ) : NanoHTTPD(port) {
 
@@ -36,19 +40,25 @@ class WebServer(
     override fun serve(session: IHTTPSession): Response {
         val uri = session.uri
         val params = session.parms
-        Log.i(TAG, "请求: ${session.method} $uri params=$params")
+        Log.i(TAG, "请求: ${session.method} $uri")
         return try {
             when {
                 uri == "/" || uri == "/index.html" -> serveIndex()
+                uri == "/api/info" -> apiInfo()
+                !security.isAuthorized(session) -> unauthorized()
                 uri == "/stream" -> serveMjpeg()
                 uri == "/snapshot" -> serveSnapshot()
                 uri == "/h264" -> serveH264()
                 uri.startsWith("/api/motor") -> apiMotor(params)
+                uri.startsWith("/api/preset") -> apiPreset(params)
+                uri.startsWith("/api/position") -> apiPosition(params)
                 uri.startsWith("/api/led") -> apiLed(params)
+                uri.startsWith("/api/statusled") -> apiStatusLed(params)
                 uri.startsWith("/api/alloff") -> apiAllOff()
                 uri.startsWith("/api/filllight") -> apiFillLight(params)
                 uri.startsWith("/api/ircut") -> apiIrcut(params)
                 uri.startsWith("/api/scene") -> apiScene(params)
+                uri.startsWith("/api/privacy") -> apiPrivacy(params)
                 uri.startsWith("/api/status") -> apiStatus()
                 else -> newFixedLengthResponse(
                     Response.Status.NOT_FOUND, MIME_PLAINTEXT, "404"
@@ -206,6 +216,64 @@ class WebServer(
         }
     }
 
+    private fun apiPreset(p: Map<String, String>): Response {
+        val action = p["action"] ?: "list"
+        val name = p["name"] ?: "home"
+        val speed = (p["speed"] ?: "400").toIntOrNull() ?: 400
+        return when (action) {
+            "list" -> json(
+                JSONObject()
+                    .put("ok", true)
+                    .put("presets", JSONArray(state.presetNames()))
+                    .toString()
+            )
+            "save" -> {
+                val saved = state.savePreset(name)
+                json(
+                    JSONObject()
+                        .put("ok", saved)
+                        .put("action", "save")
+                        .put("name", name)
+                        .put("positionSteps", state.positionSteps())
+                        .apply { if (!saved) put("error", "invalid_preset_name") }
+                        .toString()
+                )
+            }
+            "goto" -> {
+                val target = state.presetPosition(name)
+                    ?: return json("""{"ok":false,"error":"preset_not_found"}""")
+                val accepted = motor.moveTo(target, speed)
+                json(
+                    JSONObject()
+                        .put("ok", accepted)
+                        .put("action", "goto")
+                        .put("name", name)
+                        .put("targetSteps", target)
+                        .apply { if (!accepted) put("error", "motor_busy") }
+                        .toString()
+                )
+            }
+            else -> json("""{"ok":false,"error":"unknown_preset_action"}""")
+        }
+    }
+
+    private fun apiPosition(p: Map<String, String>): Response {
+        return when (p["action"] ?: "get") {
+            "get" -> json(
+                JSONObject()
+                    .put("ok", true)
+                    .put("positionSteps", state.positionSteps())
+                    .put("positionDegrees", state.positionDegrees())
+                    .toString()
+            )
+            "zero" -> {
+                state.setSoftZero()
+                json("""{"ok":true,"action":"soft_zero","positionSteps":0}""")
+            }
+            else -> json("""{"ok":false,"error":"unknown_position_action"}""")
+        }
+    }
+
     private fun apiLed(p: Map<String, String>): Response {
         val name = p["name"] ?: "ir"
         val level = (p["level"] ?: "0").toIntOrNull() ?: 0
@@ -213,6 +281,23 @@ class WebServer(
             return json("""{"ok":false,"error":"unsupported_led"}""")
         }
         return json("""{"ok":true,"led":"$name","level":$level}""")
+    }
+
+    private fun apiStatusLed(p: Map<String, String>): Response {
+        val red = (p["r"] ?: "0").toIntOrNull()?.coerceIn(0, 255) ?: 0
+        val green = (p["g"] ?: "0").toIntOrNull()?.coerceIn(0, 255) ?: 0
+        val blue = (p["b"] ?: "0").toIntOrNull()?.coerceIn(0, 255) ?: 0
+        LedController.setLed("red", red)
+        LedController.setLed("green", green)
+        LedController.setLed("blue", blue)
+        return json(
+            JSONObject()
+                .put("ok", true)
+                .put("red", red)
+                .put("green", green)
+                .put("blue", blue)
+                .toString()
+        )
     }
 
     private fun apiAllOff(): Response {
@@ -223,33 +308,95 @@ class WebServer(
     private fun apiFillLight(p: Map<String, String>): Response {
         val level = (p["level"] ?: "0").toIntOrNull() ?: 0
         LedController.setFillLight(level)
-        return json("""{"ok":true,"filllight":$level}""")
+        state.fillLightLevel = level
+        return json("""{"ok":true,"filllight":${level.coerceIn(0, 255)}}""")
     }
 
     private fun apiIrcut(p: Map<String, String>): Response {
         val on = p["on"]?.toBoolean() ?: false
         LedController.setIrcut(on)
+        state.ircutEnabled = on
         return json("""{"ok":true,"ircut":${if (on) "night" else "day"}}""")
     }
 
     private fun apiScene(p: Map<String, String>): Response {
         val mode = (p["mode"] ?: "0").toIntOrNull() ?: 0
         LedController.setSceneMode(mode)
+        state.sceneMode = mode
         val names = arrayOf("day", "night", "auto")
         return json("""{"ok":true,"scene":"${names[mode.coerceIn(0, 2)]}"}""")
+    }
+
+    private fun apiPrivacy(p: Map<String, String>): Response {
+        val enabled = p["on"]?.toBoolean() ?: false
+        val changed = MonitorService.instance?.setPrivacyMode(enabled) == true
+        return json(
+            JSONObject()
+                .put("ok", changed)
+                .put("privacy", enabled)
+                .apply { if (!changed) put("error", "service_unavailable") }
+                .toString()
+        )
+    }
+
+    private fun apiInfo(): Response {
+        val id = android.provider.Settings.Secure.getString(
+            context.contentResolver,
+            android.provider.Settings.Secure.ANDROID_ID
+        ) ?: "unknown"
+        return json(
+            JSONObject()
+                .put("ok", true)
+                .put("name", "AIUniBOX-E11 Edge Camera")
+                .put("model", android.os.Build.MODEL)
+                .put("deviceId", id)
+                .put("apiVersion", 2)
+                .put("appVersion", BuildConfig.VERSION_NAME)
+                .put("authRequired", security.isEnabled)
+                .toString()
+        )
     }
 
     private fun apiStatus(): Response {
         val ip = NetworkUtil.getIpAddress(context)
         val encoder = streamer.h264Encoder
         val service = MonitorService.instance
-        return json(
-            """{"ok":true,"ip":"$ip","cameraOn":${streamer.isRunning},"streamReady":${encoder?.isOutputHealthy() == true},"rtspPublishing":${service?.isRtspPublishing() == true},"encodedFrames":${encoder?.outputFrameCount ?: 0},"motorBusy":${motor.isBusy()},"uptimeSeconds":${service?.uptimeSeconds() ?: 0}}"""
+        val leds = JSONObject()
+        for (name in LedController.allLeds) leds.put(name, LedController.getLed(name))
+        return json(JSONObject()
+            .put("ok", true)
+            .put("ip", ip)
+            .put("cameraOn", streamer.isRunning)
+            .put("streamReady", encoder?.isOutputHealthy() == true)
+            .put("rtspPublishing", service?.isRtspPublishing() == true)
+            .put("encodedFrames", encoder?.outputFrameCount ?: 0)
+            .put("motorBusy", motor.isBusy())
+            .put("uptimeSeconds", service?.uptimeSeconds() ?: 0)
+            .put("watching", service?.isWatching() == true)
+            .put("privacy", state.privacyMode)
+            .put("positionSteps", state.positionSteps())
+            .put("positionDegrees", state.positionDegrees())
+            .put("presets", JSONArray(state.presetNames()))
+            .put("sceneMode", state.sceneMode)
+            .put("ircut", state.ircutEnabled)
+            .put("fillLight", state.fillLightLevel)
+            .put("leds", leds)
+            .toString()
         )
     }
 
     private fun json(s: String): Response =
         newFixedLengthResponse(Response.Status.OK, "application/json", s).apply {
             addHeader("Cache-Control", "no-store")
+        }
+
+    private fun unauthorized(): Response =
+        newFixedLengthResponse(
+            Response.Status.UNAUTHORIZED,
+            "application/json",
+            """{"ok":false,"error":"unauthorized"}"""
+        ).apply {
+            addHeader("Cache-Control", "no-store")
+            addHeader("WWW-Authenticate", "Bearer")
         }
 }

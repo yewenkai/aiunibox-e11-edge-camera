@@ -1,0 +1,44 @@
+{
+  "title": "AIUniBOX-E11 边缘摄像头",
+  "config": {
+    "step": {
+      "user": {
+        "title": "连接 AIUniBOX-E11",
+        "description": "输入中屏的局域网地址和部署时生成的 API Token。",
+        "data": {
+          "host": "设备 IP 或主机名",
+          "api_port": "HTTP API 端口",
+          "rtsp_port": "RTSP 端口",
+          "token": "API Token",
+          "name": "设备名称"
+        }
+      },
+      "reauth_confirm": {
+        "title": "更新 API Token",
+        "description": "设备拒绝了当前 Token，请输入新的 Token。",
+        "data": {
+          "token": "API Token"
+        }
+      },
+      "reconfigure": {
+        "title": "重新配置 AIUniBOX-E11",
+        "data": {
+          "host": "设备 IP 或主机名",
+          "api_port": "HTTP API 端口",
+          "rtsp_port": "RTSP 端口",
+          "token": "API Token",
+          "name": "设备名称"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "无法连接设备，请检查 IP、端口和局域网。",
+      "invalid_auth": "API Token 无效。"
+    },
+    "abort": {
+      "already_configured": "该设备已经配置。",
+      "reauth_successful": "API Token 已更新。",
+      "reconfigure_successful": "设备配置已更新。"
+    }
+  }
+}

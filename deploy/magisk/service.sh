@@ -5,6 +5,7 @@ LOG=/data/local/tmp/e11_camera_service.log
 MEDIAMTX_LOG=/data/local/tmp/e11_camera_mediamtx.log
 WATCHDOG_PID=/data/local/tmp/e11_camera_watchdog.pid
 APP_PKG=org.e11camera.edge
+TOKEN_FILE=/data/local/tmp/e11-edge-camera/api_token
 
 log() { echo "$(date '+%m-%d %H:%M:%S') $1" >> "$LOG"; }
 
@@ -64,7 +65,10 @@ sleep 8
 # 3) App 与内置 RTSP 直推健康检查。连续失败时重建 App 进程。
 FAIL_COUNT=0
 while true; do
-    STATUS=$(/system/bin/busybox wget -qO- http://127.0.0.1:8080/api/status 2>/dev/null)
+    TOKEN=$(cat "$TOKEN_FILE" 2>/dev/null)
+    STATUS_URL=http://127.0.0.1:8080/api/status
+    [ -n "$TOKEN" ] && STATUS_URL="$STATUS_URL?token=$TOKEN"
+    STATUS=$(/system/bin/busybox wget -qO- "$STATUS_URL" 2>/dev/null)
     if echo "$STATUS" | grep -q '"streamReady":true' &&
         echo "$STATUS" | grep -q '"rtspPublishing":true'; then
         FAIL_COUNT=0

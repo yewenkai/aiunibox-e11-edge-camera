@@ -28,6 +28,9 @@ class ViewerWatcher(
     private val scheduler = Executors.newSingleThreadScheduledExecutor()
     private val wasWatching = AtomicBoolean(false)
 
+    val isWatching: Boolean
+        get() = wasWatching.get()
+
     fun start() {
         // 标记由 mediamtx 的会话级 hook 维护。这里不主动清零，
         // 避免 App 重启时把仍在观看的会话误判为无人观看。
@@ -60,5 +63,6 @@ class ViewerWatcher(
         if (wasWatching.get()) {
             LedController.setLed(watchLed, 0)
         }
+        wasWatching.set(false)
     }
 }

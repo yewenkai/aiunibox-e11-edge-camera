@@ -13,7 +13,9 @@ import java.util.concurrent.atomic.AtomicInteger
  *
  * 所有命令在单线程队列上串行执行，避免并发转动冲突。
  */
-class MotorController {
+class MotorController(
+    private val state: DeviceStateStore
+) {
     companion object {
         private const val TAG = "MotorController"
         private const val TEST_BIN = "/vendor/bin/hw/ipcamera_test"
@@ -33,15 +35,20 @@ class MotorController {
      * 用户确认的最终映射：对应硬件方向 1。
      */
     fun turnLeft(steps: Int, speed: Int): Boolean =
-        rotate(SCREEN_LEFT_HARDWARE_DIR, steps, speed)
+        rotate(SCREEN_LEFT_HARDWARE_DIR, steps, speed, positiveDelta = true)
 
     /** 让观看画面向右移动；用户确认的最终映射为硬件方向 0。 */
     fun turnRight(steps: Int, speed: Int): Boolean =
-        rotate(SCREEN_RIGHT_HARDWARE_DIR, steps, speed)
+        rotate(SCREEN_RIGHT_HARDWARE_DIR, steps, speed, positiveDelta = false)
 
     /** hardwareDir 只作为厂商底层方向值；用户侧语义以画面移动方向为准。 */
     @Synchronized
-    private fun rotate(hardwareDir: Int, steps: Int, speedIn: Int): Boolean {
+    private fun rotate(
+        hardwareDir: Int,
+        steps: Int,
+        speedIn: Int,
+        positiveDelta: Boolean
+    ): Boolean {
         if (exec.isShutdown || pendingActions.get() >= MAX_PENDING_ACTIONS) {
             Log.w(TAG, "电机队列已满或控制器已关闭，忽略请求")
             return false
@@ -56,7 +63,10 @@ class MotorController {
         try {
             exec.submit {
                 try {
-                    ShellUtil.execSu(cmd)
+                    val result = ShellUtil.execSu(cmd)
+                    if (!result.startsWith("ERROR:")) {
+                        state.applyMovement(if (positiveDelta) s else -s)
+                    }
                 } finally {
                     pendingActions.decrementAndGet()
                 }
@@ -66,6 +76,16 @@ class MotorController {
             return false
         }
         return true
+    }
+
+    /** 移动到软件预置位；不调用存在持续励磁风险的厂商硬件复位。 */
+    fun moveTo(targetSteps: Int, speed: Int): Boolean {
+        var delta = targetSteps - state.positionSteps()
+        val half = STEPS_PER_CIRCLE / 2
+        if (delta > half) delta -= STEPS_PER_CIRCLE
+        if (delta < -half) delta += STEPS_PER_CIRCLE
+        if (delta == 0) return true
+        return if (delta > 0) turnLeft(delta, speed) else turnRight(-delta, speed)
     }
 
     /** 读取传感器位置数据 */

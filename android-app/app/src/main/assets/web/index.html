@@ -80,6 +80,10 @@
   }
   .toggle-btn:active { background: #2563eb; color: #fff; }
   input[type=range] { width: 120px; vertical-align: middle; accent-color: #3d6dd6; }
+  input[type=password] {
+    flex: 1; min-width: 180px; background: #111827; color: #fff;
+    border: 1px solid #3a4258; border-radius: 6px; padding: 8px 10px;
+  }
 
   .status {
     margin-top: 14px; text-align: center; font-size: 11px; color: #4b5563;
@@ -100,6 +104,14 @@
     <iframe id="webrtc" src="" allow="autoplay"></iframe>
     <span class="badge off" id="liveBadge">● 连接中</span>
     <span class="fps-badge" id="fpsBadge">WebRTC</span>
+  </div>
+
+  <div class="section" id="authSection" style="display:none">
+    <div class="section-title">局域网 API 鉴权</div>
+    <div class="ctrl-row">
+      <input type="password" id="apiToken" placeholder="请输入部署时生成的 API Token">
+      <button class="toggle-btn" id="saveToken">连接</button>
+    </div>
   </div>
 
   <!-- 云台 -->
@@ -208,15 +220,32 @@ function initWebRTC() {
 initWebRTC();
 
 // ===== API =====
+const tokenKey = 'e11_api_token';
+let apiToken = sessionStorage.getItem(tokenKey) || '';
+function authHeaders() {
+  return apiToken ? { 'Authorization': `Bearer ${apiToken}` } : {};
+}
 async function api(path) {
   try {
-    const r = await fetch(path);
+    const r = await fetch(path, { headers: authHeaders(), cache: 'no-store' });
+    if (r.status === 401) {
+      $('authSection').style.display = 'block';
+      toast('请输入 API Token');
+      return null;
+    }
     return await r.json();
   } catch (e) {
     toast('请求失败');
     return null;
   }
 }
+
+$('saveToken').addEventListener('click', () => {
+  apiToken = $('apiToken').value.trim();
+  sessionStorage.setItem(tokenKey, apiToken);
+  $('authSection').style.display = 'none';
+  refreshStatus();
+});
 
 function getSteps() { return parseInt($('steps').value); }
 function getSpeed() { return parseInt($('speed').value); }
@@ -301,8 +330,8 @@ $('allOff').addEventListener('click', async () => {
 let lastFrameCount = 0, lastStatusAt = Date.now();
 async function refreshStatus() {
   try {
-    const r = await fetch('/api/status', { cache: 'no-store' });
-    const j = await r.json();
+    const j = await api('/api/status');
+    if (!j) return;
     const now = Date.now();
     const elapsed = Math.max((now - lastStatusAt) / 1000, 0.1);
     const fps = lastFrameCount > 0 ? Math.max(0, (j.encodedFrames - lastFrameCount) / elapsed) : 0;

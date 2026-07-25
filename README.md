@@ -28,6 +28,9 @@ GitHub Actions 仅验证源码是否可以编译，不上传 APK 或其他构建
 - 水平云台点动与长按连续调整
 - 红外灯、补光灯、IR-CUT 和 RGB 状态灯控制
 - 有观看者时亮灯提示
+- Bearer Token 保护设备 HTTP API
+- Home Assistant / HACS 自定义集成
+- 云台软件零点、常用位置与隐私模式
 - Magisk/service.d 开机启动与健康守护示例
 
 本项目目前是面向 AIUniBOX-E11 样机的实验性实现，不是通用摄像头应用。云台和灯光功能依赖设备已经存在的本地硬件控制接口。
@@ -107,7 +110,34 @@ adb shell pm grant org.e11camera.edge android.permission.CAMERA
 | RTSP | `rtsp://<device-ip>:8554/cam` |
 | WebRTC | `http://<device-ip>:8889/cam/` |
 
-控制接口当前没有用户认证，只应在可信局域网或可信 VPN 内访问。不要把 8080、8554、8889 直接映射到公网，详见 [SECURITY.md](SECURITY.md)。
+### 启用 API Token
+
+应用启动时会读取 `/data/local/tmp/e11-edge-camera/api_token`。文件存在且非空时，
+除首页和 `/api/info` 外的 HTTP 接口都要求 Bearer Token：
+
+```bash
+adb shell "su -c 'mkdir -p /data/local/tmp/e11-edge-camera && chmod 700 /data/local/tmp/e11-edge-camera'"
+adb shell "su -c 'printf %s your-random-token > /data/local/tmp/e11-edge-camera/api_token && chmod 600 /data/local/tmp/e11-edge-camera/api_token'"
+```
+
+浏览器控制页会在首次控制时提示输入 Token，并只保存到当前浏览器会话。MediaMTX
+的 RTSP、HLS 和 WebRTC 鉴权需要单独配置；因此即使启用了 API Token，也不要把
+8080、8554、8888、8889 直接映射到公网，详见 [SECURITY.md](SECURITY.md)。
+
+## Home Assistant 接入
+
+本仓库包含 `custom_components/aiunibox_e11`，可通过 HACS 自定义仓库安装：
+
+1. 在 HACS 中添加 `https://github.com/yewenkai/aiunibox-e11-edge-camera`，类型选择“集成”。
+2. 下载 `AIUniBOX-E11 Edge Camera` 并重启 Home Assistant。
+3. 在“设置 → 设备与服务 → 添加集成”中搜索 `AIUniBOX-E11`。
+4. 输入设备 IP、HTTP/RTSP 端口和设备 API Token。
+
+集成会创建摄像头、云台按钮、补光灯、RGB 状态灯、夜视场景、IR-CUT、隐私模式、
+视频流状态、正在观看状态、软件角度和运行时间等实体。
+
+云台位置是软件累计值。首次部署时请把镜头转到希望作为中心的位置，再按一次
+“当前位置设为零点”；如果曾绕过本应用直接执行厂商电机命令，需要重新设置软件零点。
 
 ## NPU 与轻量视觉路线
 
@@ -125,6 +155,8 @@ NPU 推理尚未实现。Rockchip RKNN 工具链和模型文件不会直接提�
 ```text
 .
 ├── android-app/           Android Camera2 / MediaCodec / 控制页源码
+├── custom_components/     Home Assistant 自定义集成
+├── brand/                 HACS 展示图标
 ├── deploy/magisk/         MediaMTX 最小配置与开机守护示例
 ├── docs/                  移植和 NPU 路线文档
 ├── LICENSE                本项目 MIT License

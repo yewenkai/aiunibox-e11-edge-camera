@@ -15,6 +15,7 @@ object LedController {
 
     /** sysfs 控制的所有 LED 名 */
     val allLeds = listOf("blue", "green", "red", "ir", "camera", "work")
+    private val knownLevels = java.util.concurrent.ConcurrentHashMap<String, Int>()
 
     /** 设置 LED 亮度（sysfs 路径），level 0~255
      *  对 work 灯：先解绑 heartbeat trigger，再写亮度 */
@@ -26,14 +27,18 @@ object LedController {
             ShellUtil.execSu("echo none > /sys/class/leds/work/trigger")
         }
         ShellUtil.execSu("echo $l > /sys/class/leds/$name/brightness")
+        knownLevels[name] = l
         return true
     }
 
     /** 读取 LED 当前亮度 */
     fun getLed(name: String): Int {
         if (name !in allLeds) return 0
+        knownLevels[name]?.let { return it }
         val out = ShellUtil.execSu("cat /sys/class/leds/$name/brightness")
-        return out.trim().toIntOrNull() ?: 0
+        val value = out.trim().toIntOrNull() ?: 0
+        knownLevels[name] = value
+        return value
     }
 
     /** 关闭所有灯（RGB + IR + 补光 + 心跳） */

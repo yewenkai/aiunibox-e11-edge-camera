@@ -35,6 +35,7 @@ class MonitorService : Service() {
     private var server: WebServer? = null
     private var viewerWatcher: ViewerWatcher? = null
     private var rtspPublisher: RtspPublisher? = null
+    private var deviceState: DeviceStateStore? = null
     private var startedAtMs: Long = 0
     private val healthScheduler = Executors.newSingleThreadScheduledExecutor()
     @Volatile private var initializing = false
@@ -62,25 +63,25 @@ class MonitorService : Service() {
         initializing = true
         try {
             val s = CameraStreamer(this)
-            val m = MotorController()
+            val state = DeviceStateStore(this)
+            val m = MotorController(state)
 
             // 局域网 HTTP 控制服务。
-            val srv = WebServer(this, s, m, PORT)
+            val srv = WebServer(this, s, m, state, ApiSecurity(), PORT)
             srv.start(NanoHTTPD.SOCKET_READ_TIMEOUT, false)
             Log.i(TAG, "HTTP 服务已启动，端口 $PORT")
 
-            s.start()
             streamer = s
             motor = m
+            deviceState = state
             server = srv
             startedAtMs = System.currentTimeMillis()
 
-            // 内置 RTSP 直推：使用 MediaCodec 原始 PTS，避免裸流经过
-            // HTTP/ffmpeg 后时间戳成批、浏览器出现周期性停顿。
-            s.h264Encoder?.let { enc ->
-                val pub = RtspPublisher(enc, path = "cam")
-                pub.start()
-                rtspPublisher = pub
+            if (!state.privacyMode) {
+                s.start()
+                startRtspPublisher(s)
+            } else {
+                Log.i(TAG, "设备处于隐私模式，暂不启动摄像头")
             }
 
             // 启动拉流感知（有人看时亮灯）
@@ -90,6 +91,7 @@ class MonitorService : Service() {
 
             healthScheduler.scheduleAtFixedRate({
                 val current = streamer ?: return@scheduleAtFixedRate
+                if (deviceState?.privacyMode == true) return@scheduleAtFixedRate
                 val encoderHealthy = current.h264Encoder?.isOutputHealthy(10_000) == true
                 if (!current.isRunning || !encoderHealthy) {
                     Log.w(
@@ -132,6 +134,7 @@ class MonitorService : Service() {
         server = null
         streamer = null
         motor = null
+        deviceState = null
     }
 
     /** 获取采集器（供 MainActivity 设置预览 Surface） */
@@ -175,4 +178,34 @@ class MonitorService : Service() {
         if (startedAtMs == 0L) 0 else (System.currentTimeMillis() - startedAtMs) / 1000
 
     fun isRtspPublishing(): Boolean = rtspPublisher?.connected == true
+
+    fun isWatching(): Boolean = viewerWatcher?.isWatching == true
+
+    @Synchronized
+    fun setPrivacyMode(enabled: Boolean): Boolean {
+        val s = streamer ?: return false
+        val state = deviceState ?: return false
+        if (state.privacyMode == enabled) return true
+
+        state.privacyMode = enabled
+        if (enabled) {
+            rtspPublisher?.stop()
+            rtspPublisher = null
+            s.pause()
+        } else {
+            s.resume()
+            startRtspPublisher(s)
+        }
+        return true
+    }
+
+    private fun startRtspPublisher(s: CameraStreamer) {
+        // 内置 RTSP 直推：使用 MediaCodec 原始 PTS，避免裸流经过
+        // HTTP/ffmpeg 后时间戳成批、浏览器出现周期性停顿。
+        s.h264Encoder?.let { enc ->
+            val pub = RtspPublisher(enc, path = "cam")
+            pub.start()
+            rtspPublisher = pub
+        }
+    }
 }

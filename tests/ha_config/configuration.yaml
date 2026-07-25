@@ -1,0 +1,6 @@
+default_config:
+
+logger:
+  default: warning
+  logs:
+    custom_components.aiunibox_e11: debug

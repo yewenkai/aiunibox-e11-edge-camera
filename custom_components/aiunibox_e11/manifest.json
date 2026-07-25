@@ -1,0 +1,17 @@
+{
+  "domain": "aiunibox_e11",
+  "name": "AIUniBOX-E11 Edge Camera",
+  "codeowners": [
+    "@yewenkai"
+  ],
+  "config_flow": true,
+  "dependencies": [
+    "stream"
+  ],
+  "documentation": "https://github.com/yewenkai/aiunibox-e11-edge-camera",
+  "integration_type": "device",
+  "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/yewenkai/aiunibox-e11-edge-camera/issues",
+  "requirements": [],
+  "version": "0.1.0"
+}
