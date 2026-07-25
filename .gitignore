@@ -1,0 +1,24 @@
+.DS_Store
+.idea/
+.vscode/
+.gradle/
+**/build/
+local.properties
+*.iml
+*.apk
+*.aab
+*.jks
+*.keystore
+*.p12
+*.pem
+*.key
+*.crt
+.playwright-cli/
+
+# Do not commit third-party firmware, extracted applications or native binaries.
+apk/
+firmware/
+vendor/
+mediamtx
+ffmpeg
+ffprobe

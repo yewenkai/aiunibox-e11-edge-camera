@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="icon" href="data:,">
+<title>AIUniBOX-E11 Edge Camera</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: #0f1419; color: #e6e6e6;
+    min-height: 100vh; padding: 12px; -webkit-user-select: none;
+  }
+  .wrap { max-width: 760px; margin: 0 auto; }
+
+  /* 视频 */
+  .video-box {
+    position: relative; width: 100%; background: #000;
+    border-radius: 12px; overflow: hidden; aspect-ratio: 16/9;
+  }
+  .video-box canvas { width: 100%; height: 100%; display: block; }
+  .video-box iframe { width: 100%; height: 100%; border: none; }
+  .badge {
+    position: absolute; top: 8px; left: 8px;
+    background: rgba(0,0,0,0.6); color: #4ade80;
+    font-size: 12px; padding: 3px 8px; border-radius: 4px;
+    font-family: monospace;
+  }
+  .badge.off { color: #f87171; }
+  .fps-badge {
+    position: absolute; top: 8px; right: 8px;
+    background: rgba(0,0,0,0.6); color: #93c5fd;
+    font-size: 12px; padding: 3px 8px; border-radius: 4px;
+    font-family: monospace;
+  }
+
+  /* 云台 */
+  .section {
+    margin-top: 12px; background: #1a1f29; border-radius: 12px; padding: 16px;
+  }
+  .section-title { font-size: 14px; color: #9ca3af; margin-bottom: 12px; font-weight: 600; }
+
+  .pan-grid {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
+    max-width: 440px; margin: 0 auto;
+  }
+  .pan-btn {
+    background: #2d3548; color: #fff; border: none;
+    height: 60px; border-radius: 10px;
+    font-size: 22px; cursor: pointer; user-select: none;
+    transition: background .1s; display: flex; align-items: center; justify-content: center;
+    touch-action: manipulation;
+  }
+  .pan-btn:active { background: #3d6dd6; }
+  .pan-hint { color: #8f9bad; font-size: 12px; margin-top: 8px; text-align: center; }
+
+  .params {
+    display: flex; gap: 14px; margin-top: 14px; justify-content: center; flex-wrap: wrap;
+    font-size: 13px;
+  }
+  .params label { display: flex; align-items: center; gap: 6px; color: #9ca3af; }
+  select {
+    background: #2d3548; color: #fff; border: 1px solid #3a4258;
+    border-radius: 6px; padding: 5px 8px; font-size: 13px;
+  }
+
+  /* 控制 */
+  .ctrl-row {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 0; border-bottom: 1px solid #2a2f3a; flex-wrap: wrap; gap: 8px;
+  }
+  .ctrl-row:last-child { border-bottom: none; }
+  .ctrl-label { font-size: 14px; }
+  .ctrl-val { font-size: 12px; color: #6b7280; font-family: monospace; }
+  .toggle-group { display: flex; gap: 6px; flex-wrap: wrap; }
+  .toggle-btn {
+    background: #2d3548; color: #9ca3af; border: none; border-radius: 6px;
+    padding: 7px 16px; font-size: 13px; cursor: pointer; transition: background .1s;
+  }
+  .toggle-btn:active { background: #2563eb; color: #fff; }
+  input[type=range] { width: 120px; vertical-align: middle; accent-color: #3d6dd6; }
+
+  .status {
+    margin-top: 14px; text-align: center; font-size: 11px; color: #4b5563;
+    font-family: monospace;
+  }
+  .toast {
+    position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+    background: rgba(0,0,0,0.85); color: #fff; padding: 8px 18px;
+    border-radius: 20px; font-size: 13px; opacity: 0;
+    transition: opacity .3s; pointer-events: none; z-index: 999;
+  }
+  .toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="video-box">
+    <iframe id="webrtc" src="" allow="autoplay"></iframe>
+    <span class="badge off" id="liveBadge">● 连接中</span>
+    <span class="fps-badge" id="fpsBadge">WebRTC</span>
+  </div>
+
+  <!-- 云台 -->
+  <div class="section">
+    <div class="section-title">云台控制（按画面移动方向）</div>
+    <div class="pan-grid">
+      <button class="pan-btn" id="btnLeft">◀ 画面向左</button>
+      <button class="pan-btn" id="btnRight">画面向右 ▶</button>
+    </div>
+    <div class="params">
+      <label>角度:
+        <select id="steps">
+          <option value="25">~3°</option>
+          <option value="41">~5°</option>
+          <option value="83" selected>~10°</option>
+          <option value="124">~15°</option>
+          <option value="249">~30°</option>
+          <option value="498">~60°</option>
+          <option value="747">~90°</option>
+          <option value="1493">~180°</option>
+        </select>
+      </label>
+      <label>速度:
+        <select id="speed">
+          <option value="200">慢</option>
+          <option value="400" selected>中</option>
+          <option value="600">快</option>
+          <option value="854">极速</option>
+        </select>
+      </label>
+    </div>
+    <div class="pan-hint">轻触点动，按住连续调整；已禁用会锁住电机的硬件复位</div>
+  </div>
+
+  <!-- 灯光 -->
+  <div class="section">
+    <div class="section-title">灯光与夜视</div>
+
+    <div class="ctrl-row">
+      <span class="ctrl-label">红外夜视灯 <span class="ctrl-val" id="irVal">关</span></span>
+      <div class="toggle-group">
+        <button class="toggle-btn" data-led="ir" data-level="0">关</button>
+        <button class="toggle-btn" data-led="ir" data-level="128">半</button>
+        <button class="toggle-btn" data-led="ir" data-level="255">亮</button>
+      </div>
+    </div>
+
+    <div class="ctrl-row">
+      <span class="ctrl-label">补光灯 <span class="ctrl-val" id="fillVal">0</span></span>
+      <input type="range" id="fillSlider" min="0" max="255" value="0">
+      <button class="toggle-btn" id="fillApply">应用</button>
+    </div>
+
+    <div class="ctrl-row">
+      <span class="ctrl-label">IR-CUT 夜视</span>
+      <div class="toggle-group">
+        <button class="toggle-btn" data-scene="0">日间</button>
+        <button class="toggle-btn" data-scene="1">夜间</button>
+        <button class="toggle-btn" data-scene="2">自动</button>
+      </div>
+    </div>
+
+    <div class="ctrl-row">
+      <span class="ctrl-label">状态灯</span>
+      <div class="toggle-group">
+        <button class="toggle-btn" data-status-led="off">灭</button>
+        <button class="toggle-btn" data-status-led="blue">蓝</button>
+        <button class="toggle-btn" data-status-led="green">绿</button>
+        <button class="toggle-btn" data-status-led="red">红</button>
+      </div>
+    </div>
+
+    <div class="ctrl-row">
+      <span class="ctrl-label">全部关灯</span>
+      <div class="toggle-group">
+        <button class="toggle-btn" id="allOff" style="background:#7f1d1d;color:#fff">全灭</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="status" id="status">连接中...</div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+let toastTimer;
+function toast(msg) {
+  const t = $('toast');
+  t.textContent = msg; t.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove('show'), 1200);
+}
+
+// ===== 视频流：WebRTC（低延迟）嵌入 mediamtx 播放器 =====
+// mediamtx 内置 WebRTC 播放页在 :8889
+function initWebRTC() {
+  const iframe = $('webrtc');
+  const host = location.hostname;
+  if (location.protocol === 'https:') {
+    $('status').textContent = '实时画面请使用 HTTP 地址打开';
+  }
+  iframe.src = 'http://' + host + ':8889/cam/';
+}
+initWebRTC();
+
+// ===== API =====
+async function api(path) {
+  try {
+    const r = await fetch(path);
+    return await r.json();
+  } catch (e) {
+    toast('请求失败');
+    return null;
+  }
+}
+
+function getSteps() { return parseInt($('steps').value); }
+function getSpeed() { return parseInt($('speed').value); }
+
+// ===== 云台控制 =====
+async function turn(dir) {
+  const s = getSteps(), sp = getSpeed();
+  toast(`${dir === 'left' ? '◀' : '▶'} ${dir === 'left' ? '左' : '右'}转`);
+  await api(`/api/motor?dir=${dir}&steps=${s}&speed=${sp}`);
+}
+// 按住持续微调；按本次运动耗时节流，避免命令堆叠。
+let holdTimer = null;
+function startHold(dir) {
+  if (holdTimer) return;
+  turn(dir);
+  const moveMs = Math.ceil(getSteps() / getSpeed() * 1000);
+  holdTimer = setInterval(() => turn(dir), Math.max(320, moveMs + 220));
+}
+function stopHold() {
+  if (holdTimer) { clearInterval(holdTimer); holdTimer = null; }
+}
+
+function bindHold(btn, dir) {
+  btn.addEventListener('pointerdown', e => {
+    e.preventDefault();
+    btn.setPointerCapture(e.pointerId);
+    startHold(dir);
+  });
+  btn.addEventListener('pointerup', stopHold);
+  btn.addEventListener('pointercancel', stopHold);
+  btn.addEventListener('lostpointercapture', stopHold);
+}
+bindHold($('btnLeft'), 'left');
+bindHold($('btnRight'), 'right');
+
+// ===== LED / 灯光控制（事件委托）=====
+document.addEventListener('click', async (e) => {
+  const btn = e.target.closest('button');
+  if (!btn) return;
+
+  // data-led 属性
+  if (btn.dataset.led !== undefined) {
+    const led = btn.dataset.led, level = parseInt(btn.dataset.level);
+    if (led === 'ir') $('irVal').textContent = level === 0 ? '关' : (level >= 255 ? '亮' : '半');
+    await api(`/api/led?name=${led}&level=${level}`);
+    toast(`${led} = ${level}`);
+  }
+
+  // 状态灯颜色互斥，并允许明确选择熄灭。
+  if (btn.dataset.statusLed !== undefined) {
+    const selected = btn.dataset.statusLed;
+    await Promise.all(['blue', 'green', 'red'].map(name =>
+      api(`/api/led?name=${name}&level=${name === selected ? 255 : 0}`)
+    ));
+    toast(selected === 'off' ? '状态灯已灭' : `状态灯: ${selected}`);
+  }
+
+  // data-scene 属性
+  if (btn.dataset.scene !== undefined) {
+    const mode = parseInt(btn.dataset.scene);
+    const names = ['日间', '夜间', '自动'];
+    await api(`/api/scene?mode=${mode}`);
+    toast(`场景: ${names[mode]}`);
+  }
+});
+
+// 补光灯滑块
+$('fillSlider').addEventListener('input', () => $('fillVal').textContent = $('fillSlider').value);
+$('fillApply').addEventListener('click', async () => {
+  const v = $('fillSlider').value;
+  await api(`/api/filllight?level=${v}`);
+  toast(`补光 = ${v}`);
+});
+
+// 全部关灯（RGB + 补光 + IR + 心跳灯）
+$('allOff').addEventListener('click', async () => {
+  await api('/api/alloff');
+  toast('全部灯已灭');
+});
+
+// ===== 状态与自动恢复 =====
+let lastFrameCount = 0, lastStatusAt = Date.now();
+async function refreshStatus() {
+  try {
+    const r = await fetch('/api/status', { cache: 'no-store' });
+    const j = await r.json();
+    const now = Date.now();
+    const elapsed = Math.max((now - lastStatusAt) / 1000, 0.1);
+    const fps = lastFrameCount > 0 ? Math.max(0, (j.encodedFrames - lastFrameCount) / elapsed) : 0;
+    lastFrameCount = j.encodedFrames;
+    lastStatusAt = now;
+
+    const live = j.cameraOn && j.streamReady && j.rtspPublishing;
+    $('liveBadge').textContent = live ? '● LIVE' : '● 恢复中';
+    $('liveBadge').classList.toggle('off', !live);
+    $('fpsBadge').textContent = fps > 0 ? `${fps.toFixed(1)} fps` : 'WebRTC';
+    $('status').textContent =
+      `IP: ${j.ip} | 摄像头: ${j.cameraOn ? '开' : '恢复中'} | 运行: ${Math.floor(j.uptimeSeconds / 60)} 分钟`;
+  } catch (_) {
+    $('liveBadge').textContent = '● 已断开';
+    $('liveBadge').classList.add('off');
+    $('status').textContent = '设备连接中断，正在重试…';
+  }
+}
+refreshStatus();
+setInterval(refreshStatus, 3000);
+</script>
+</body>
+</html>

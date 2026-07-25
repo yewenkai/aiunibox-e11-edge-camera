@@ -1,0 +1,32 @@
+logLevel: info
+logDestinations: [stdout]
+
+api: no
+metrics: no
+pprof: no
+playback: no
+
+rtsp: yes
+protocols: [tcp]
+encryption: "no"
+rtspAddress: :8554
+
+rtmp: no
+hls: no
+srt: no
+
+webrtc: yes
+webrtcAddress: :8889
+webrtcEncryption: no
+webrtcAllowOrigin: '*'
+webrtcLocalUDPAddress: :8189
+webrtcLocalTCPAddress: ''
+webrtcIPsFromInterfaces: yes
+
+pathDefaults:
+  record: no
+
+paths:
+  cam:
+    runOnRead: /data/local/tmp/bin/hook_on.sh
+    runOnUnread: /data/local/tmp/bin/hook_off.sh
