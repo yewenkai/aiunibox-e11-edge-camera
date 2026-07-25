@@ -1,0 +1,36 @@
+name: 发布 HACS 精简包
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 校验版本号
+        run: |
+          manifest_version="$(jq -r '.version' custom_components/aiunibox_e11/manifest.json)"
+          tag_version="${GITHUB_REF_NAME#v}"
+          test "$manifest_version" = "$tag_version"
+
+      - name: 打包 HACS 集成
+        run: scripts/build_hacs_release.sh aiunibox_e11.zip
+
+      - name: 校验发布包边界
+        run: unzip -l aiunibox_e11.zip
+
+      - name: 创建 GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" aiunibox_e11.zip \
+            --verify-tag \
+            --generate-notes \
+            --title "$GITHUB_REF_NAME"

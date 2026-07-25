@@ -136,6 +136,16 @@ adb shell "su -c 'printf %s your-random-token > /data/local/tmp/e11-edge-camera/
 集成会创建摄像头、云台按钮、补光灯、RGB 状态灯、夜视场景、IR-CUT、隐私模式、
 视频流状态、正在观看状态、软件角度和运行时间等实体。
 
+HACS 版本从 v0.1.2 起使用 GitHub Release 中的 `aiunibox_e11.zip` 精简发布包。
+该 ZIP 根目录只包含 `custom_components/aiunibox_e11` 内运行集成所需的文件，
+不会把 Android 工程、Magisk 脚本或设备端文档下载到 Home Assistant。完整仓库仍
+作为设备端主仓库保留；若未来申请进入 HACS 默认仓库，可再把已经隔离好的
+`custom_components/aiunibox_e11` 迁移为独立仓库。
+
+本地可运行 `scripts/build_hacs_release.sh /tmp/aiunibox_e11.zip` 检查发布边界。
+推送与集成版本一致的 `v*` 标签后，GitHub Actions 会自动生成精简 ZIP 并创建
+Release；标签版本与 `manifest.json` 不一致时会拒绝发布。
+
 云台位置是软件累计值。首次部署时请把镜头转到希望作为中心的位置，再按一次
 “当前位置设为零点”；如果曾绕过本应用直接执行厂商电机命令，需要重新设置软件零点。
 

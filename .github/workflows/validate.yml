@@ -2,7 +2,12 @@ name: Home Assistant integration validation
 
 on:
   push:
+    branches:
+      - '**'
   pull_request:
+  release:
+    types:
+      - published
 
 jobs:
   hacs:
@@ -18,3 +23,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: home-assistant/actions/hassfest@master
+
+  deployment:
+    name: 启动脚本与精简包检查
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 校验 Magisk 脚本
+        run: sh -n deploy/magisk/service.sh
+      - name: 构建 HACS 精简包
+        run: scripts/build_hacs_release.sh /tmp/aiunibox_e11.zip

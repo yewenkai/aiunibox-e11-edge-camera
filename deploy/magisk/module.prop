@@ -1,6 +1,6 @@
 id=ptz_rtsp
 name=AIUniBOX-E11 Edge Camera Service
-version=v1.1.0
-versionCode=2
+version=v1.1.1
+versionCode=3
 author=yewenkai
 description=开机启动 E11 边缘摄像头、MediaMTX 与健康守护
