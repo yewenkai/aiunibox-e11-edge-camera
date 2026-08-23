@@ -72,3 +72,4 @@ mode: single
 - 云台位置是软件累计值，外部直接执行厂商命令会造成漂移。
 - API Token 不覆盖 MediaMTX 视频端口，需要单独配置视频鉴权或网络隔离。
 - 隐私模式会关闭 Camera2 与 RTSP 发布，但 HTTP 控制服务仍保持在线。
+- 实体镜头罩状态不是电动执行器。当前通过设备网页或 `/api/baby?mode=normal|audio_only` 手动声明；选择 `audio_only` 后只保留哭声守护，不能从遮挡画面判断成人是否在场。

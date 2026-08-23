@@ -20,6 +20,7 @@ class DeviceStateStore(context: Context) {
         private const val KEY_IRCUT = "ircut"
         private const val KEY_FILL_LIGHT = "fill_light"
         private const val KEY_BABY_MODE = "baby_monitor_enabled"
+        private const val KEY_LENS_COVER_CLOSED = "lens_cover_closed"
         private const val KEY_BABY_SENSITIVITY = "baby_sensitivity"
         private const val KEY_MOTION_ROI = "motion_roi"
         private const val LEGACY_KEY_BABY_ROI = "baby_roi"
@@ -124,6 +125,16 @@ class DeviceStateStore(context: Context) {
         get() = prefs.getBoolean(KEY_BABY_MODE, false)
         set(value) {
             prefs.edit().putBoolean(KEY_BABY_MODE, value).commit()
+        }
+
+    /**
+     * 实体镜头罩的人工声明状态。它不会关闭摄像头硬件；守护据此停用视觉分析和短片，
+     * 只保留音频检测。使用同步 commit，确保异常重启后仍按实际镜头状态恢复。
+     */
+    var lensCoverClosed: Boolean
+        get() = prefs.getBoolean(KEY_LENS_COVER_CLOSED, false)
+        set(value) {
+            prefs.edit().putBoolean(KEY_LENS_COVER_CLOSED, value).commit()
         }
 
     /** 宝宝守护灵敏度：0=低 1=中 2=高 */

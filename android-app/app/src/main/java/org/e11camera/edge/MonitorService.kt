@@ -127,13 +127,13 @@ class MonitorService : Service() {
             watcher.start()
             viewerWatcher = watcher
 
-            // 宝宝守护：开机若已启用则恢复动作+哭声检测并压制所有 LED
+            // 宝宝守护：开机若已启用则按实体镜头罩状态恢复，并压制所有 LED
             // （补光灯硬件默认常亮 255，必须主动熄灭）。
             if (state.babyMonitorEnabled) {
                 watcher.setLedSuppressed(true)
                 Thread { LedController.allOff() }.start()
                 if (!state.privacyMode) {
-                    startGuardianMonitoring(s, clipRecorder, motion, cry, npu)
+                    startConfiguredGuardianMonitoring(s, clipRecorder, motion, cry, npu)
                 }
             }
 
@@ -250,10 +250,7 @@ class MonitorService : Service() {
 
         state.privacyMode = enabled
         if (enabled) {
-            eventClipRecorder?.stop()
-            motionDetector?.stop()
-            cryDetector?.stop()
-            npuDetector?.stop()
+            stopGuardianMonitoring()
             rtspPublisher?.stop()
             rtspPublisher = null
             s.pause()
@@ -261,7 +258,7 @@ class MonitorService : Service() {
             s.resume()
             startRtspPublisher(s)
             if (state.babyMonitorEnabled) {
-                startGuardianMonitoring(s)
+                startConfiguredGuardianMonitoring(s)
             }
         }
         return true
@@ -276,16 +273,47 @@ class MonitorService : Service() {
             viewerWatcher?.setLedSuppressed(true)
             Thread { LedController.allOff() }.start()
             if (!state.privacyMode) {
-                streamer?.let { startGuardianMonitoring(it) }
+                streamer?.let { startConfiguredGuardianMonitoring(it) }
             }
         } else {
-            eventClipRecorder?.stop()
-            motionDetector?.stop()
-            cryDetector?.stop()
-            npuDetector?.stop()
+            stopGuardianMonitoring()
             viewerWatcher?.setLedSuppressed(false)
         }
         return true
+    }
+
+    /**
+     * 记录实体镜头罩的实际状态。镜头罩关闭不等于软件隐私：摄像头基础链路继续运行，
+     * 但宝宝守护停用 NPU、动作检测和事件短片，只保留哭声检测。
+     */
+    @Synchronized
+    fun setLensCoverClosed(closed: Boolean): Boolean {
+        val state = deviceState ?: return false
+        if (state.lensCoverClosed == closed) return true
+        state.lensCoverClosed = closed
+        cancelSceneCalibration()
+        if (state.babyMonitorEnabled && !state.privacyMode) {
+            streamer?.let { startConfiguredGuardianMonitoring(it) }
+        }
+        Log.i(TAG, "实体镜头罩状态已更新 closed=$closed mode=${guardianOperatingMode().apiValue}")
+        return true
+    }
+
+    private fun startConfiguredGuardianMonitoring(
+        currentStreamer: CameraStreamer,
+        clipRecorder: EventClipRecorder? = eventClipRecorder,
+        motion: MotionDetector? = motionDetector,
+        cry: CryDetector? = cryDetector,
+        npu: NpuDetector? = npuDetector
+    ) {
+        when (guardianOperatingMode()) {
+            GuardianOperatingMode.NORMAL ->
+                startGuardianMonitoring(currentStreamer, clipRecorder, motion, cry, npu)
+            GuardianOperatingMode.AUDIO_ONLY ->
+                startAudioOnlyGuardianMonitoring(clipRecorder, motion, cry, npu)
+            GuardianOperatingMode.OFF,
+            GuardianOperatingMode.PRIVACY_PAUSED -> stopGuardianMonitoring()
+        }
     }
 
     private fun startGuardianMonitoring(
@@ -303,6 +331,26 @@ class MonitorService : Service() {
         // 视觉预热完成后再启动事件源，避免首个告警撞上首轮慢推理。
         motion?.start()
         cry?.start()
+    }
+
+    private fun startAudioOnlyGuardianMonitoring(
+        clipRecorder: EventClipRecorder? = eventClipRecorder,
+        motion: MotionDetector? = motionDetector,
+        cry: CryDetector? = cryDetector,
+        npu: NpuDetector? = npuDetector
+    ) {
+        clipRecorder?.stop()
+        motion?.stop()
+        npu?.stop()
+        cry?.start()
+        Log.i(TAG, "实体镜头罩关闭：仅音频守护已启动")
+    }
+
+    private fun stopGuardianMonitoring() {
+        eventClipRecorder?.stop()
+        motionDetector?.stop()
+        cryDetector?.stop()
+        npuDetector?.stop()
     }
 
     fun setBabySensitivity(level: Int) {
@@ -385,11 +433,11 @@ class MonitorService : Service() {
     fun npuAlertRefreshAt(): Long = npuDetector?.lastAlertRefreshAt ?: 0L
 
     fun startAmbientCalibration(): Boolean =
-        deviceState?.babyMonitorEnabled == true && deviceState?.privacyMode != true &&
+        GuardianModePolicy.audioEnabled(guardianOperatingMode()) &&
             cryDetector?.startAmbientCalibration() == true
 
     fun startAdultCalibration(): Boolean =
-        deviceState?.babyMonitorEnabled == true && deviceState?.privacyMode != true &&
+        GuardianModePolicy.visualEnabled(guardianOperatingMode()) &&
             npuDetector?.startAdultCalibration() == true
 
     fun cancelSceneCalibration() {
@@ -416,16 +464,32 @@ class MonitorService : Service() {
             medianHeight = 0f, medianArea = 0f, minHeight = 0.48f, minArea = 0.14f
         )
 
-    fun supervisionState(): String =
+    fun supervisionState(): String = if (GuardianModePolicy.visualEnabled(guardianOperatingMode())) {
         (npuDetector?.supervisionState ?: SupervisionStateMachine.State.UNKNOWN).name.lowercase()
+    } else {
+        SupervisionStateMachine.State.UNKNOWN.name.lowercase()
+    }
 
-    fun notificationsArmed(): Boolean = npuDetector?.notificationsSuppressed != true
+    fun notificationsArmed(): Boolean =
+        !GuardianModePolicy.visualEnabled(guardianOperatingMode()) ||
+            npuDetector?.notificationsSuppressed != true
 
     fun lastSuppressedAlertAt(): Long = lastSuppressedAlertAt
 
     fun isBabyModeEnabled(): Boolean = deviceState?.babyMonitorEnabled == true
 
     fun isPrivacyModeOn(): Boolean = deviceState?.privacyMode == true
+
+    fun isLensCoverClosed(): Boolean = deviceState?.lensCoverClosed == true
+
+    fun guardianOperatingMode(): GuardianOperatingMode {
+        val state = deviceState ?: return GuardianOperatingMode.OFF
+        return GuardianModePolicy.resolve(
+            guardianEnabled = state.babyMonitorEnabled,
+            privacyMode = state.privacyMode,
+            lensCoverClosed = state.lensCoverClosed
+        )
+    }
 
     fun babyLastEventAt(): Long? = guardianEventStore?.list(1)?.firstOrNull()?.lastOccurredAt
 
@@ -474,7 +538,11 @@ class MonitorService : Service() {
             val currentStreamer = streamer ?: return
             val encoder = currentStreamer.h264Encoder
             val cameraExpected = !state.privacyMode
-            val guardianExpected = state.babyMonitorEnabled && cameraExpected
+            val guardianMode = GuardianModePolicy.resolve(
+                guardianEnabled = state.babyMonitorEnabled,
+                privacyMode = state.privacyMode,
+                lensCoverClosed = state.lensCoverClosed
+            )
             diagnostics.sample(
                 DeviceHealthInput(
                     cameraExpected = cameraExpected,
@@ -482,11 +550,11 @@ class MonitorService : Service() {
                     frameCapturedAt = currentStreamer.latestJpegCapturedAtMs,
                     streamReady = encoder?.isOutputHealthy() == true,
                     encodedFrameCount = encoder?.outputFrameCount ?: 0L,
-                    npuExpected = guardianExpected,
+                    npuExpected = GuardianModePolicy.visualEnabled(guardianMode),
                     npuLoaded = npuDetector?.modelLoaded == true,
                     npuAnalyzedAt = npuDetector?.lastAnalyzedAt ?: 0L,
                     npuInferenceMs = npuDetector?.lastInferenceMs ?: 0L,
-                    audioExpected = guardianExpected,
+                    audioExpected = GuardianModePolicy.audioEnabled(guardianMode),
                     audioLoaded = cryDetector?.modelLoaded == true,
                     audioAnalyzedAt = cryDetector?.lastAnalyzedAt ?: 0L,
                     freeStorageBytes = filesDir.usableSpace,
@@ -500,6 +568,7 @@ class MonitorService : Service() {
 
     /** 手动验证端侧短片链路，不发送 Bark。 */
     fun createGuardianTestClip(): Boolean {
+        if (!GuardianModePolicy.clipEnabled(guardianOperatingMode())) return false
         val store = guardianEventStore ?: return false
         val recorder = eventClipRecorder ?: return false
         val npu = npuDetector
@@ -519,8 +588,8 @@ class MonitorService : Service() {
     }
 
     /**
-     * 动作和哭声检测始终记录事件。当前帧出现两人或成人体型证据时立即暂停 Bark；
-     * 多帧确认后进入陪护缓冲状态。其余 UNKNOWN 按安全侧继续推送，避免人体漏检造成守护空窗。
+     * 正常守护在通知前复核成人陪护证据；仅音频守护不读取画面，哭声按安全侧处理。
+     * 两种模式都写入事件解释，并在同一 60 秒会话中最多通知一次。
      */
     private fun notifyGuardianEvent(
         kind: String,
@@ -528,11 +597,20 @@ class MonitorService : Service() {
         summary: String,
         cryScore: Float? = null
     ) {
+        val operatingMode = guardianOperatingMode()
+        if (!GuardianModePolicy.audioEnabled(operatingMode)) return
+        if (kind == "motion" && !GuardianModePolicy.visualEnabled(operatingMode)) return
+
+        val audioOnly = operatingMode == GuardianOperatingMode.AUDIO_ONLY
         val npu = npuDetector
-        val vision = npu?.refreshForAlert(300L)
-        val personCount = vision?.personCount ?: npu?.personCount ?: 0
-        val adultLikeCount = vision?.adultLikePersonCount ?: npu?.adultLikePersonCount ?: 0
-        val suppressed = vision?.notificationsSuppressed ?: (npu?.notificationsSuppressed == true)
+        val vision = if (audioOnly) null else npu?.refreshForAlert(300L)
+        val personCount = if (audioOnly) 0 else vision?.personCount ?: npu?.personCount ?: 0
+        val adultLikeCount = if (audioOnly) 0 else {
+            vision?.adultLikePersonCount ?: npu?.adultLikePersonCount ?: 0
+        }
+        val suppressed = if (audioOnly) false else {
+            vision?.notificationsSuppressed ?: (npu?.notificationsSuppressed == true)
+        }
         val configured = barkNotifier?.configured == true
         val decision = when {
             suppressed -> "suppressed"
@@ -540,6 +618,10 @@ class MonitorService : Service() {
             else -> "not_configured"
         }
         val decisionReason = when {
+            audioOnly && configured ->
+                "实体镜头罩已关闭，无法判断成人陪护；仅根据疑似哭声按安全侧发送通知"
+            audioOnly ->
+                "实体镜头罩已关闭，无法判断成人陪护；已记录疑似哭声，但尚未配置可用的通知设备"
             suppressed && personCount >= 2 ->
                 "当前画面检测到 ${personCount} 人，按有人陪护处理，因此未发送通知"
             suppressed && adultLikeCount > 0 ->
@@ -551,8 +633,9 @@ class MonitorService : Service() {
             else ->
                 "未检测到明确成人，但尚未配置可用的通知设备"
         }
-        val refreshStatus = vision?.refreshStatus ?: "unavailable"
+        val refreshStatus = if (audioOnly) "lens_covered" else vision?.refreshStatus ?: "unavailable"
         val refreshReason = when (refreshStatus) {
+            "lens_covered" -> "实体镜头罩关闭，本次未采集或分析画面"
             "refreshed" -> "通知前已补跑一次新画面 NPU"
             "latest_frame" -> "未在限时内取到新帧，已用最近画面补跑 NPU"
             "timeout" -> "NPU 补跑等待超过 300ms，本次按最近可用结果判断"
@@ -568,19 +651,29 @@ class MonitorService : Service() {
             reason = reason,
             personCount = personCount,
             adultLikePersonCount = adultLikeCount,
-            supervisionState = (vision?.supervisionState
-                ?: npu?.supervisionState
-                ?: SupervisionStateMachine.State.UNKNOWN).name.lowercase(),
+            supervisionState = if (audioOnly) {
+                SupervisionStateMachine.State.UNKNOWN.name.lowercase()
+            } else {
+                (vision?.supervisionState
+                    ?: npu?.supervisionState
+                    ?: SupervisionStateMachine.State.UNKNOWN).name.lowercase()
+            },
             cryScore = cryScore,
             visionRefreshStatus = refreshStatus,
             visionAnalyzedAt = vision?.analyzedAt ?: 0L,
             visionSourceCapturedAt = vision?.sourceCapturedAt ?: 0L,
             visionInferenceMs = vision?.inferenceMs ?: 0L,
-            canNotify = !suppressed && configured
+            canNotify = !suppressed && configured,
+            captureClip = GuardianModePolicy.clipEnabled(operatingMode)
         )
-        mutation?.let {
-            if (it.created) eventClipRecorder?.capture(it.event.id)
-            else eventClipRecorder?.extend(it.event.id)
+        if (GuardianModePolicy.clipEnabled(operatingMode)) mutation?.let {
+            when {
+                it.created -> eventClipRecorder?.capture(it.event.id)
+                it.event.clipStatus == GuardianEventStore.CLIP_NONE &&
+                    guardianEventStore?.requestClip(it.event.id) == true ->
+                    eventClipRecorder?.capture(it.event.id)
+                else -> eventClipRecorder?.extend(it.event.id)
+            }
         }
 
         if (suppressed) {
@@ -589,7 +682,12 @@ class MonitorService : Service() {
             return
         }
         if (mutation?.shouldNotify == true) {
-            barkNotifier?.notify(title, "$summary，打开控制页查看实时画面")
+            val detail = if (audioOnly) {
+                "$summary；当前为仅音频守护，无法确认成人是否在场"
+            } else {
+                "$summary，打开控制页查看实时画面"
+            }
+            barkNotifier?.notify(title, detail)
         } else if (configured) {
             Log.i(TAG, "检测到$title，已合并到一分钟事件会话，不重复发送 Bark")
         }
@@ -600,6 +698,7 @@ class MonitorService : Service() {
         current: SupervisionStateMachine.State,
         observation: SupervisionStateMachine.Observation
     ) {
+        if (!GuardianModePolicy.visualEnabled(guardianOperatingMode())) return
         if (previous == current) return
         if (current == SupervisionStateMachine.State.CAREGIVER_PRESENT) {
             val reason = if (observation.totalPeople >= 2) {

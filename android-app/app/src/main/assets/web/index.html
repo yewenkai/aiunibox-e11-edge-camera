@@ -249,12 +249,14 @@
   .ctrl-row:last-child { border-bottom: none; }
   .ctrl-label { font-size: 14px; }
   .ctrl-val { font-size: 12px; color: #6b7280; font-family: monospace; }
+  .ctrl-hint { flex-basis: 100%; color: #718096; font-size: 10px; line-height: 1.5; }
   .toggle-group { display: flex; gap: 6px; flex-wrap: wrap; }
   .toggle-btn {
     background: #2d3548; color: #9ca3af; border: none; border-radius: 6px;
     padding: 7px 16px; font-size: 13px; cursor: pointer; transition: background .1s;
   }
   .toggle-btn:active { background: #2563eb; color: #fff; }
+  .toggle-btn.selected { background: #1d4ed8; color: #dbeafe; }
   input[type=range] { width: 120px; vertical-align: middle; accent-color: #3d6dd6; }
   input[type=password] {
     flex: 1; min-width: 180px; background: #111827; color: #fff;
@@ -495,6 +497,15 @@
     </div>
 
     <div class="ctrl-row">
+      <span class="ctrl-label">实体镜头罩 <span class="ctrl-val" id="lensCoverVal">读取中…</span></span>
+      <div class="toggle-group">
+        <button class="toggle-btn" id="lensOpen" type="button">镜头开放</button>
+        <button class="toggle-btn" id="lensCovered" type="button">镜头罩关闭</button>
+      </div>
+      <div class="ctrl-hint">请让这里与实体镜头罩保持一致。关闭后不做 NPU、动作和画面短片，只保留麦克风哭声守护；软件隐私模式仍会同时停止画面和声音。</div>
+    </div>
+
+    <div class="ctrl-row">
       <span class="ctrl-label">灵敏度 <span class="ctrl-val" id="babySensVal">中</span></span>
       <div class="toggle-group">
         <button class="toggle-btn" data-baby-sens="0">低</button>
@@ -568,7 +579,7 @@
       </div>
     </div>
 
-    <div class="pan-hint">重点区域仅限定动作检测；哭声和成人陪护判断仍使用完整声音与画面。事件短片保存在设备端，可在时间线中逐条删除。</div>
+    <div class="pan-hint" id="babySettingsHint">重点区域仅限定动作检测；正常守护的成人陪护判断仍使用完整画面。事件短片保存在设备端，可在时间线中逐条删除。</div>
   </div>
 
   <div class="status" id="status">连接中...</div>
@@ -760,8 +771,15 @@ async function loadGuardianEvents(force = false) {
     appendText(card, 'event-summary', event.summary);
     appendText(card, 'event-reason', `判断原因：${event.reason}`);
 
+    const observations = event.observations || [];
+    const latestObservation = observations[observations.length - 1] || {};
+    const lensCoveredEvent = latestObservation.visionRefreshStatus === 'lens_covered';
     const metrics = [];
-    if (event.kind !== 'state' || Number(event.personCount || 0) > 0) {
+    if (lensCoveredEvent) {
+      metrics.push(event.clipStatus === 'none'
+        ? '仅音频 · 未分析画面 · 无画面短片'
+        : '仅音频 · 本次未分析画面');
+    } else if (event.kind !== 'state' || Number(event.personCount || 0) > 0) {
       metrics.push(`画面人体 ${Number(event.personCount || 0)}`);
     }
     if (Number(event.adultLikePersonCount || 0) > 0) {
@@ -772,7 +790,6 @@ async function loadGuardianEvents(force = false) {
     }
     if (metrics.length) appendText(card, 'event-meta', metrics.join(' · '));
 
-    const observations = event.observations || [];
     if (observations.length > 1) {
       const details = document.createElement('details');
       details.className = 'event-observations';
@@ -785,10 +802,12 @@ async function loadGuardianEvents(force = false) {
         const row = document.createElement('div');
         row.className = 'event-observation';
         const label = eventKindNames[item.kind] || '● 守护信号';
-        const refresh = item.visionRefreshStatus === 'refreshed'
-          ? ` · NPU ${Number(item.visionInferenceMs || 0)}ms`
-          : (item.visionRefreshStatus && item.visionRefreshStatus !== 'not_requested'
-            ? ` · NPU ${item.visionRefreshStatus}` : '');
+        const refresh = item.visionRefreshStatus === 'lens_covered'
+          ? ' · 仅音频'
+          : item.visionRefreshStatus === 'refreshed'
+            ? ` · NPU ${Number(item.visionInferenceMs || 0)}ms`
+            : (item.visionRefreshStatus && item.visionRefreshStatus !== 'not_requested'
+              ? ` · NPU ${item.visionRefreshStatus}` : '');
         const heading = document.createElement('strong');
         heading.textContent = `${shanghaiDateTime.format(new Date(item.occurredAt))} · ${label}${refresh}`;
         row.appendChild(heading);
@@ -903,7 +922,9 @@ $('testClipBtn').addEventListener('click', async () => {
     eventRenderSignature = '';
     loadGuardianEvents(true);
   } else {
-    toast('请先开启宝宝守护和摄像头');
+    toast(j?.error === 'lens_cover_closed'
+      ? '镜头罩关闭时不生成画面短片'
+      : '请先开启正常守护和摄像头');
   }
 });
 
@@ -1015,7 +1036,10 @@ document.addEventListener('click', async (e) => {
 async function setBaby(on) {
   const j = await api(`/api/baby?on=${on}`);
   if (j && j.ok) {
-    toast(on ? '宝宝守护已开启，指示灯已全部熄灭' : '宝宝守护已关闭');
+    const openedText = j.guardianMode === 'audio_only'
+      ? '仅音频守护已开启，画面分析和短片已暂停'
+      : '宝宝守护已开启，指示灯已全部熄灭';
+    toast(on ? openedText : '宝宝守护已关闭');
     await refreshStatus();
     return true;
   }
@@ -1023,6 +1047,26 @@ async function setBaby(on) {
 }
 $('babyOn').addEventListener('click', () => setBaby(true));
 $('babyOff').addEventListener('click', () => setBaby(false));
+$('lensOpen').addEventListener('click', () => setLensMode('normal'));
+$('lensCovered').addEventListener('click', () => setLensMode('audio_only'));
+
+async function setLensMode(mode) {
+  const closing = mode === 'audio_only';
+  $('lensOpen').disabled = true;
+  $('lensCovered').disabled = true;
+  const j = await api(`/api/baby?mode=${mode}`);
+  if (j?.ok) {
+    toast(closing
+      ? '已切换为镜头罩关闭；守护开启时仅监听哭声'
+      : '已切换为镜头开放；守护开启时恢复画面分析');
+    await refreshStatus();
+  } else {
+    toast('镜头罩状态更新失败');
+  }
+  $('lensOpen').disabled = false;
+  $('lensCovered').disabled = false;
+}
+
 $('guardianQuickToggle').addEventListener('click', async () => {
   const button = $('guardianQuickToggle');
   const turnOn = button.dataset.nextOn === 'true';
@@ -1035,6 +1079,7 @@ $('guardianQuickToggle').addEventListener('click', async () => {
 });
 
 // ===== 场景校准：只落盘统计值，不保存音视频 =====
+let latestGuardianStatus = {};
 function renderCalibration(calibration) {
   const ambient = calibration?.ambient || {};
   const adult = calibration?.adult || {};
@@ -1053,16 +1098,20 @@ function renderCalibration(calibration) {
       ? `已校准 · 当前有效哭声阈值 ${Math.round(Number(ambient.effectiveThreshold || 0) * 100)}%`
       : ambient.state === 'failed' ? '校准失败，可重新开始' : '尚未校准，使用默认底噪参考';
 
-  $('adultCalibrationStatus').textContent = adult.state === 'running'
-    ? (Number(adult.currentPersonCount || 0) === 1
-      ? `请保持常用站位… ${adultCount}/${adultTarget}`
-      : `请让画面中只保留 1 名成人… ${adultCount}/${adultTarget}`)
-    : adult.state === 'complete'
-      ? '已校准 · 成人体型只作为陪护证据'
-      : adult.state === 'failed' ? '校准失败，可重新开始' : '尚未校准，使用默认体型参考';
+  $('adultCalibrationStatus').textContent = latestGuardianStatus.lensCoverClosed === true
+    ? '镜头罩关闭，当前不能进行成人站位校准'
+    : adult.state === 'running'
+      ? (Number(adult.currentPersonCount || 0) === 1
+        ? `请保持常用站位… ${adultCount}/${adultTarget}`
+        : `请让画面中只保留 1 名成人… ${adultCount}/${adultTarget}`)
+      : adult.state === 'complete'
+        ? '已校准 · 成人体型只作为陪护证据'
+        : adult.state === 'failed' ? '校准失败，可重新开始' : '尚未校准，使用默认体型参考';
 
-  $('startAmbientCalibration').disabled = ambient.state === 'running';
-  $('startAdultCalibration').disabled = adult.state === 'running';
+  $('startAmbientCalibration').disabled = ambient.state === 'running' ||
+    latestGuardianStatus.guardianAudioEnabled !== true;
+  $('startAdultCalibration').disabled = adult.state === 'running' ||
+    latestGuardianStatus.guardianVisualEnabled !== true;
 }
 
 $('startAmbientCalibration').addEventListener('click', async () => {
@@ -1262,10 +1311,30 @@ function setSignal(cardId, valueId, text, state) {
   $(valueId).textContent = text;
 }
 
+function renderCrySignal(j, unavailableNote) {
+  if (!j.cryModelLoaded) {
+    setSignal('crySignalCard', 'crySignalVal', '模型未加载', 'warn');
+    $('crySignalNote').textContent = unavailableNote;
+    return;
+  }
+  const cryPct = Math.round(Number(j.cryScore || 0) * 100);
+  const thresholdPct = Math.round(Number(j.cryThreshold || 0) * 100);
+  const rms = Number(j.cryAudioRms || 0).toFixed(3);
+  const topIndex = Number(j.cryTopClassIndex ?? -1);
+  const topName = yamnetLabels[topIndex] || (topIndex >= 0 ? `类别 #${topIndex}` : '安静');
+  setSignal(
+    'crySignalCard', 'crySignalVal',
+    j.babyCryActive ? `哭声事件中 · 当前 ${cryPct}%` : `哭声 ${cryPct}% / 阈值 ${thresholdPct}%`,
+    j.babyCryActive ? 'alert' : 'ok'
+  );
+  $('crySignalNote').textContent = `音频能量 ${rms} · 当前最高 ${topName}`;
+}
+
 async function refreshStatus() {
   try {
     const j = await api('/api/status');
     if (!j) return;
+    latestGuardianStatus = j;
     renderCalibration(j.sceneCalibration || {});
     const now = Date.now();
     const elapsed = Math.max((now - lastStatusAt) / 1000, 0.1);
@@ -1286,15 +1355,20 @@ async function refreshStatus() {
 
     // 宝宝守护面板
     $('babyModeVal').textContent = j.babyMonitorEnabled ? '开' : '关';
+    $('lensCoverVal').textContent = j.lensCoverClosed ? '关闭 · 仅音频' : '开放 · 画面与音频';
+    $('lensOpen').classList.toggle('selected', !j.lensCoverClosed);
+    $('lensCovered').classList.toggle('selected', j.lensCoverClosed === true);
     $('babySensVal').textContent = ['低', '中', '高'][j.babySensitivity] || '中';
     motionRoi = j.motionRoi || [0, 0, 1, 1];
     const fullMotionRoi = isFullRoi(motionRoi);
     $('motionRoiVal').textContent = fullMotionRoi
       ? '全画面'
       : `${Math.round(motionRoi[2] * 100)}% × ${Math.round(motionRoi[3] * 100)}% @ (${Math.round(motionRoi[0] * 100)},${Math.round(motionRoi[1] * 100)})`;
-    $('guardianRoiHint').textContent = fullMotionRoi
-      ? 'NPU 不识别年龄。当前画面发现两人或成人体型证据时暂停通知；否则保持武装。'
-      : '重点区域只限定动作检测。成人陪护仍按全画面人数和体型证据判断，不推断宝宝位置。';
+    $('guardianRoiHint').textContent = j.lensCoverClosed
+      ? '实体镜头罩关闭：无法判断成人是否在场，仅按哭声模型结果守护，达到阈值时按安全侧通知。'
+      : (fullMotionRoi
+        ? 'NPU 不识别年龄。当前画面发现两人或成人体型证据时暂停通知；否则保持武装。'
+        : '重点区域只限定动作检测。成人陪护仍按全画面人数和体型证据判断，不推断宝宝位置。');
     $('motionSignalNote').textContent = fullMotionRoi
       ? '当前按全画面判断持续动作'
       : '当前只在重点区域内判断持续动作';
@@ -1305,6 +1379,11 @@ async function refreshStatus() {
     quickToggle.textContent = j.babyMonitorEnabled ? '关闭守护' : '开启守护';
     quickToggle.classList.toggle('is-on', j.babyMonitorEnabled);
     chip.classList.remove('alert', 'off');
+    const visualConfigEnabled = !j.lensCoverClosed && !j.privacy;
+    $('roiSelect').disabled = !visualConfigEnabled;
+    $('roiFull').disabled = !visualConfigEnabled;
+    $('jumpToRoi').disabled = !visualConfigEnabled;
+    $('testClipBtn').disabled = j.guardianMode !== 'normal';
     if (!j.babyMonitorEnabled) {
       chip.textContent = '未启用';
       chip.classList.add('off');
@@ -1312,9 +1391,16 @@ async function refreshStatus() {
       setSignal('motionSignalCard', 'motionSignalVal', '未启用', 'off');
       setSignal('crySignalCard', 'crySignalVal', '未启用', 'off');
       setSignal('guardianSignalCard', 'babyMotionVal', '守护已关闭', 'off');
-      $('npuSignalNote').textContent = '只识别通用人体，不区分宝宝与成人';
+      $('npuSignalNote').textContent = j.lensCoverClosed
+        ? '镜头罩已关闭；开启守护后不分析画面'
+        : '只识别通用人体，不区分宝宝与成人';
+      $('motionSignalNote').textContent = j.lensCoverClosed
+        ? '镜头罩关闭；开启守护后不检测画面动作'
+        : (fullMotionRoi ? '当前按全画面判断持续动作' : '当前只判断重点区域');
       $('crySignalNote').textContent = '开启守护后显示实时音频分数';
-      $('guardianSignalNote').textContent = '开启后按陪护状态决定是否推送';
+      $('guardianSignalNote').textContent = j.lensCoverClosed
+        ? '开启后仅按哭声结果守护，无法判断成人陪护'
+        : '开启后按陪护状态决定是否推送';
     } else if (j.privacy) {
       chip.textContent = '隐私模式暂停';
       chip.classList.add('off');
@@ -1325,6 +1411,22 @@ async function refreshStatus() {
       $('npuSignalNote').textContent = '隐私模式不采集画面';
       $('crySignalNote').textContent = '隐私模式不采集声音';
       $('guardianSignalNote').textContent = '关闭隐私模式后自动恢复';
+    } else if (j.guardianMode === 'audio_only') {
+      const alerting = j.babyCryActive === true;
+      chip.textContent = alerting ? '仅音频 · 需要关注' : '仅音频守护';
+      chip.classList.toggle('alert', alerting);
+      setSignal('npuSignalCard', 'npuPersonVal', '实体镜头罩关闭', 'off');
+      $('npuSignalNote').textContent = 'NPU 已暂停，不判断人数或成人陪护';
+      setSignal('motionSignalCard', 'motionSignalVal', '画面动作已暂停', 'off');
+      $('motionSignalNote').textContent = '不采集动作证据，也不生成画面短片';
+      renderCrySignal(j, '仅音频守护依赖哭声模型，请检查模型与麦克风');
+      setSignal(
+        'guardianSignalCard', 'babyMotionVal',
+        alerting ? '疑似哭声，需要关注' : '仅音频 · 通知已武装',
+        alerting ? 'alert' : 'warn'
+      );
+      $('guardianSignalNote').textContent =
+        '镜头罩关闭时无法确认成人是否在场；哭声达到阈值会按安全侧通知';
     } else {
       const alerting = j.babyCryActive || j.babyMotionActive;
       const supervised = j.notificationsArmed === false;
@@ -1363,22 +1465,7 @@ async function refreshStatus() {
         j.babyMotionActive ? '检测到持续动作' : '动作监测中',
         j.babyMotionActive ? 'alert' : 'ok'
       );
-      if (!j.cryModelLoaded) {
-        setSignal('crySignalCard', 'crySignalVal', '模型未加载', 'warn');
-        $('crySignalNote').textContent = '动作检测仍会继续运行';
-      } else {
-        const cryPct = Math.round(Number(j.cryScore || 0) * 100);
-        const thresholdPct = Math.round(Number(j.cryThreshold || 0) * 100);
-        const rms = Number(j.cryAudioRms || 0).toFixed(3);
-        const topIndex = Number(j.cryTopClassIndex ?? -1);
-        const topName = yamnetLabels[topIndex] || (topIndex >= 0 ? `类别 #${topIndex}` : '安静');
-        setSignal(
-          'crySignalCard', 'crySignalVal',
-          j.babyCryActive ? `哭声事件中 · 当前 ${cryPct}%` : `哭声 ${cryPct}% / 阈值 ${thresholdPct}%`,
-          j.babyCryActive ? 'alert' : 'ok'
-        );
-        $('crySignalNote').textContent = `音频能量 ${rms} · 当前最高 ${topName}`;
-      }
+      renderCrySignal(j, '动作检测仍会继续运行');
 
       let guardianText, guardianState, guardianNote;
       if (supervised) {
@@ -1395,6 +1482,9 @@ async function refreshStatus() {
       setSignal('guardianSignalCard', 'babyMotionVal', guardianText, guardianState);
       $('guardianSignalNote').textContent = guardianNote;
     }
+    $('babySettingsHint').textContent = j.lensCoverClosed
+      ? '镜头罩关闭时只保留哭声检测，不分析人数和动作，也不生成画面短片。'
+      : '重点区域仅限定动作检测；正常守护的成人陪护判断仍使用完整画面。事件短片保存在设备端，可逐条删除。';
   } catch (_) {
     $('liveBadge').textContent = '● 已断开';
     $('liveBadge').classList.add('off');

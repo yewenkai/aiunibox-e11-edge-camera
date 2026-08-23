@@ -21,7 +21,7 @@ import java.io.InputStream
  *  GET /api/filllight    ?level=0-255
  *  GET /api/ircut        ?on=true|false
  *  GET /api/scene        ?mode=0|1|2
- *  GET /api/baby         ?on=true|false [&sensitivity=0|1|2]（无参数=查询）
+ *  GET /api/baby         ?on=true|false [&mode=normal|audio_only]（无参数=查询）
  *  GET /api/calibration  ?action=ambient|adult|cancel|reset，场景校准不保存音视频
  *  GET /api/notify       ?add=KEY[&name=备注] ?remove=KEY ?toggle=KEY&on= ?test=KEY|all
  *  GET /api/events       解释时间线；?deleteClip=EVENT_ID 或 ?clearClips=true 清理端侧短片
@@ -370,11 +370,21 @@ class WebServer(
         )
     }
 
-    /** 宝宝守护：开关、灵敏度、监测区域；无参数时查询当前状态。 */
+    /** 宝宝守护：开关、镜头罩模式、灵敏度、监测区域；无参数时查询当前状态。 */
     private fun apiBaby(p: Map<String, String>): Response {
         val service = MonitorService.instance
             ?: return json("""{"ok":false,"error":"service_unavailable"}""")
         try {
+            p["mode"]?.lowercase()?.let { mode ->
+                val closed = when (mode) {
+                    GuardianOperatingMode.NORMAL.apiValue -> false
+                    GuardianOperatingMode.AUDIO_ONLY.apiValue -> true
+                    else -> return json("""{"ok":false,"error":"invalid_guardian_mode"}""")
+                }
+                if (!service.setLensCoverClosed(closed)) {
+                    return json("""{"ok":false,"error":"service_unavailable"}""")
+                }
+            }
             p["on"]?.let { service.setBabyMode(it.toBoolean()) }
             p["sensitivity"]?.toIntOrNull()?.let { service.setBabySensitivity(it) }
             p["roi"]?.let { raw ->
@@ -398,6 +408,8 @@ class WebServer(
             JSONObject()
                 .put("ok", true)
                 .put("babyMonitorEnabled", state.babyMonitorEnabled)
+                .put("lensCoverClosed", state.lensCoverClosed)
+                .put("guardianMode", service.guardianOperatingMode().apiValue)
                 .put("babySensitivity", state.babySensitivity)
                 .put("motionRoi", roi)
                 .put("babyMotionActive", service.isBabyMotionActive())
@@ -477,7 +489,7 @@ class WebServer(
                 .put("name", "AIUniBOX-E11 Edge Camera")
                 .put("model", android.os.Build.MODEL)
                 .put("deviceId", id)
-                .put("apiVersion", 6)
+                .put("apiVersion", 7)
                 .put("appVersion", BuildConfig.VERSION_NAME)
                 .put("authRequired", security.isEnabled)
                 .toString()
@@ -514,6 +526,16 @@ class WebServer(
             .put("uptimeSeconds", service?.uptimeSeconds() ?: 0)
             .put("watching", service?.isWatching() == true)
             .put("privacy", state.privacyMode)
+            .put("lensCoverClosed", state.lensCoverClosed)
+            .put("guardianMode", service?.guardianOperatingMode()?.apiValue ?: GuardianOperatingMode.OFF.apiValue)
+            .put(
+                "guardianVisualEnabled",
+                service?.guardianOperatingMode()?.let(GuardianModePolicy::visualEnabled) == true
+            )
+            .put(
+                "guardianAudioEnabled",
+                service?.guardianOperatingMode()?.let(GuardianModePolicy::audioEnabled) == true
+            )
             .put("positionSteps", state.positionSteps())
             .put("positionDegrees", state.positionDegrees())
             .put("presets", JSONArray(state.presetNames()))
@@ -623,7 +645,12 @@ class WebServer(
             null
         }
         if (p["testClip"]?.toBoolean() == true && !service.createGuardianTestClip()) {
-            return json("""{"ok":false,"error":"clip_recorder_unavailable"}""")
+            val error = when (service.guardianOperatingMode()) {
+                GuardianOperatingMode.AUDIO_ONLY -> "lens_cover_closed"
+                GuardianOperatingMode.PRIVACY_PAUSED -> "privacy_mode"
+                else -> "clip_recorder_unavailable"
+            }
+            return json(JSONObject().put("ok", false).put("error", error).toString())
         }
         val limit = (p["limit"]?.toIntOrNull() ?: 40).coerceIn(1, 100)
         val items = JSONArray()

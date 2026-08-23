@@ -150,6 +150,7 @@ class GuardianEventStore(context: Context) {
         visionSourceCapturedAt: Long,
         visionInferenceMs: Long,
         canNotify: Boolean,
+        captureClip: Boolean = true,
         now: Long = System.currentTimeMillis()
     ): GuardianEventMutation {
         require(kind == "motion" || kind == "cry") { "unsupported incident kind: $kind" }
@@ -213,7 +214,7 @@ class GuardianEventStore(context: Context) {
                 cryCount = cryCount,
                 notificationSent = canNotify,
                 observations = initialObservations,
-                clipStatus = CLIP_PENDING
+                clipStatus = if (captureClip) CLIP_PENDING else CLIP_NONE
             )
             addLocked(event)
             return GuardianEventMutation(event, created = true, shouldNotify = canNotify)
@@ -256,6 +257,16 @@ class GuardianEventStore(context: Context) {
         events.add(0, updated)
         persistLocked()
         return GuardianEventMutation(updated, created = false, shouldNotify = shouldNotify)
+    }
+
+    /** 音频会话后来在正常模式下收到视觉事件时，可为同一会话补建一段短片。 */
+    @Synchronized
+    fun requestClip(eventId: String): Boolean {
+        val index = events.indexOfFirst { it.id == eventId }
+        if (index < 0 || events[index].clipStatus != CLIP_NONE) return false
+        events[index] = events[index].copy(clipStatus = CLIP_PENDING)
+        persistLocked()
+        return true
     }
 
     @Synchronized
