@@ -356,6 +356,16 @@ class MonitorService : Service() {
 
     fun personBoxes(): List<FloatArray> = npuDetector?.personBoxes ?: emptyList()
 
+    fun npuAnalyzedAt(): Long = npuDetector?.lastAnalyzedAt ?: 0L
+
+    fun npuSourceCapturedAt(): Long = npuDetector?.lastSourceCapturedAt ?: 0L
+
+    fun npuInferenceMs(): Long = npuDetector?.lastInferenceMs ?: 0L
+
+    fun npuAlertRefreshStatus(): String = npuDetector?.lastAlertRefreshStatus ?: "unavailable"
+
+    fun npuAlertRefreshAt(): Long = npuDetector?.lastAlertRefreshAt ?: 0L
+
     fun supervisionState(): String =
         (npuDetector?.supervisionState ?: SupervisionStateMachine.State.UNKNOWN).name.lowercase()
 
@@ -367,13 +377,22 @@ class MonitorService : Service() {
 
     fun isPrivacyModeOn(): Boolean = deviceState?.privacyMode == true
 
-    fun babyLastEventAt(): Long? = guardianEventStore?.list(1)?.firstOrNull()?.occurredAt
+    fun babyLastEventAt(): Long? = guardianEventStore?.list(1)?.firstOrNull()?.lastOccurredAt
 
     /** 动作+哭声事件合并（新→旧），kind: "motion" | "cry"。 */
     fun babyRecentEvents(): List<Pair<Long, String>> {
         return (guardianEventStore?.list(50) ?: emptyList())
-            .filter { it.kind == "motion" || it.kind == "cry" }
-            .map { it.occurredAt to it.kind }
+            .flatMap { event ->
+                if (event.kind == "incident") {
+                    event.observations.filter { it.kind == "motion" || it.kind == "cry" }
+                        .map { it.occurredAt to it.kind }
+                } else if (event.kind == "motion" || event.kind == "cry") {
+                    listOf(event.occurredAt to event.kind)
+                } else {
+                    emptyList()
+                }
+            }
+            .sortedByDescending { it.first }
             .take(20)
     }
 
@@ -424,16 +443,17 @@ class MonitorService : Service() {
         cryScore: Float? = null
     ) {
         val npu = npuDetector
-        val personCount = npu?.personCount ?: 0
-        val adultLikeCount = npu?.adultLikePersonCount ?: 0
-        val suppressed = npu?.notificationsSuppressed == true
+        val vision = npu?.refreshForAlert(300L)
+        val personCount = vision?.personCount ?: npu?.personCount ?: 0
+        val adultLikeCount = vision?.adultLikePersonCount ?: npu?.adultLikePersonCount ?: 0
+        val suppressed = vision?.notificationsSuppressed ?: (npu?.notificationsSuppressed == true)
         val configured = barkNotifier?.configured == true
         val decision = when {
             suppressed -> "suppressed"
             configured -> "notified"
             else -> "not_configured"
         }
-        val reason = when {
+        val decisionReason = when {
             suppressed && personCount >= 2 ->
                 "当前画面检测到 ${personCount} 人，按有人陪护处理，因此未发送通知"
             suppressed && adultLikeCount > 0 ->
@@ -445,26 +465,48 @@ class MonitorService : Service() {
             else ->
                 "未检测到明确成人，但尚未配置可用的通知设备"
         }
-        val event = guardianEventStore?.addTriggered(
+        val refreshStatus = vision?.refreshStatus ?: "unavailable"
+        val refreshReason = when (refreshStatus) {
+            "refreshed" -> "通知前已补跑一次新画面 NPU"
+            "latest_frame" -> "未在限时内取到新帧，已用最近画面补跑 NPU"
+            "timeout" -> "NPU 补跑等待超过 300ms，本次按最近可用结果判断"
+            "no_frame" -> "当前没有可用新画面，本次按最近可用结果判断"
+            "unavailable" -> "NPU 当前不可用，不将单次人体结果作为绝对依据"
+            else -> "NPU 补跑状态：$refreshStatus"
+        }
+        val reason = "$decisionReason；$refreshReason"
+        val mutation = guardianEventStore?.addOrMergeTriggered(
             kind = kind,
-            title = title,
             summary = summary,
             decision = decision,
             reason = reason,
             personCount = personCount,
             adultLikePersonCount = adultLikeCount,
-            supervisionState = (npu?.supervisionState ?: SupervisionStateMachine.State.UNKNOWN)
-                .name.lowercase(),
-            cryScore = cryScore
+            supervisionState = (vision?.supervisionState
+                ?: npu?.supervisionState
+                ?: SupervisionStateMachine.State.UNKNOWN).name.lowercase(),
+            cryScore = cryScore,
+            visionRefreshStatus = refreshStatus,
+            visionAnalyzedAt = vision?.analyzedAt ?: 0L,
+            visionSourceCapturedAt = vision?.sourceCapturedAt ?: 0L,
+            visionInferenceMs = vision?.inferenceMs ?: 0L,
+            canNotify = !suppressed && configured
         )
-        event?.let { eventClipRecorder?.capture(it.id) }
+        mutation?.let {
+            if (it.created) eventClipRecorder?.capture(it.event.id)
+            else eventClipRecorder?.extend(it.event.id)
+        }
 
         if (suppressed) {
             lastSuppressedAlertAt = System.currentTimeMillis()
             Log.i(TAG, "检测到${title}，当前有人陪护，仅记录事件和短片，不发送 Bark")
             return
         }
-        barkNotifier?.notify(title, "$summary，打开控制页查看实时画面")
+        if (mutation?.shouldNotify == true) {
+            barkNotifier?.notify(title, "$summary，打开控制页查看实时画面")
+        } else if (configured) {
+            Log.i(TAG, "检测到$title，已合并到一分钟事件会话，不重复发送 Bark")
+        }
     }
 
     private fun recordSupervisionTransition(
@@ -487,7 +529,7 @@ class MonitorService : Service() {
                 personCount = observation.totalPeople,
                 adultLikePersonCount = observation.adultLikePeople,
                 supervisionState = current.name.lowercase()
-            )
+            )?.takeIf { !it.created }?.let { eventClipRecorder?.extend(it.event.id) }
         } else if (previous == SupervisionStateMachine.State.CAREGIVER_PRESENT) {
             guardianEventStore?.addState(
                 title = "通知已恢复",
@@ -497,7 +539,7 @@ class MonitorService : Service() {
                 personCount = observation.totalPeople,
                 adultLikePersonCount = observation.adultLikePeople,
                 supervisionState = current.name.lowercase()
-            )
+            )?.takeIf { !it.created }?.let { eventClipRecorder?.extend(it.event.id) }
         }
     }
 

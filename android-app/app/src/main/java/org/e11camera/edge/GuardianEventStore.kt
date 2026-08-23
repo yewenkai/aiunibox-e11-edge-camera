@@ -21,11 +21,38 @@ data class GuardianEventEntry(
     val adultLikePersonCount: Int,
     val supervisionState: String,
     val cryScore: Float? = null,
+    val lastOccurredAt: Long = occurredAt,
+    val motionCount: Int = 0,
+    val cryCount: Int = 0,
+    val notificationSent: Boolean = false,
+    val observations: List<GuardianEventObservation> = emptyList(),
     val clipStatus: String = GuardianEventStore.CLIP_NONE,
     val clipFileName: String? = null,
     val clipDurationMs: Long = 0L,
     val clipSizeBytes: Long = 0L,
     val clipError: String? = null
+)
+
+data class GuardianEventObservation(
+    val occurredAt: Long,
+    val kind: String,
+    val summary: String,
+    val decision: String,
+    val reason: String,
+    val personCount: Int,
+    val adultLikePersonCount: Int,
+    val supervisionState: String,
+    val cryScore: Float? = null,
+    val visionRefreshStatus: String = "not_requested",
+    val visionAnalyzedAt: Long = 0L,
+    val visionSourceCapturedAt: Long = 0L,
+    val visionInferenceMs: Long = 0L
+)
+
+data class GuardianEventMutation(
+    val event: GuardianEventEntry,
+    val created: Boolean,
+    val shouldNotify: Boolean = false
 )
 
 data class GuardianClipStorageInfo(
@@ -50,8 +77,9 @@ data class GuardianClipCleanupResult(
 class GuardianEventStore(context: Context) {
     companion object {
         private const val TAG = "GuardianEventStore"
-        private const val STORE_VERSION = 1
+        private const val STORE_VERSION = 2
         private const val MAX_EVENTS = 200
+        private const val MAX_OBSERVATIONS = 30
         const val MAX_CLIPS = 60
         const val MAX_CLIP_BYTES = 256L * 1024L * 1024L
 
@@ -101,6 +129,133 @@ class GuardianEventStore(context: Context) {
         )
     )
 
+    /**
+     * 将 1 分钟内的动作、疑似哭声和陪护变化归入同一事件会话。
+     * 每个会话最多返回一次 shouldNotify=true，由调用方实际发送。
+     */
+    @Synchronized
+    fun addOrMergeTriggered(
+        kind: String,
+        summary: String,
+        decision: String,
+        reason: String,
+        personCount: Int,
+        adultLikePersonCount: Int,
+        supervisionState: String,
+        cryScore: Float?,
+        visionRefreshStatus: String,
+        visionAnalyzedAt: Long,
+        visionSourceCapturedAt: Long,
+        visionInferenceMs: Long,
+        canNotify: Boolean,
+        now: Long = System.currentTimeMillis()
+    ): GuardianEventMutation {
+        require(kind == "motion" || kind == "cry") { "unsupported incident kind: $kind" }
+        val observation = GuardianEventObservation(
+            occurredAt = now,
+            kind = kind,
+            summary = summary,
+            decision = decision,
+            reason = reason,
+            personCount = personCount,
+            adultLikePersonCount = adultLikePersonCount,
+            supervisionState = supervisionState,
+            cryScore = cryScore,
+            visionRefreshStatus = visionRefreshStatus,
+            visionAnalyzedAt = visionAnalyzedAt,
+            visionSourceCapturedAt = visionSourceCapturedAt,
+            visionInferenceMs = visionInferenceMs
+        )
+        val existingIndex = events.indexOfFirst {
+            it.kind == "incident" && GuardianIncidentPolicy.canMerge(it.occurredAt, now)
+        }
+        if (existingIndex < 0) {
+            val motionCount = if (kind == "motion") 1 else 0
+            val cryCount = if (kind == "cry") 1 else 0
+            val stateIndex = events.indexOfFirst {
+                it.kind == "state" && now >= it.lastOccurredAt && now - it.lastOccurredAt <= 2_000L
+            }
+            val recentState = stateIndex.takeIf { it >= 0 }?.let { events[it] }
+            val initialObservations = buildList {
+                recentState?.let {
+                    add(
+                        GuardianEventObservation(
+                            occurredAt = it.lastOccurredAt,
+                            kind = "state",
+                            summary = it.summary,
+                            decision = it.decision,
+                            reason = it.reason,
+                            personCount = it.personCount,
+                            adultLikePersonCount = it.adultLikePersonCount,
+                            supervisionState = it.supervisionState
+                        )
+                    )
+                }
+                add(observation)
+            }
+            if (stateIndex >= 0) events.removeAt(stateIndex)
+            val event = GuardianEventEntry(
+                id = UUID.randomUUID().toString(),
+                occurredAt = recentState?.occurredAt ?: now,
+                lastOccurredAt = now,
+                kind = "incident",
+                title = GuardianIncidentPolicy.title(motionCount, cryCount),
+                summary = GuardianIncidentPolicy.summary(motionCount, cryCount),
+                decision = decision,
+                reason = reason,
+                personCount = personCount,
+                adultLikePersonCount = adultLikePersonCount,
+                supervisionState = supervisionState,
+                cryScore = cryScore,
+                motionCount = motionCount,
+                cryCount = cryCount,
+                notificationSent = canNotify,
+                observations = initialObservations,
+                clipStatus = CLIP_PENDING
+            )
+            addLocked(event)
+            return GuardianEventMutation(event, created = true, shouldNotify = canNotify)
+        }
+
+        val existing = events[existingIndex]
+        val motionCount = existing.motionCount + if (kind == "motion") 1 else 0
+        val cryCount = existing.cryCount + if (kind == "cry") 1 else 0
+        val shouldNotify = canNotify && !existing.notificationSent
+        val notificationSent = existing.notificationSent || shouldNotify
+        val mergedObservation = if (canNotify && existing.notificationSent) {
+            observation.copy(
+                decision = "merged",
+                reason = "$reason；同一事件会话已发送过通知，本次不重复推送"
+            )
+        } else {
+            observation
+        }
+        val mergedReason = if (existing.notificationSent && !shouldNotify) {
+            "本会话已处理过一次通知，后续信号仅合并记录。最近判断：$reason"
+        } else {
+            reason
+        }
+        val updated = existing.copy(
+            lastOccurredAt = now,
+            title = GuardianIncidentPolicy.title(motionCount, cryCount),
+            summary = GuardianIncidentPolicy.summary(motionCount, cryCount),
+            decision = if (notificationSent) "notified" else decision,
+            reason = mergedReason,
+            personCount = personCount,
+            adultLikePersonCount = adultLikePersonCount,
+            supervisionState = supervisionState,
+            cryScore = cryScore ?: existing.cryScore,
+            motionCount = motionCount,
+            cryCount = cryCount,
+            notificationSent = notificationSent,
+            observations = (existing.observations + mergedObservation).takeLast(MAX_OBSERVATIONS)
+        )
+        events.removeAt(existingIndex)
+        events.add(0, updated)
+        persistLocked()
+        return GuardianEventMutation(updated, created = false, shouldNotify = shouldNotify)
+    }
+
     @Synchronized
     fun addState(
         title: String,
@@ -109,11 +264,41 @@ class GuardianEventStore(context: Context) {
         reason: String,
         personCount: Int,
         adultLikePersonCount: Int,
-        supervisionState: String
-    ): GuardianEventEntry = addLocked(
-        GuardianEventEntry(
+        supervisionState: String,
+        now: Long = System.currentTimeMillis()
+    ): GuardianEventMutation {
+        val existingIndex = events.indexOfFirst {
+            it.kind == "incident" && GuardianIncidentPolicy.canMerge(it.occurredAt, now)
+        }
+        if (existingIndex >= 0) {
+            val existing = events[existingIndex]
+            val observation = GuardianEventObservation(
+                occurredAt = now,
+                kind = "state",
+                summary = summary,
+                decision = decision,
+                reason = reason,
+                personCount = personCount,
+                adultLikePersonCount = adultLikePersonCount,
+                supervisionState = supervisionState
+            )
+            val updated = existing.copy(
+                lastOccurredAt = now,
+                reason = "${existing.reason}；陪护变化：$reason",
+                personCount = personCount,
+                adultLikePersonCount = adultLikePersonCount,
+                supervisionState = supervisionState,
+                observations = (existing.observations + observation).takeLast(MAX_OBSERVATIONS)
+            )
+            events.removeAt(existingIndex)
+            events.add(0, updated)
+            persistLocked()
+            return GuardianEventMutation(updated, created = false)
+        }
+        val event = GuardianEventEntry(
             id = UUID.randomUUID().toString(),
-            occurredAt = System.currentTimeMillis(),
+            occurredAt = now,
+            lastOccurredAt = now,
             kind = "state",
             title = title,
             summary = summary,
@@ -123,7 +308,9 @@ class GuardianEventStore(context: Context) {
             adultLikePersonCount = adultLikePersonCount,
             supervisionState = supervisionState
         )
-    )
+        addLocked(event)
+        return GuardianEventMutation(event, created = true)
+    }
 
     @Synchronized
     fun list(limit: Int = 50): List<GuardianEventEntry> =
@@ -275,7 +462,7 @@ class GuardianEventStore(context: Context) {
                         } else parsed
                     )
                 }
-                events.sortByDescending { it.occurredAt }
+                events.sortByDescending { it.lastOccurredAt }
                 enforceLimitsLocked()
                 persistLocked()
             } catch (e: Exception) {
@@ -372,6 +559,13 @@ class GuardianEventStore(context: Context) {
         .put("adultLikePersonCount", event.adultLikePersonCount)
         .put("supervisionState", event.supervisionState)
         .put("cryScore", event.cryScore ?: JSONObject.NULL)
+        .put("lastOccurredAt", event.lastOccurredAt)
+        .put("motionCount", event.motionCount)
+        .put("cryCount", event.cryCount)
+        .put("notificationSent", event.notificationSent)
+        .put("observations", JSONArray().apply {
+            event.observations.forEach { put(toJson(it)) }
+        })
         .put("clipStatus", event.clipStatus)
         .put("clipFileName", event.clipFileName ?: JSONObject.NULL)
         .put("clipDurationMs", event.clipDurationMs)
@@ -382,10 +576,17 @@ class GuardianEventStore(context: Context) {
         val id = json.optString("id")
         val occurredAt = json.optLong("occurredAt")
         if (id.isBlank() || occurredAt <= 0L) return null
+        val kind = json.optString("kind", "state")
+        val observations = mutableListOf<GuardianEventObservation>()
+        json.optJSONArray("observations")?.let { array ->
+            for (i in 0 until array.length()) {
+                fromObservationJson(array.optJSONObject(i) ?: continue)?.let(observations::add)
+            }
+        }
         return GuardianEventEntry(
             id = id,
             occurredAt = occurredAt,
-            kind = json.optString("kind", "state"),
+            kind = kind,
             title = json.optString("title"),
             summary = json.optString("summary"),
             decision = json.optString("decision", "recorded"),
@@ -394,11 +595,55 @@ class GuardianEventStore(context: Context) {
             adultLikePersonCount = json.optInt("adultLikePersonCount"),
             supervisionState = json.optString("supervisionState", "unknown"),
             cryScore = if (json.isNull("cryScore")) null else json.optDouble("cryScore").toFloat(),
+            lastOccurredAt = json.optLong("lastOccurredAt", occurredAt).coerceAtLeast(occurredAt),
+            motionCount = if (json.has("motionCount")) {
+                json.optInt("motionCount")
+            } else if (kind == "motion") 1 else 0,
+            cryCount = if (json.has("cryCount")) {
+                json.optInt("cryCount")
+            } else if (kind == "cry") 1 else 0,
+            notificationSent = json.optBoolean("notificationSent", json.optString("decision") == "notified"),
+            observations = observations.takeLast(MAX_OBSERVATIONS),
             clipStatus = json.optString("clipStatus", CLIP_NONE),
             clipFileName = json.optNullableString("clipFileName"),
             clipDurationMs = json.optLong("clipDurationMs"),
             clipSizeBytes = json.optLong("clipSizeBytes"),
             clipError = json.optNullableString("clipError")
+        )
+    }
+
+    private fun toJson(observation: GuardianEventObservation): JSONObject = JSONObject()
+        .put("occurredAt", observation.occurredAt)
+        .put("kind", observation.kind)
+        .put("summary", observation.summary)
+        .put("decision", observation.decision)
+        .put("reason", observation.reason)
+        .put("personCount", observation.personCount)
+        .put("adultLikePersonCount", observation.adultLikePersonCount)
+        .put("supervisionState", observation.supervisionState)
+        .put("cryScore", observation.cryScore ?: JSONObject.NULL)
+        .put("visionRefreshStatus", observation.visionRefreshStatus)
+        .put("visionAnalyzedAt", observation.visionAnalyzedAt)
+        .put("visionSourceCapturedAt", observation.visionSourceCapturedAt)
+        .put("visionInferenceMs", observation.visionInferenceMs)
+
+    private fun fromObservationJson(json: JSONObject): GuardianEventObservation? {
+        val occurredAt = json.optLong("occurredAt")
+        if (occurredAt <= 0L) return null
+        return GuardianEventObservation(
+            occurredAt = occurredAt,
+            kind = json.optString("kind", "state"),
+            summary = json.optString("summary"),
+            decision = json.optString("decision", "recorded"),
+            reason = json.optString("reason"),
+            personCount = json.optInt("personCount"),
+            adultLikePersonCount = json.optInt("adultLikePersonCount"),
+            supervisionState = json.optString("supervisionState", "unknown"),
+            cryScore = if (json.isNull("cryScore")) null else json.optDouble("cryScore").toFloat(),
+            visionRefreshStatus = json.optString("visionRefreshStatus", "not_requested"),
+            visionAnalyzedAt = json.optLong("visionAnalyzedAt"),
+            visionSourceCapturedAt = json.optLong("visionSourceCapturedAt"),
+            visionInferenceMs = json.optLong("visionInferenceMs")
         )
     }
 

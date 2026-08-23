@@ -7,12 +7,25 @@ import android.util.Log
 import java.io.File
 import java.util.ArrayDeque
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.exp
 import kotlin.math.max
 import kotlin.math.min
+
+data class AlertVisionSnapshot(
+    val refreshStatus: String,
+    val analyzedAt: Long,
+    val sourceCapturedAt: Long,
+    val inferenceMs: Long,
+    val personCount: Int,
+    val adultLikePersonCount: Int,
+    val supervisionState: SupervisionStateMachine.State,
+    val notificationsSuppressed: Boolean
+)
 
 /**
  * 宝宝守护：RK3566 NPU 端侧视觉补强（NPU_ROADMAP 阶段 1：有人/无人）。
@@ -37,6 +50,7 @@ class NpuDetector(
         private const val TAG = "NpuDetector"
         private const val MODEL_FILE = "yolov8n_rk3566.rknn"
         private const val SAMPLE_INTERVAL_SEC = 2L
+        private const val ALERT_FRESH_FRAME_TIMEOUT_MS = 100L
         private const val INPUT_SIZE = 640
 
         /** COCO class 0 = person；只关心人 */
@@ -98,6 +112,21 @@ class NpuDetector(
         get() = caregiverEvidenceNow || supervision.notificationsSuppressed
 
     @Volatile var lastSeenAt: Long = 0
+        private set
+
+    @Volatile var lastAnalyzedAt: Long = 0L
+        private set
+
+    @Volatile var lastSourceCapturedAt: Long = 0L
+        private set
+
+    @Volatile var lastInferenceMs: Long = 0L
+        private set
+
+    @Volatile var lastAlertRefreshStatus: String = "never"
+        private set
+
+    @Volatile var lastAlertRefreshAt: Long = 0L
         private set
 
     @Synchronized
@@ -166,18 +195,87 @@ class NpuDetector(
     private fun tick() {
         if (!running.get()) return
         try {
-            synchronized(inferenceLock) {
-                if (!running.get() || handle == 0L) return
-                val jpeg = streamer.latestJpeg
-                if (jpeg.isEmpty()) return
-                val t0 = System.currentTimeMillis()
-                val boxes = detectPersons(jpeg)
-                val cost = System.currentTimeMillis() - t0
-                updatePresence(boxes, cost)
-            }
+            val snapshot = streamer.latestJpegSnapshot()
+            if (snapshot.bytes.isEmpty()) return
+            runInference(snapshot, "scheduled")
         } catch (e: Exception) {
             Log.w(TAG, "tick 异常", e)
         }
+    }
+
+    /**
+     * 告警前尝试强制取下一帧并补跑 NPU。调用方最多等待 [timeoutMs]，
+     * 超时后按安全侧继续事件流程，已开始的推理可以在后台完成并更新状态。
+     */
+    fun refreshForAlert(timeoutMs: Long = 300L): AlertVisionSnapshot {
+        val requestedAt = System.currentTimeMillis()
+        val executor = scheduler
+        if (!running.get() || !modelLoaded || executor == null) {
+            return recordAlertRefresh(currentSnapshot("unavailable"), requestedAt)
+        }
+        return try {
+            val future = executor.submit<AlertVisionSnapshot> {
+                val fresh = streamer.requestFreshJpeg(ALERT_FRESH_FRAME_TIMEOUT_MS)
+                val source = fresh ?: streamer.latestJpegSnapshot()
+                if (source.bytes.isEmpty()) {
+                    currentSnapshot("no_frame")
+                } else {
+                    runInference(source, if (fresh != null) "refreshed" else "latest_frame")
+                }
+            }
+            try {
+                recordAlertRefresh(
+                    future.get(timeoutMs.coerceAtLeast(1L), TimeUnit.MILLISECONDS),
+                    requestedAt
+                )
+            } catch (_: TimeoutException) {
+                future.cancel(false)
+                recordAlertRefresh(currentSnapshot("timeout"), requestedAt)
+            }
+        } catch (_: RejectedExecutionException) {
+            recordAlertRefresh(currentSnapshot("unavailable"), requestedAt)
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            recordAlertRefresh(currentSnapshot("interrupted"), requestedAt)
+        } catch (e: Exception) {
+            Log.w(TAG, "告警前 NPU 补跑失败", e)
+            recordAlertRefresh(currentSnapshot("failed"), requestedAt)
+        }
+    }
+
+    private fun runInference(
+        source: CameraStreamer.JpegSnapshot,
+        refreshStatus: String
+    ): AlertVisionSnapshot = synchronized(inferenceLock) {
+        if (!running.get() || handle == 0L) return@synchronized currentSnapshot("unavailable")
+        val t0 = System.currentTimeMillis()
+        val boxes = detectPersons(source.bytes)
+        val cost = System.currentTimeMillis() - t0
+        lastSourceCapturedAt = source.capturedAtMs
+        lastInferenceMs = cost
+        lastAnalyzedAt = System.currentTimeMillis()
+        updatePresence(boxes, cost)
+        currentSnapshot(refreshStatus)
+    }
+
+    private fun currentSnapshot(refreshStatus: String): AlertVisionSnapshot = AlertVisionSnapshot(
+        refreshStatus = refreshStatus,
+        analyzedAt = lastAnalyzedAt,
+        sourceCapturedAt = lastSourceCapturedAt,
+        inferenceMs = lastInferenceMs,
+        personCount = personCount,
+        adultLikePersonCount = adultLikePersonCount,
+        supervisionState = supervisionState,
+        notificationsSuppressed = notificationsSuppressed
+    )
+
+    private fun recordAlertRefresh(
+        snapshot: AlertVisionSnapshot,
+        requestedAt: Long
+    ): AlertVisionSnapshot {
+        lastAlertRefreshStatus = snapshot.refreshStatus
+        lastAlertRefreshAt = requestedAt
+        return snapshot
     }
 
     /** JPEG → letterbox 640 → NPU 推理 → yolov8 解码 → NMS → person 框（归一化 x,y,w,h,conf）。 */
@@ -336,16 +434,18 @@ class NpuDetector(
                 "supervision=$previousSupervision->$currentSupervision count=$personCount " +
                     "adultLike=$adultLikePersonCount (${costMs}ms)"
             )
-            try {
-                onSupervisionChanged(previousSupervision, currentSupervision, observation)
-            } catch (e: Exception) {
-                Log.w(TAG, "陪护状态回调异常", e)
-            }
         } else {
             Log.d(
                 TAG,
                 "detect=$detected count=$personCount supervision=$currentSupervision (${costMs}ms)"
             )
+        }
+        if (currentSupervision != previousSupervision) {
+            try {
+                onSupervisionChanged(previousSupervision, currentSupervision, observation)
+            } catch (e: Exception) {
+                Log.w(TAG, "陪护状态回调异常", e)
+            }
         }
     }
 
@@ -359,6 +459,11 @@ class NpuDetector(
         adultLikePersonCount = 0
         caregiverEvidenceNow = false
         lastSeenAt = 0L
+        lastAnalyzedAt = 0L
+        lastSourceCapturedAt = 0L
+        lastInferenceMs = 0L
+        lastAlertRefreshStatus = "never"
+        lastAlertRefreshAt = 0L
         supervision.reset()
     }
 

@@ -37,7 +37,7 @@ class EventClipRecorder(
 
     private data class PendingClip(
         val eventId: String,
-        val finishAtMs: Long,
+        var finishAtMs: Long,
         val frames: MutableList<EncodedFrame>
     )
 
@@ -91,6 +91,13 @@ class EventClipRecorder(
         }
         currentEncoder.requestKeyFrame()
         return true
+    }
+
+    /** 同一事件会话再次触发时，将尚未结束的短片延长到最近信号后 20 秒。 */
+    fun extend(eventId: String): Boolean = synchronized(lock) {
+        val pending = active.firstOrNull { it.eventId == eventId } ?: return@synchronized false
+        pending.finishAtMs = maxOf(pending.finishAtMs, System.currentTimeMillis() + POST_ROLL_MS)
+        true
     }
 
     @Synchronized

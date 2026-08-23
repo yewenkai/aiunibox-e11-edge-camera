@@ -32,6 +32,11 @@ class CameraStreamer(private val context: Context) {
         private const val HEIGHT = 480
     }
 
+    data class JpegSnapshot(
+        val bytes: ByteArray,
+        val capturedAtMs: Long
+    )
+
     /** 本地预览 Surface（App 前台回显用），为 null 时不回显 */
     @Volatile
     var previewSurface: android.view.Surface? = null
@@ -42,6 +47,13 @@ class CameraStreamer(private val context: Context) {
     private val handler = Handler(callbackThread.looper)
     private val desiredRunning = AtomicBoolean(false)
     private val opening = AtomicBoolean(false)
+    private val jpegMonitor = Object()
+
+    @Volatile
+    private var requestedJpegSequence = 0L
+
+    @Volatile
+    private var completedJpegSequence = 0L
 
     @Volatile
     @get:Synchronized
@@ -52,6 +64,37 @@ class CameraStreamer(private val context: Context) {
     @Volatile
     var latestJpegCapturedAtMs: Long = 0L
         private set
+
+    /** 同时读取 JPEG 和其采集时间，避免拿到不同帧的字节与时间。 */
+    fun latestJpegSnapshot(): JpegSnapshot = synchronized(this) {
+        JpegSnapshot(latestJpeg, latestJpegCapturedAtMs)
+    }
+
+    /**
+     * 请求相机回调将下一帧立即转成 JPEG。
+     *
+     * 日常推流仍每 30 帧生成一张快照；只有事件告警等少量调用会
+     * 临时补一张，不会把整条采集链路退回到每帧 YUV 转 JPEG。
+     */
+    fun requestFreshJpeg(timeoutMs: Long): JpegSnapshot? {
+        if (timeoutMs <= 0L || !desiredRunning.get()) return null
+        val deadline = System.currentTimeMillis() + timeoutMs
+        synchronized(jpegMonitor) {
+            val sequence = ++requestedJpegSequence
+            while (desiredRunning.get() && completedJpegSequence < sequence) {
+                val remaining = deadline - System.currentTimeMillis()
+                if (remaining <= 0L) return null
+                try {
+                    jpegMonitor.wait(remaining)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    return null
+                }
+            }
+            if (completedJpegSequence < sequence) return null
+        }
+        return latestJpegSnapshot().takeIf { it.bytes.isNotEmpty() }
+    }
 
     @Volatile
     private var camera: CameraDevice? = null
@@ -238,6 +281,7 @@ class CameraStreamer(private val context: Context) {
     /** 隐私模式暂停采集；保留工作线程，使摄像头可以原地恢复。 */
     fun pause() {
         desiredRunning.set(false)
+        synchronized(jpegMonitor) { jpegMonitor.notifyAll() }
         handler.removeCallbacks(retryRunnable)
         closeCameraOnly()
         timestampCompositor?.stop()
@@ -278,12 +322,18 @@ class CameraStreamer(private val context: Context) {
             // H.264 编码走 Surface 零拷贝，不需要在这里喂编码器
             // JPEG 快照：每 30 帧做一次（约每秒一张，大幅省 CPU）
             jpegSkipCounter++
-            if (jpegSkipCounter >= 30) {
+            val forcedSequence = requestedJpegSequence
+            if (jpegSkipCounter >= 30 || forcedSequence > completedJpegSequence) {
                 jpegSkipCounter = 0
                 val jpeg = yuvToJpeg(image)
                 synchronized(this) {
                     latestJpeg = jpeg
                     latestJpegCapturedAtMs = System.currentTimeMillis()
+                }
+                synchronized(jpegMonitor) {
+                    // 同一张新帧可以满足转码期间累积的多个请求。
+                    completedJpegSequence = requestedJpegSequence
+                    jpegMonitor.notifyAll()
                 }
             } else {
                 // 不做 JPEG 的帧也要快速丢弃，避免 ImageReader 积压
@@ -375,6 +425,7 @@ class CameraStreamer(private val context: Context) {
 
     fun stop() {
         desiredRunning.set(false)
+        synchronized(jpegMonitor) { jpegMonitor.notifyAll() }
         handler.removeCallbacksAndMessages(null)
         try {
             closeCameraOnly()

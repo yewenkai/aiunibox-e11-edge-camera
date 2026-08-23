@@ -161,6 +161,18 @@
     color: #aab4c3; background: rgba(15,23,42,.72); font-size: 11px; line-height: 1.5;
   }
   .event-meta { margin-top: 7px; color: #64748b; font-size: 10px; }
+  .event-observations {
+    margin-top: 8px; border-top: 1px solid #263244; color: #94a3b8; font-size: 10px;
+  }
+  .event-observations > summary { padding-top: 8px; color: #93c5fd; cursor: pointer; }
+  .event-observation-list {
+    display: grid; gap: 5px; max-height: 180px; overflow-y: auto; margin-top: 7px;
+    overscroll-behavior: contain; padding-right: 2px;
+  }
+  .event-observation {
+    padding: 6px 7px; border-radius: 6px; background: rgba(15,23,42,.72); line-height: 1.45;
+  }
+  .event-observation strong { color: #cbd5e1; font-weight: 600; }
   .event-actions { display: flex; align-items: center; gap: 7px; margin-top: 9px; flex-wrap: wrap; }
   .event-actions .toggle-btn { padding: 5px 10px; font-size: 11px; }
   .clip-state { color: #718096; font-size: 10px; }
@@ -554,9 +566,10 @@ const decisionNames = {
   notified: '已触发通知',
   armed: '通知已恢复',
   not_configured: '仅端侧记录',
+  merged: '已合并·不重复通知',
   recorded: '已记录'
 };
-const eventKindNames = { motion: '⚠ 画面动作', cry: '◉ 哭声', state: '● 状态变化', test: '▣ 手动测试' };
+const eventKindNames = { incident: '◈ 事件会话', motion: '⚠ 画面动作', cry: '◉ 哭声', state: '● 状态变化', test: '▣ 手动测试' };
 let eventRenderSignature = '';
 let latestGuardianStorage = {};
 
@@ -585,7 +598,7 @@ async function loadGuardianEvents(force = false) {
   $('clearClipsBtn').disabled = storedClipCount <= 0;
 
   const events = j.events || [];
-  const signature = events.map(e => `${e.id}:${e.clipStatus}:${e.clipSizeBytes}`).join('|');
+  const signature = events.map(e => `${e.id}:${e.lastOccurredAt}:${e.clipStatus}:${e.clipSizeBytes}:${(e.observations || []).length}`).join('|');
   if (!force && signature === eventRenderSignature) return;
   eventRenderSignature = signature;
 
@@ -603,7 +616,12 @@ async function loadGuardianEvents(force = false) {
 
     const top = document.createElement('div');
     top.className = 'event-top';
-    appendText(top, 'event-time', shanghaiDateTime.format(new Date(event.occurredAt)), 'time');
+    const startedText = shanghaiDateTime.format(new Date(event.occurredAt));
+    const endedAt = Number(event.lastOccurredAt || event.occurredAt);
+    const timeText = endedAt > Number(event.occurredAt)
+      ? `${startedText} → ${shanghaiDateTime.format(new Date(endedAt))}`
+      : startedText;
+    appendText(top, 'event-time', timeText, 'time');
     appendText(top, 'event-time', eventKindNames[event.kind] || '● 守护事件', 'span');
     appendText(top, 'event-decision', decisionNames[event.decision] || '已记录', 'span');
     card.appendChild(top);
@@ -622,6 +640,33 @@ async function loadGuardianEvents(force = false) {
       metrics.push(`哭声匹配 ${Math.round(Number(event.cryScore) * 100)}%`);
     }
     if (metrics.length) appendText(card, 'event-meta', metrics.join(' · '));
+
+    const observations = event.observations || [];
+    if (observations.length > 1) {
+      const details = document.createElement('details');
+      details.className = 'event-observations';
+      const summary = document.createElement('summary');
+      summary.textContent = `查看会话内 ${observations.length} 次判断`;
+      details.appendChild(summary);
+      const observationList = document.createElement('div');
+      observationList.className = 'event-observation-list';
+      for (const item of [...observations].reverse()) {
+        const row = document.createElement('div');
+        row.className = 'event-observation';
+        const label = eventKindNames[item.kind] || '● 守护信号';
+        const refresh = item.visionRefreshStatus === 'refreshed'
+          ? ` · NPU ${Number(item.visionInferenceMs || 0)}ms`
+          : (item.visionRefreshStatus && item.visionRefreshStatus !== 'not_requested'
+            ? ` · NPU ${item.visionRefreshStatus}` : '');
+        const heading = document.createElement('strong');
+        heading.textContent = `${shanghaiDateTime.format(new Date(item.occurredAt))} · ${label}${refresh}`;
+        row.appendChild(heading);
+        row.appendChild(document.createTextNode(`：${item.reason || item.summary || '已记录'}`));
+        observationList.appendChild(row);
+      }
+      details.appendChild(observationList);
+      card.appendChild(details);
+    }
 
     if (event.clipStatus !== 'none') {
       const actions = document.createElement('div');
