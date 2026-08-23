@@ -143,3 +143,30 @@ Java_org_e11camera_edge_NpuDetector_nativeDestroy(
     if (n->ctx != 0) rknn_destroy(n->ctx);
     delete n;
 }
+
+// PoseDetector 同时持有 Pose 与按需 RetinaFace 两个 RKNN context，复用同一薄 JNI 桥。
+extern "C" JNIEXPORT jlong JNICALL
+Java_org_e11camera_edge_PoseDetector_nativeCreate(
+        JNIEnv *env, jobject thiz, jbyteArray modelBytes) {
+    return Java_org_e11camera_edge_NpuDetector_nativeCreate(env, thiz, modelBytes);
+}
+
+extern "C" JNIEXPORT jintArray JNICALL
+Java_org_e11camera_edge_PoseDetector_nativeQuery(
+        JNIEnv *env, jobject thiz, jlong handle) {
+    return Java_org_e11camera_edge_NpuDetector_nativeQuery(env, thiz, handle);
+}
+
+extern "C" JNIEXPORT jobjectArray JNICALL
+Java_org_e11camera_edge_PoseDetector_nativeRun(
+        JNIEnv *env, jobject thiz, jlong handle,
+        jbyteArray input, jint width, jint height) {
+    return Java_org_e11camera_edge_NpuDetector_nativeRun(
+            env, thiz, handle, input, width, height);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_org_e11camera_edge_PoseDetector_nativeDestroy(
+        JNIEnv *env, jobject thiz, jlong handle) {
+    Java_org_e11camera_edge_NpuDetector_nativeDestroy(env, thiz, handle);
+}

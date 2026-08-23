@@ -16,7 +16,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  * 端侧事件短片录制器。
  *
  * 它订阅现有 MediaCodec H.264 输出，不再启动一套摄像头或编码器。内存中常驻最近
- * 10 秒编码帧；动作/哭声事件发生后继续收集 20 秒并封装为 MP4。短片包含已经烧进
+ * 10 秒编码帧；动作/哭声/可选姿态事件发生后继续收集 20 秒并封装为 MP4。短片包含已经烧进
  * 画面的东八区时间戳，当前版本为纯视频，不额外占用麦克风。
  */
 class EventClipRecorder(

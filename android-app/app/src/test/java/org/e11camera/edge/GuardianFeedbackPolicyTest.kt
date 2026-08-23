@@ -8,6 +8,8 @@ class GuardianFeedbackPolicyTest {
     @Test
     fun `feedback accepts only explicit local labels`() {
         assertEquals("false_alarm", GuardianFeedbackPolicy.normalize(" FALSE_ALARM "))
+        assertEquals("correct", GuardianFeedbackPolicy.normalize("correct"))
+        assertEquals("incorrect", GuardianFeedbackPolicy.normalize("INCORRECT"))
         assertNull(GuardianFeedbackPolicy.normalize("auto_train"))
         assertNull(GuardianFeedbackPolicy.normalize(""))
     }

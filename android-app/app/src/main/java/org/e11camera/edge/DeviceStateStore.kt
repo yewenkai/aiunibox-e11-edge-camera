@@ -34,6 +34,11 @@ class DeviceStateStore(context: Context) {
         private const val KEY_ADULT_MEDIAN_HEIGHT = "adult_median_height"
         private const val KEY_ADULT_MEDIAN_AREA = "adult_median_area"
         private const val KEY_ADULT_CALIBRATED_AT = "adult_calibrated_at"
+        private const val KEY_POSE_ANALYSIS = "pose_analysis_enabled"
+        private const val KEY_POSE_NOTIFICATIONS = "pose_notifications_enabled"
+        private const val KEY_POSE_DEBUG_OVERLAY = "pose_debug_overlay_enabled"
+        private const val KEY_POSE_SIDE_RISK = "pose_side_risk_enabled"
+        private const val KEY_FACE_VISIBILITY = "face_visibility_enabled"
     }
 
     private val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -221,6 +226,31 @@ class DeviceStateStore(context: Context) {
     var adultCalibratedAt: Long
         get() = prefs.getLong(KEY_ADULT_CALIBRATED_AT, 0L)
         set(value) { prefs.edit().putLong(KEY_ADULT_CALIBRATED_AT, value.coerceAtLeast(0L)).commit() }
+
+    /** 睡姿分析总开关。关闭时释放 Pose 与按需面部模型，不占用 NPU。 */
+    var poseAnalysisEnabled: Boolean
+        get() = prefs.getBoolean(KEY_POSE_ANALYSIS, false)
+        set(value) { prefs.edit().putBoolean(KEY_POSE_ANALYSIS, value).commit() }
+
+    /** 实验性姿态通知独立开关；默认关闭，影子模式仍会保留 24 小时统计。 */
+    var poseNotificationsEnabled: Boolean
+        get() = prefs.getBoolean(KEY_POSE_NOTIFICATIONS, false)
+        set(value) { prefs.edit().putBoolean(KEY_POSE_NOTIFICATIONS, value).commit() }
+
+    /** 只在浏览器叠加调试骨架，不写入直播编码或事件短片。 */
+    var poseDebugOverlayEnabled: Boolean
+        get() = prefs.getBoolean(KEY_POSE_DEBUG_OVERLAY, false)
+        set(value) { prefs.edit().putBoolean(KEY_POSE_DEBUG_OVERLAY, value).commit() }
+
+    /** 默认只把疑似俯卧作为风险；可选将侧卧也作为风险候选。 */
+    var poseSideRiskEnabled: Boolean
+        get() = prefs.getBoolean(KEY_POSE_SIDE_RISK, false)
+        set(value) { prefs.edit().putBoolean(KEY_POSE_SIDE_RISK, value).commit() }
+
+    /** 风险候选出现时，是否按需分析头部裁剪区域的面部可见性。 */
+    var faceVisibilityEnabled: Boolean
+        get() = prefs.getBoolean(KEY_FACE_VISIBILITY, false)
+        set(value) { prefs.edit().putBoolean(KEY_FACE_VISIBILITY, value).commit() }
 
     fun resetSceneCalibration() {
         prefs.edit()

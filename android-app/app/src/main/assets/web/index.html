@@ -26,6 +26,10 @@
   }
   .video-box canvas { width: 100%; height: 100%; display: block; }
   .video-box iframe { width: 100%; height: 100%; border: none; }
+  #poseOverlay {
+    position: absolute; inset: 0; z-index: 2; pointer-events: none;
+    width: 100%; height: 100%; display: block;
+  }
   .badge {
     color: #4ade80;
     font-size: 12px; padding: 3px 8px; border-radius: 4px;
@@ -76,7 +80,7 @@
   }
   .guardian-quick-toggle.is-on { color: #fecaca; background: #4c1d1d; border-color: rgba(248,113,113,.34); }
   .guardian-quick-toggle:disabled, .toggle-btn:disabled { opacity: .5; cursor: default; }
-  .guardian-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+  .guardian-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(132px, 1fr)); gap: 8px; }
   .signal-card {
     min-width: 0; min-height: 108px; padding: 11px; border-radius: 10px;
     background: rgba(9,14,22,.58); border: 1px solid #293444;
@@ -95,6 +99,13 @@
     font-weight: 650; line-height: 1.35; overflow-wrap: anywhere;
   }
   .signal-note { display: block; margin-top: 6px; color: #718096; font-size: 10px; line-height: 1.4; }
+  .pose-feedback-actions { display: flex; gap: 5px; margin-top: 8px; flex-wrap: wrap; }
+  .pose-feedback-actions button {
+    flex: 1; min-width: 50px; padding: 4px 6px; border: 1px solid #334155;
+    border-radius: 6px; color: #94a3b8; background: #182130; font: inherit;
+    font-size: 9px; cursor: pointer;
+  }
+  .pose-feedback-actions button:disabled { opacity: .45; cursor: default; }
   .guardian-note {
     margin-top: 10px; padding: 9px 10px; border-radius: 8px;
     color: #aab4c3; background: rgba(15,23,42,.7); font-size: 11px; line-height: 1.55;
@@ -321,6 +332,7 @@
   </div>
   <div class="video-box">
     <iframe id="webrtc" src="" allow="autoplay; picture-in-picture"></iframe>
+    <canvas id="poseOverlay" aria-hidden="true"></canvas>
   </div>
   <div class="stream-meta">
     <span class="badge off" id="liveBadge">● 连接中</span>
@@ -341,6 +353,15 @@
         <span class="signal-name"><i class="signal-dot"></i>人体感知 · NPU</span>
         <strong class="signal-value" id="npuPersonVal">读取中…</strong>
         <small class="signal-note" id="npuSignalNote">只识别通用人体，不区分宝宝与成人</small>
+      </div>
+      <div class="signal-card off" id="poseSignalCard">
+        <span class="signal-name"><i class="signal-dot"></i>睡姿影子 · Pose</span>
+        <strong class="signal-value" id="poseStateVal">未启用</strong>
+        <small class="signal-note" id="poseSignalNote">默认只记录，不发送通知</small>
+        <div class="pose-feedback-actions">
+          <button id="poseFeedbackCorrect" type="button" disabled>判断正确</button>
+          <button id="poseFeedbackIncorrect" type="button" disabled>判断错误</button>
+        </div>
       </div>
       <div class="signal-card off" id="motionSignalCard">
         <span class="signal-name"><i class="signal-dot"></i>画面动作</span>
@@ -515,6 +536,51 @@
     </div>
 
     <div class="ctrl-row">
+      <span class="ctrl-label">睡姿影子分析 <span class="ctrl-val" id="poseModeVal">关闭</span></span>
+      <div class="toggle-group">
+        <button class="toggle-btn" id="poseOn" type="button">开启</button>
+        <button class="toggle-btn" id="poseOff" type="button">关闭</button>
+      </div>
+      <div class="ctrl-hint">宝宝守护且镜头开放时每 2 秒分析一帧；关闭后释放 Pose 和面部模型。24 小时统计只保存数量、有效率和耗时。</div>
+    </div>
+
+    <div class="ctrl-row">
+      <span class="ctrl-label">调试骨架 <span class="ctrl-val" id="poseDebugVal">隐藏</span></span>
+      <div class="toggle-group">
+        <button class="toggle-btn" id="poseDebugOn" type="button">显示</button>
+        <button class="toggle-btn" id="poseDebugOff" type="button">隐藏</button>
+      </div>
+      <div class="ctrl-hint">只覆盖在当前浏览器页面上；不会烧进直播、快照或事件短片，画中画也不会携带骨架。</div>
+    </div>
+
+    <div class="ctrl-row">
+      <span class="ctrl-label">风险范围 <span class="ctrl-val" id="poseRiskVal">仅疑似俯卧</span></span>
+      <div class="toggle-group">
+        <button class="toggle-btn" id="poseProneOnly" type="button">仅俯卧</button>
+        <button class="toggle-btn" id="poseIncludeSide" type="button">俯卧 + 侧卧</button>
+      </div>
+      <div class="ctrl-hint">这里只改变风险候选范围，不改变姿态统计；2D 关键点无法可靠确认真实睡姿。</div>
+    </div>
+
+    <div class="ctrl-row">
+      <span class="ctrl-label">面部可见性 <span class="ctrl-val" id="faceVisibilityVal">关闭</span></span>
+      <div class="toggle-group">
+        <button class="toggle-btn" id="faceVisibilityOn" type="button">风险时按需分析</button>
+        <button class="toggle-btn" id="faceVisibilityOff" type="button">关闭</button>
+      </div>
+      <div class="ctrl-hint">仅在已有姿态风险候选时裁剪头部区域运行，不持续占用 NPU；结果只作为附加证据。</div>
+    </div>
+
+    <div class="ctrl-row">
+      <span class="ctrl-label">实验性姿态通知 <span class="ctrl-val" id="poseNotifyVal">关闭</span></span>
+      <div class="toggle-group">
+        <button class="toggle-btn" id="poseNotifyOn" type="button">开启通知</button>
+        <button class="toggle-btn" id="poseNotifyOff" type="button">保持影子模式</button>
+      </div>
+      <div class="ctrl-hint" id="poseObservationHint">建议先完成至少 24 小时影子观察并反馈若干次。发现两人、成人体型或陪护缓冲证据时，始终不发送姿态通知。</div>
+    </div>
+
+    <div class="ctrl-row">
       <span class="ctrl-label">动作监测区域 <span class="ctrl-val" id="motionRoiVal">全画面</span></span>
       <div class="toggle-group">
         <button class="toggle-btn" id="roiSelect">框选区域</button>
@@ -655,7 +721,7 @@ const decisionNames = {
   merged: '已合并·不重复通知',
   recorded: '已记录'
 };
-const eventKindNames = { incident: '◈ 事件会话', motion: '⚠ 画面动作', cry: '◉ 哭声', state: '● 状态变化', test: '▣ 手动测试' };
+const eventKindNames = { incident: '◈ 事件会话', motion: '⚠ 画面动作', cry: '◉ 哭声', posture: '◆ 姿态候选', state: '● 状态变化', test: '▣ 手动测试' };
 let eventRenderSignature = '';
 let latestGuardianStorage = {};
 
@@ -818,15 +884,17 @@ async function loadGuardianEvents(force = false) {
       card.appendChild(details);
     }
 
-    if (['incident', 'motion', 'cry'].includes(event.kind)) {
+    if (['incident', 'motion', 'cry', 'posture'].includes(event.kind)) {
       const feedback = document.createElement('div');
       feedback.className = 'feedback-actions';
       appendText(feedback, 'feedback-label', '这次实际情况：', 'span');
-      const choices = [
-        ['attention', '确实需要关注'],
-        ['false_alarm', '误报'],
-        ['caregiver_present', '成人在场']
-      ];
+      const choices = event.kind === 'posture'
+        ? [['correct', '判断正确'], ['incorrect', '判断错误'], ['caregiver_present', '成人在场']]
+        : [
+          ['attention', '确实需要关注'],
+          ['false_alarm', '误报'],
+          ['caregiver_present', '成人在场']
+        ];
       for (const [value, label] of choices) {
         const button = appendText(feedback, `toggle-btn${event.feedback === value ? ' selected' : ''}`, label, 'button');
         button.type = 'button';
@@ -1077,6 +1145,55 @@ $('guardianQuickToggle').addEventListener('click', async () => {
     button.textContent = turnOn ? '开启守护' : '关闭守护';
   }
 });
+
+async function setPoseOption(parameter, enabled, message) {
+  const j = await api(`/api/baby?${parameter}=${enabled}`);
+  if (j?.ok) {
+    toast(message);
+    await refreshStatus();
+    return true;
+  }
+  toast('姿态设置更新失败');
+  return false;
+}
+
+$('poseOn').addEventListener('click', () =>
+  setPoseOption('pose', true, '睡姿影子分析已开启；默认不会通知'));
+$('poseOff').addEventListener('click', () =>
+  setPoseOption('pose', false, '睡姿分析已关闭，模型将释放'));
+$('poseDebugOn').addEventListener('click', () =>
+  setPoseOption('poseDebug', true, '仅在当前网页显示调试骨架'));
+$('poseDebugOff').addEventListener('click', () =>
+  setPoseOption('poseDebug', false, '调试骨架已隐藏'));
+$('poseProneOnly').addEventListener('click', () =>
+  setPoseOption('poseSideRisk', false, '风险范围：仅疑似俯卧'));
+$('poseIncludeSide').addEventListener('click', () =>
+  setPoseOption('poseSideRisk', true, '风险范围：疑似俯卧和侧卧'));
+$('faceVisibilityOn').addEventListener('click', () =>
+  setPoseOption('faceVisibility', true, '风险候选时将按需分析面部可见性'));
+$('faceVisibilityOff').addEventListener('click', () =>
+  setPoseOption('faceVisibility', false, '面部可见性模型已关闭'));
+$('poseNotifyOn').addEventListener('click', async () => {
+  if (!window.confirm(
+    '姿态识别是实验性 2D 关键点启发式，可能误报或漏报。\n\n' +
+    '检测到两人或成人证据时仍会硬性禁止通知。确定开启吗？'
+  )) return;
+  await setPoseOption('poseNotify', true, '实验性姿态通知已开启');
+});
+$('poseNotifyOff').addEventListener('click', () =>
+  setPoseOption('poseNotify', false, '已恢复为只记录的影子模式'));
+
+async function savePoseFeedback(value) {
+  const j = await api(`/api/pose-feedback?value=${value}`);
+  if (j?.ok) {
+    toast('反馈已保存在设备端，不会自动修改阈值');
+    await refreshStatus();
+  } else {
+    toast('尚无可反馈的姿态结果');
+  }
+}
+$('poseFeedbackCorrect').addEventListener('click', () => savePoseFeedback('correct'));
+$('poseFeedbackIncorrect').addEventListener('click', () => savePoseFeedback('incorrect'));
 
 // ===== 场景校准：只落盘统计值，不保存音视频 =====
 let latestGuardianStatus = {};
@@ -1330,6 +1447,142 @@ function renderCrySignal(j, unavailableNote) {
   $('crySignalNote').textContent = `音频能量 ${rms} · 当前最高 ${topName}`;
 }
 
+const postureNames = {
+  unknown: '姿态不明确', supine: '疑似仰卧', side: '疑似侧卧', prone: '疑似俯卧'
+};
+const faceVisibilityNames = {
+  disabled: '面部分析关闭', idle: '面部模型待命', no_head_crop: '未能裁出头部',
+  visible: '面部可见', not_visible: '未确认面部可见', model_unavailable: '面部模型不可用'
+};
+
+function renderPoseSignal(j) {
+  const diagnostics = j.poseDiagnostics || {};
+  const minutes = Number(diagnostics.sampledMinuteCount || 0);
+  const samples = Number(diagnostics.sampleCount || 0);
+  const validPct = Number(diagnostics.validPosePercent || 0);
+  const correct = Number(diagnostics.correctFeedbackCount || 0);
+  const incorrect = Number(diagnostics.incorrectFeedbackCount || 0);
+  const rawName = postureNames[j.poseRawState] || '姿态不明确';
+  const stableName = postureNames[j.poseState] || '姿态不明确';
+
+  $('poseModeVal').textContent = j.poseAnalysisEnabled ? '开启' : '关闭';
+  $('poseDebugVal').textContent = j.poseDebugOverlayEnabled ? '显示' : '隐藏';
+  $('poseRiskVal').textContent = j.poseSideRiskEnabled ? '俯卧 + 侧卧' : '仅疑似俯卧';
+  $('faceVisibilityVal').textContent = j.faceVisibilityEnabled ? '风险时按需' : '关闭';
+  $('poseNotifyVal').textContent = j.poseNotificationsEnabled ? '开启 · 实验' : '关闭 · 影子模式';
+  $('poseOn').classList.toggle('selected', j.poseAnalysisEnabled === true);
+  $('poseOff').classList.toggle('selected', j.poseAnalysisEnabled !== true);
+  $('poseDebugOn').classList.toggle('selected', j.poseDebugOverlayEnabled === true);
+  $('poseDebugOff').classList.toggle('selected', j.poseDebugOverlayEnabled !== true);
+  $('poseProneOnly').classList.toggle('selected', j.poseSideRiskEnabled !== true);
+  $('poseIncludeSide').classList.toggle('selected', j.poseSideRiskEnabled === true);
+  $('faceVisibilityOn').classList.toggle('selected', j.faceVisibilityEnabled === true);
+  $('faceVisibilityOff').classList.toggle('selected', j.faceVisibilityEnabled !== true);
+  $('poseNotifyOn').classList.toggle('selected', j.poseNotificationsEnabled === true);
+  $('poseNotifyOff').classList.toggle('selected', j.poseNotificationsEnabled !== true);
+  $('poseDebugOn').disabled = j.poseAnalysisEnabled !== true;
+  $('poseNotifyOn').disabled = j.poseAnalysisEnabled !== true;
+
+  const feedbackReady = j.poseModelLoaded === true && Number(j.poseAnalyzedAt || 0) > 0;
+  $('poseFeedbackCorrect').disabled = !feedbackReady;
+  $('poseFeedbackIncorrect').disabled = !feedbackReady;
+  $('poseObservationHint').textContent =
+    `影子观察 ${minutes}/1440 分钟 · ${samples} 次分析 · 姿态有效 ${validPct.toFixed(1)}% · ` +
+    `反馈正确 ${correct} / 错误 ${incorrect}。发现两人或成人证据时始终不发送姿态通知。`;
+
+  if (!j.poseAnalysisEnabled) {
+    setSignal('poseSignalCard', 'poseStateVal', '未启用', 'off');
+    $('poseSignalNote').textContent = `已有 ${minutes} 分钟影子记录；开启后继续滚动统计`;
+  } else if (j.guardianMode !== 'normal') {
+    setSignal('poseSignalCard', 'poseStateVal', j.lensCoverClosed ? '镜头罩关闭 · 已暂停' : '等待正常守护', 'off');
+    $('poseSignalNote').textContent = '只在宝宝守护、镜头开放且软件隐私关闭时分析';
+  } else if (!j.poseModelAvailable) {
+    setSignal('poseSignalCard', 'poseStateVal', 'Pose 模型未安装', 'warn');
+    $('poseSignalNote').textContent = '设置已保留，模型安装后自动生效';
+  } else if (!j.poseModelLoaded) {
+    setSignal('poseSignalCard', 'poseStateVal', 'Pose 初始化中', 'warn');
+    $('poseSignalNote').textContent = '正在加载设备端模型';
+  } else {
+    const state = j.poseRiskCandidate ? 'alert' : (j.poseState === 'unknown' ? 'warn' : 'ok');
+    setSignal(
+      'poseSignalCard', 'poseStateVal',
+      `${stableName}${j.poseNotificationsEnabled ? ' · 实验通知' : ' · 仅记录'}`,
+      state
+    );
+    const faceText = faceVisibilityNames[j.faceVisibilityStatus] || '面部状态未知';
+    $('poseSignalNote').textContent =
+      `本帧 ${rawName} · 关键点 ${Math.round(Number(j.poseKeypointValidity || 0) * 100)}% · ` +
+      `${Number(j.poseInferenceMs || 0)} ms · ${faceText}`;
+  }
+  drawPoseOverlay(j);
+}
+
+function drawPoseOverlay(j) {
+  const canvas = $('poseOverlay');
+  const width = canvas.clientWidth;
+  const height = canvas.clientHeight;
+  if (width <= 0 || height <= 0) return;
+  const dpr = Math.max(1, window.devicePixelRatio || 1);
+  const pixelWidth = Math.round(width * dpr);
+  const pixelHeight = Math.round(height * dpr);
+  if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
+    canvas.width = pixelWidth;
+    canvas.height = pixelHeight;
+  }
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, width, height);
+  if (!j.poseDebugOverlayEnabled || !j.poseModelLoaded || j.guardianMode !== 'normal') return;
+
+  // 摄像头源为 4:3；WebRTC 播放器在 16:9 容器中按 contain 留黑边。
+  const sourceAspect = 4 / 3;
+  let drawWidth = width, drawHeight = width / sourceAspect, offsetX = 0, offsetY = 0;
+  if (drawHeight > height) {
+    drawHeight = height;
+    drawWidth = height * sourceAspect;
+    offsetX = (width - drawWidth) / 2;
+  } else {
+    offsetY = (height - drawHeight) / 2;
+  }
+  const mapX = value => offsetX + Number(value || 0) * drawWidth;
+  const mapY = value => offsetY + Number(value || 0) * drawHeight;
+  const box = j.poseTargetBox || [];
+  if (box.length >= 4) {
+    ctx.strokeStyle = 'rgba(250, 204, 21, .9)';
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([6, 4]);
+    ctx.strokeRect(mapX(box[0]), mapY(box[1]), Number(box[2]) * drawWidth, Number(box[3]) * drawHeight);
+    ctx.setLineDash([]);
+  }
+
+  const points = j.poseKeypoints || [];
+  if (points.length < 51) return;
+  const valid = index => Number(points[index * 3 + 2] || 0) >= 0.35;
+  const skeleton = [
+    [15,13],[13,11],[16,14],[14,12],[11,12],[5,11],[6,12],[5,6],[5,7],
+    [6,8],[7,9],[8,10],[1,2],[0,1],[0,2],[1,3],[2,4],[3,5],[4,6]
+  ];
+  ctx.strokeStyle = 'rgba(74, 222, 128, .92)';
+  ctx.lineWidth = 2;
+  ctx.lineCap = 'round';
+  for (const [a, b] of skeleton) {
+    if (!valid(a) || !valid(b)) continue;
+    ctx.beginPath();
+    ctx.moveTo(mapX(points[a * 3]), mapY(points[a * 3 + 1]));
+    ctx.lineTo(mapX(points[b * 3]), mapY(points[b * 3 + 1]));
+    ctx.stroke();
+  }
+  ctx.fillStyle = 'rgba(147, 197, 253, .96)';
+  for (let index = 0; index < 17; index++) {
+    if (!valid(index)) continue;
+    ctx.beginPath();
+    ctx.arc(mapX(points[index * 3]), mapY(points[index * 3 + 1]), 3, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+window.addEventListener('resize', () => drawPoseOverlay(latestGuardianStatus || {}));
+
 async function refreshStatus() {
   try {
     const j = await api('/api/status');
@@ -1359,6 +1612,7 @@ async function refreshStatus() {
     $('lensOpen').classList.toggle('selected', !j.lensCoverClosed);
     $('lensCovered').classList.toggle('selected', j.lensCoverClosed === true);
     $('babySensVal').textContent = ['低', '中', '高'][j.babySensitivity] || '中';
+    renderPoseSignal(j);
     motionRoi = j.motionRoi || [0, 0, 1, 1];
     const fullMotionRoi = isFullRoi(motionRoi);
     $('motionRoiVal').textContent = fullMotionRoi
@@ -1428,7 +1682,8 @@ async function refreshStatus() {
       $('guardianSignalNote').textContent =
         '镜头罩关闭时无法确认成人是否在场；哭声达到阈值会按安全侧通知';
     } else {
-      const alerting = j.babyCryActive || j.babyMotionActive;
+      const poseAlerting = j.poseNotificationsEnabled === true && j.poseRiskCandidate === true;
+      const alerting = j.babyCryActive || j.babyMotionActive || poseAlerting;
       const supervised = j.notificationsArmed === false;
       const confirmedSupervised = j.supervisionState === 'caregiver_present';
       const caregiverNow = j.caregiverEvidenceNow === true;
@@ -1486,6 +1741,7 @@ async function refreshStatus() {
       ? '镜头罩关闭时只保留哭声检测，不分析人数和动作，也不生成画面短片。'
       : '重点区域仅限定动作检测；正常守护的成人陪护判断仍使用完整画面。事件短片保存在设备端，可逐条删除。';
   } catch (_) {
+    drawPoseOverlay({});
     $('liveBadge').textContent = '● 已断开';
     $('liveBadge').classList.add('off');
     $('status').textContent = '设备连接中断，正在重试…';

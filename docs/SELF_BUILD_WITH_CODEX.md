@@ -40,7 +40,7 @@ docs/EVENT_TIMELINE.md 和本文件，再检查我的本机构建环境。
    家庭画面、事件短片、设备 IP/序列号、Bark Key 或日志提交到 Git。
 4. 模型转换和部署只在本机完成；先显示将要执行的路径和验证步骤。
 5. 使用 JDK 17 运行单元测试、assembleDebug 和 lintDebug，随后在真机验证
-   摄像头帧率、时间戳、NPU 降级/加载、哭声诊断和事件短片。
+   摄像头帧率、时间戳、NPU 降级/加载、Pose 影子统计、哭声诊断和事件短片。
 6. 最后做 git status --ignored、敏感信息和大文件审计；Git 提交信息使用中文，
    不生成 Release，也不 push，除非我另行明确要求。
 
@@ -72,11 +72,26 @@ python scripts/convert_yolov8_rknn.py \
 
 转换前需要同时核对模型仓库许可证、上游权重许可证和 RKNN Toolkit 条款。不要把家庭校准图或转换后的权重复制到本仓库。
 
+可选睡姿链路还会按文件名查找：
+
+```text
+yolov8n_pose_rk3566.rknn
+retinaface_mobile320_rk3566.rknn
+```
+
+请从 Rockchip RKNN Model Zoo 的 `examples/yolov8_pose` 和 `examples/RetinaFace`
+官方转换说明开始。Pose 的 INT8 路线包含特定 hybrid quantization 配置，不应直接套用
+通用 person 转换脚本。RetinaFace 转换使用其官方 BGR/mean 配置。让 Codex 在 Linux
+x86_64 隔离环境中执行官方脚本、检查输入输出张量数量，并将产物直接放入设备应用私有
+目录；不要把 ONNX、RKNN、校准集或运行库复制到 Git 工作树。
+
 应用运行时从自身私有目录读取：
 
 ```text
 files/yolov8n_rk3566.rknn
 files/yamnet.tflite
+files/yolov8n_pose_rk3566.rknn
+files/retinaface_mobile320_rk3566.rknn
 ```
 
 不同系统对 `run-as`、root 和应用数据目录的限制不同。让 Codex先通过只读命令检查设备，再选择适合该设备的本地部署方式；不要把某台设备的 UID、序列号或固定 IP 写入脚本和文档。
@@ -96,6 +111,11 @@ cd android-app
 - 镜头开放时动作、NPU、哭声和短片正常；镜头罩关闭时只运行哭声检测，NPU、动作和短片停止；
 - 软件隐私模式仍同时停止摄像头和音频，不与实体镜头罩模式混淆；
 - NPU 每 2 秒低频推理，不拖慢约 30fps 编码；
+- Pose 关闭时不加载新增模型；开启后每 2 秒更新姿态、关键点有效率和耗时，镜头罩/隐私/守护关闭时释放模型；
+- 调试骨架默认关闭且只存在于网页 canvas，不进入直播、画中画、快照或事件短片；
+- 面部可见性只在 Pose 风险候选时运行，关闭开关后释放模型；
+- 姿态通知默认关闭；手动开启后会在外发前补跑人体 NPU，检测到两人或成人证据时仍绝不发送，成人离开且风险持续时重新评估；
+- “判断正确 / 错误”反馈只增加端侧标签计数，不自动训练或修改阈值；
 - 动作/疑似哭声事件前的 NPU 补跑在 300ms 上限内返回或清晰记录超时降级；
 - NPU 不根据重点动作区域推断宝宝身份；
 - 检测到两人或成人体型证据时，动作/哭声仍记录但不发送 Bark；

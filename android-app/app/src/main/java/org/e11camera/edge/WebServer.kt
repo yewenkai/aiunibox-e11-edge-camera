@@ -21,7 +21,9 @@ import java.io.InputStream
  *  GET /api/filllight    ?level=0-255
  *  GET /api/ircut        ?on=true|false
  *  GET /api/scene        ?mode=0|1|2
- *  GET /api/baby         ?on=true|false [&mode=normal|audio_only]（无参数=查询）
+ *  GET /api/baby         守护、镜头罩、Pose/面部实验开关（无参数=查询）
+ *  GET /api/pose-feedback ?value=correct|incorrect，保存最近姿态的人工反馈
+ *  GET /api/pose-selftest 单次模型冒烟；不启动守护、不通知、不计入 24 小时样本
  *  GET /api/calibration  ?action=ambient|adult|cancel|reset，场景校准不保存音视频
  *  GET /api/notify       ?add=KEY[&name=备注] ?remove=KEY ?toggle=KEY&on= ?test=KEY|all
  *  GET /api/events       解释时间线；?deleteClip=EVENT_ID 或 ?clearClips=true 清理端侧短片
@@ -68,6 +70,8 @@ class WebServer(
                 uri.startsWith("/api/scene") -> apiScene(params)
                 uri.startsWith("/api/privacy") -> apiPrivacy(params)
                 uri.startsWith("/api/baby") -> apiBaby(params)
+                uri.startsWith("/api/pose-feedback") -> apiPoseFeedback(params)
+                uri.startsWith("/api/pose-selftest") -> apiPoseSelfTest()
                 uri.startsWith("/api/calibration") -> apiCalibration(params)
                 uri.startsWith("/api/notify") -> apiNotify(params)
                 uri.startsWith("/api/events") -> apiEvents(params)
@@ -370,7 +374,7 @@ class WebServer(
         )
     }
 
-    /** 宝宝守护：开关、镜头罩模式、灵敏度、监测区域；无参数时查询当前状态。 */
+    /** 宝宝守护：开关、镜头罩、灵敏度、监测区域和可选 Pose 实验；无参数时查询。 */
     private fun apiBaby(p: Map<String, String>): Response {
         val service = MonitorService.instance
             ?: return json("""{"ok":false,"error":"service_unavailable"}""")
@@ -387,6 +391,11 @@ class WebServer(
             }
             p["on"]?.let { service.setBabyMode(it.toBoolean()) }
             p["sensitivity"]?.toIntOrNull()?.let { service.setBabySensitivity(it) }
+            p["pose"]?.let { service.setPoseAnalysisEnabled(it.toBoolean()) }
+            p["poseNotify"]?.let { service.setPoseNotificationsEnabled(it.toBoolean()) }
+            p["poseDebug"]?.let { service.setPoseDebugOverlayEnabled(it.toBoolean()) }
+            p["poseSideRisk"]?.let { service.setPoseSideRiskEnabled(it.toBoolean()) }
+            p["faceVisibility"]?.let { service.setFaceVisibilityEnabled(it.toBoolean()) }
             p["roi"]?.let { raw ->
                 val v = raw.split(",").map { it.trim().toFloatOrNull() }
                 if (v.size == 4 && v.all { it != null && it in 0f..1f } &&
@@ -411,8 +420,49 @@ class WebServer(
                 .put("lensCoverClosed", state.lensCoverClosed)
                 .put("guardianMode", service.guardianOperatingMode().apiValue)
                 .put("babySensitivity", state.babySensitivity)
+                .put("poseAnalysisEnabled", state.poseAnalysisEnabled)
+                .put("poseNotificationsEnabled", state.poseNotificationsEnabled)
+                .put("poseDebugOverlayEnabled", state.poseDebugOverlayEnabled)
+                .put("poseSideRiskEnabled", state.poseSideRiskEnabled)
+                .put("faceVisibilityEnabled", state.faceVisibilityEnabled)
                 .put("motionRoi", roi)
                 .put("babyMotionActive", service.isBabyMotionActive())
+                .toString()
+        )
+    }
+
+    private fun apiPoseFeedback(p: Map<String, String>): Response {
+        val service = MonitorService.instance
+            ?: return json("""{"ok":false,"error":"service_unavailable"}""")
+        val value = p["value"] ?: return json("""{"ok":false,"error":"feedback_value_required"}""")
+        if (!service.recordPoseFeedback(value)) {
+            return json("""{"ok":false,"error":"pose_or_feedback_unavailable"}""")
+        }
+        return json(
+            JSONObject()
+                .put("ok", true)
+                .put("diagnostics", poseDiagnosticsJson(service.poseDiagnosticsSummary()))
+                .toString()
+        )
+    }
+
+    private fun apiPoseSelfTest(): Response {
+        val service = MonitorService.instance
+            ?: return json("""{"ok":false,"error":"service_unavailable"}""")
+        val snapshot = service.runPoseSelfTest()
+            ?: return json("""{"ok":false,"error":"pose_model_or_frame_unavailable"}""")
+        return json(
+            JSONObject()
+                .put("ok", true)
+                .put("analyzedAt", snapshot.analyzedAt)
+                .put("sourceCapturedAt", snapshot.sourceCapturedAt)
+                .put("inferenceMs", snapshot.poseInferenceMs)
+                .put("personCount", snapshot.personCount)
+                .put("adultLikePersonCount", snapshot.adultLikePersonCount)
+                .put("rawPosture", snapshot.rawPosture.apiValue)
+                .put("keypointValidity", snapshot.keypointValidity)
+                .put("faceStatus", snapshot.faceStatus.apiValue)
+                .put("faceInferenceMs", snapshot.faceInferenceMs)
                 .toString()
         )
     }
@@ -489,7 +539,7 @@ class WebServer(
                 .put("name", "AIUniBOX-E11 Edge Camera")
                 .put("model", android.os.Build.MODEL)
                 .put("deviceId", id)
-                .put("apiVersion", 7)
+                .put("apiVersion", 8)
                 .put("appVersion", BuildConfig.VERSION_NAME)
                 .put("authRequired", security.isEnabled)
                 .toString()
@@ -513,6 +563,10 @@ class WebServer(
         for (box in service?.personBoxes() ?: emptyList()) {
             personBoxes.put(JSONArray(box.toList()))
         }
+        val poseSnapshot = service?.poseSnapshot() ?: PoseAnalysisSnapshot()
+        val poseKeypoints = JSONArray(poseSnapshot.keypoints.toList())
+        val poseTargetBox = JSONArray(poseSnapshot.targetBox.toList())
+        val poseDiagnostics = service?.poseDiagnosticsSummary()
         val clipStorage = service?.guardianClipStorageInfo()
         return json(JSONObject()
             .put("ok", true)
@@ -560,6 +614,37 @@ class WebServer(
             .put("npuInferenceMs", service?.npuInferenceMs() ?: 0L)
             .put("npuAlertRefreshStatus", service?.npuAlertRefreshStatus() ?: "unavailable")
             .put("npuAlertRefreshAt", service?.npuAlertRefreshAt() ?: 0L)
+            .put("poseAnalysisEnabled", state.poseAnalysisEnabled)
+            .put("poseNotificationsEnabled", state.poseNotificationsEnabled)
+            .put("poseDebugOverlayEnabled", state.poseDebugOverlayEnabled)
+            .put("poseSideRiskEnabled", state.poseSideRiskEnabled)
+            .put("faceVisibilityEnabled", state.faceVisibilityEnabled)
+            .put("poseModelAvailable", service?.isPoseModelAvailable() == true)
+            .put("poseModelLoaded", service?.isPoseModelLoaded() == true)
+            .put("faceModelAvailable", service?.isFaceModelAvailable() == true)
+            .put("faceModelLoaded", service?.isFaceModelLoaded() == true)
+            .put("poseAnalyzedAt", poseSnapshot.analyzedAt)
+            .put("poseSourceCapturedAt", poseSnapshot.sourceCapturedAt)
+            .put("poseInferenceMs", poseSnapshot.poseInferenceMs)
+            .put("poseRawState", poseSnapshot.rawPosture.apiValue)
+            .put("poseState", poseSnapshot.stablePosture.apiValue)
+            .put("poseKeypointValidity", poseSnapshot.keypointValidity)
+            .put("poseFaceKeypointValidity", poseSnapshot.faceKeypointValidity)
+            .put("posePersonCount", poseSnapshot.personCount)
+            .put("poseAdultLikePersonCount", poseSnapshot.adultLikePersonCount)
+            .put("poseTargetBox", poseTargetBox)
+            .put("poseKeypoints", poseKeypoints)
+            .put("faceVisibilityStatus", poseSnapshot.faceStatus.apiValue)
+            .put("faceVisibilityScore", poseSnapshot.faceScore)
+            .put("faceVisibilityInferenceMs", poseSnapshot.faceInferenceMs)
+            .put(
+                "poseRiskCandidate",
+                PostureClassificationPolicy.isRisk(
+                    poseSnapshot.stablePosture,
+                    state.poseSideRiskEnabled
+                )
+            )
+            .put("poseDiagnostics", poseDiagnosticsJson(poseDiagnostics))
             .put("personPresent", service?.isPersonPresent() == true)
             .put("personConfidence", service?.personConfidence() ?: 0f)
             .put("personBox", JSONArray(service?.personBox()?.toList() ?: emptyList<Float>()))
@@ -581,6 +666,30 @@ class WebServer(
             .apply { service?.let { put("sceneCalibration", calibrationJson(it)) } }
             .toString()
         )
+    }
+
+    private fun poseDiagnosticsJson(summary: PoseDiagnosticsSummary?): JSONObject {
+        if (summary == null) return JSONObject()
+        return JSONObject()
+            .put("windowHours", 24)
+            .put("observationTargetMinutes", 1_440)
+            .put("sampleCount", summary.sampleCount)
+            .put("sampledMinuteCount", summary.sampledMinuteCount)
+            .put("firstSampleAt", summary.firstSampleAt)
+            .put("lastSampleAt", summary.lastSampleAt)
+            .put("validPosePercent", summary.validPosePercent)
+            .put("averageKeypointValidity", summary.averageKeypointValidity)
+            .put("averageInferenceMs", summary.averageInferenceMs)
+            .put("maximumInferenceMs", summary.maximumInferenceMs)
+            .put("unknownCount", summary.unknownCount)
+            .put("supineCount", summary.supineCount)
+            .put("sideCount", summary.sideCount)
+            .put("proneCount", summary.proneCount)
+            .put("faceRunCount", summary.faceRunCount)
+            .put("averageFaceInferenceMs", summary.averageFaceInferenceMs)
+            .put("correctFeedbackCount", summary.correctFeedbackCount)
+            .put("incorrectFeedbackCount", summary.incorrectFeedbackCount)
+            .put("lastFeedbackAt", summary.lastFeedbackAt)
     }
 
     private fun apiHealth(): Response {

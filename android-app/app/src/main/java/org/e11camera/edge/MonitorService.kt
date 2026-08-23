@@ -25,6 +25,7 @@ class MonitorService : Service() {
         private const val NOTIFICATION_ID = 1
         const val PORT = 8080
         const val ACTION_RESTART_CAMERA = "org.e11camera.edge.RESTART_CAMERA"
+        private const val POSTURE_ALERT_COOLDOWN_MS = 5L * 60L * 1_000L
 
         @Volatile
         var instance: MonitorService? = null
@@ -39,6 +40,8 @@ class MonitorService : Service() {
     private var motionDetector: MotionDetector? = null
     private var cryDetector: CryDetector? = null
     private var npuDetector: NpuDetector? = null
+    private var poseDetector: PoseDetector? = null
+    private var poseDiagnostics: PoseDiagnosticsStore? = null
     private var barkNotifier: BarkNotifier? = null
     private var guardianEventStore: GuardianEventStore? = null
     private var eventClipRecorder: EventClipRecorder? = null
@@ -46,6 +49,8 @@ class MonitorService : Service() {
     private var startedAtMs: Long = 0
     private val healthScheduler = Executors.newSingleThreadScheduledExecutor()
     @Volatile private var lastSuppressedAlertAt: Long = 0
+    @Volatile private var lastPostureAlertAt: Long = 0
+    @Volatile private var lastPostureSuppressedAt: Long = 0
     @Volatile private var initializing = false
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -77,6 +82,7 @@ class MonitorService : Service() {
             val eventStore = GuardianEventStore(this)
             val clipRecorder = EventClipRecorder(eventStore)
             val diagnostics = HealthDiagnostics(this)
+            val poseStats = PoseDiagnosticsStore(this)
             val motion = MotionDetector(s, state, m) {
                 notifyGuardianEvent(
                     kind = "motion",
@@ -95,6 +101,9 @@ class MonitorService : Service() {
             val npu = NpuDetector(this, s, state) { previous, current, observation ->
                 recordSupervisionTransition(previous, current, observation)
             }
+            val pose = PoseDetector(this, s, state, poseStats) { transition, snapshot ->
+                handlePostureTransition(transition, snapshot)
+            }
 
             // 局域网 HTTP 控制服务。
             val srv = WebServer(this, s, m, state, ApiSecurity(), PORT)
@@ -108,6 +117,8 @@ class MonitorService : Service() {
             motionDetector = motion
             cryDetector = cry
             npuDetector = npu
+            poseDetector = pose
+            poseDiagnostics = poseStats
             barkNotifier = bark
             guardianEventStore = eventStore
             eventClipRecorder = clipRecorder
@@ -133,7 +144,7 @@ class MonitorService : Service() {
                 watcher.setLedSuppressed(true)
                 Thread { LedController.allOff() }.start()
                 if (!state.privacyMode) {
-                    startConfiguredGuardianMonitoring(s, clipRecorder, motion, cry, npu)
+                    startConfiguredGuardianMonitoring(s, clipRecorder, motion, cry, npu, pose)
                 }
             }
 
@@ -177,6 +188,7 @@ class MonitorService : Service() {
             motionDetector?.stop()
             cryDetector?.stop()
             npuDetector?.stop()
+            poseDetector?.stop()
             viewerWatcher?.stop()
             server?.stop()
             streamer?.stop()
@@ -188,6 +200,8 @@ class MonitorService : Service() {
         motionDetector = null
         cryDetector = null
         npuDetector = null
+        poseDetector = null
+        poseDiagnostics = null
         eventClipRecorder = null
         guardianEventStore = null
         healthDiagnostics = null
@@ -304,13 +318,14 @@ class MonitorService : Service() {
         clipRecorder: EventClipRecorder? = eventClipRecorder,
         motion: MotionDetector? = motionDetector,
         cry: CryDetector? = cryDetector,
-        npu: NpuDetector? = npuDetector
+        npu: NpuDetector? = npuDetector,
+        pose: PoseDetector? = poseDetector
     ) {
         when (guardianOperatingMode()) {
             GuardianOperatingMode.NORMAL ->
-                startGuardianMonitoring(currentStreamer, clipRecorder, motion, cry, npu)
+                startGuardianMonitoring(currentStreamer, clipRecorder, motion, cry, npu, pose)
             GuardianOperatingMode.AUDIO_ONLY ->
-                startAudioOnlyGuardianMonitoring(clipRecorder, motion, cry, npu)
+                startAudioOnlyGuardianMonitoring(clipRecorder, motion, cry, npu, pose)
             GuardianOperatingMode.OFF,
             GuardianOperatingMode.PRIVACY_PAUSED -> stopGuardianMonitoring()
         }
@@ -321,13 +336,15 @@ class MonitorService : Service() {
         clipRecorder: EventClipRecorder? = eventClipRecorder,
         motion: MotionDetector? = motionDetector,
         cry: CryDetector? = cryDetector,
-        npu: NpuDetector? = npuDetector
+        npu: NpuDetector? = npuDetector,
+        pose: PoseDetector? = poseDetector
     ) {
         clipRecorder?.start(currentStreamer.h264Encoder)
         npu?.start()
         if (npu?.warmUpForGuard() != true) {
             Log.w(TAG, "NPU 未完成启动预热，动作与哭声仍按安全侧继续")
         }
+        pose?.applyConfiguration(visualGuardianRunning = true)
         // 视觉预热完成后再启动事件源，避免首个告警撞上首轮慢推理。
         motion?.start()
         cry?.start()
@@ -337,11 +354,13 @@ class MonitorService : Service() {
         clipRecorder: EventClipRecorder? = eventClipRecorder,
         motion: MotionDetector? = motionDetector,
         cry: CryDetector? = cryDetector,
-        npu: NpuDetector? = npuDetector
+        npu: NpuDetector? = npuDetector,
+        pose: PoseDetector? = poseDetector
     ) {
         clipRecorder?.stop()
         motion?.stop()
         npu?.stop()
+        pose?.stop()
         cry?.start()
         Log.i(TAG, "实体镜头罩关闭：仅音频守护已启动")
     }
@@ -351,10 +370,49 @@ class MonitorService : Service() {
         motionDetector?.stop()
         cryDetector?.stop()
         npuDetector?.stop()
+        poseDetector?.stop()
     }
 
     fun setBabySensitivity(level: Int) {
         deviceState?.babySensitivity = level
+    }
+
+    @Synchronized
+    fun setPoseAnalysisEnabled(enabled: Boolean): Boolean {
+        val state = deviceState ?: return false
+        state.poseAnalysisEnabled = enabled
+        if (!enabled) state.poseNotificationsEnabled = false
+        poseDetector?.applyConfiguration(
+            visualGuardianRunning = GuardianModePolicy.visualEnabled(guardianOperatingMode())
+        )
+        return true
+    }
+
+    fun setPoseNotificationsEnabled(enabled: Boolean): Boolean {
+        val state = deviceState ?: return false
+        state.poseNotificationsEnabled = enabled && state.poseAnalysisEnabled
+        return true
+    }
+
+    fun setPoseDebugOverlayEnabled(enabled: Boolean): Boolean {
+        val state = deviceState ?: return false
+        state.poseDebugOverlayEnabled = enabled
+        return true
+    }
+
+    fun setPoseSideRiskEnabled(enabled: Boolean): Boolean {
+        val state = deviceState ?: return false
+        state.poseSideRiskEnabled = enabled
+        return true
+    }
+
+    fun setFaceVisibilityEnabled(enabled: Boolean): Boolean {
+        val state = deviceState ?: return false
+        state.faceVisibilityEnabled = enabled
+        poseDetector?.applyConfiguration(
+            visualGuardianRunning = GuardianModePolicy.visualEnabled(guardianOperatingMode())
+        )
+        return true
     }
 
     fun barkTargets(): List<BarkNotifier.Target> =
@@ -431,6 +489,25 @@ class MonitorService : Service() {
     fun npuAlertRefreshStatus(): String = npuDetector?.lastAlertRefreshStatus ?: "unavailable"
 
     fun npuAlertRefreshAt(): Long = npuDetector?.lastAlertRefreshAt ?: 0L
+
+    fun isPoseModelAvailable(): Boolean = poseDetector?.poseModelAvailable == true
+
+    fun isPoseModelLoaded(): Boolean = poseDetector?.modelLoaded == true
+
+    fun isFaceModelAvailable(): Boolean = poseDetector?.faceModelAvailable == true
+
+    fun isFaceModelLoaded(): Boolean = poseDetector?.faceModelLoaded == true
+
+    fun poseSnapshot(): PoseAnalysisSnapshot = poseDetector?.latest ?: PoseAnalysisSnapshot()
+
+    fun poseDiagnosticsSummary(): PoseDiagnosticsSummary? = poseDiagnostics?.summary()
+
+    fun recordPoseFeedback(value: String): Boolean = poseDetector?.recordFeedback(value) == true
+
+    fun runPoseSelfTest(): PoseAnalysisSnapshot? {
+        if (deviceState?.privacyMode == true) return null
+        return poseDetector?.selfTest()
+    }
 
     fun startAmbientCalibration(): Boolean =
         GuardianModePolicy.audioEnabled(guardianOperatingMode()) &&
@@ -690,6 +767,115 @@ class MonitorService : Service() {
             barkNotifier?.notify(title, detail)
         } else if (configured) {
             Log.i(TAG, "检测到$title，已合并到一分钟事件会话，不重复发送 Bark")
+        }
+    }
+
+    /**
+     * 稳定姿态首次进入风险候选时才到这里。影子模式和调试骨架始终不经过此方法；
+     * 即使用户手动打开姿态通知，只要当前检测到两人或成人证据也绝不外发。
+     */
+    private fun handlePostureTransition(
+        transition: PostureTransition,
+        snapshot: PoseAnalysisSnapshot
+    ) {
+        val state = deviceState ?: return
+        if (!state.poseNotificationsEnabled) return
+        if (!GuardianModePolicy.visualEnabled(guardianOperatingMode())) return
+        if (!PostureClassificationPolicy.isRisk(transition.current, state.poseSideRiskEnabled)) return
+
+        val now = System.currentTimeMillis()
+        val npu = npuDetector
+        val poseAdultPresent = snapshot.personCount >= 2 || snapshot.adultLikePersonCount > 0
+        val currentNpuAdultPresent = (npu?.personCount ?: 0) >= 2 ||
+            (npu?.adultLikePersonCount ?: 0) > 0 || npu?.notificationsSuppressed == true
+
+        // 已有成人证据时无需为通知补跑；证据消失且冷却期已过，才取新帧做最后复核。
+        if (!poseAdultPresent && !currentNpuAdultPresent &&
+            now - lastPostureAlertAt < POSTURE_ALERT_COOLDOWN_MS
+        ) {
+            Log.i(TAG, "姿态风险候选仍在 5 分钟冷却期，仅保留影子统计")
+            return
+        }
+        val vision = if (poseAdultPresent || currentNpuAdultPresent) null else npu?.refreshForAlert(300L)
+        val refreshedAdultPresent = (vision?.personCount ?: 0) >= 2 ||
+            (vision?.adultLikePersonCount ?: 0) > 0 || vision?.notificationsSuppressed == true
+        val adultPresent = poseAdultPresent || currentNpuAdultPresent || refreshedAdultPresent
+
+        val personCount = maxOf(
+            snapshot.personCount,
+            vision?.personCount ?: npu?.personCount ?: 0
+        )
+        val adultLikeCount = maxOf(
+            snapshot.adultLikePersonCount,
+            vision?.adultLikePersonCount ?: npu?.adultLikePersonCount ?: 0
+        )
+        if (adultPresent && transition.previous == transition.current &&
+            now - lastPostureSuppressedAt < POSTURE_ALERT_COOLDOWN_MS
+        ) {
+            return
+        }
+        if (!adultPresent) lastPostureAlertAt = now else lastPostureSuppressedAt = now
+        val configured = barkNotifier?.configured == true
+        val decision = when {
+            adultPresent -> "suppressed"
+            configured -> "notified"
+            else -> "not_configured"
+        }
+        val postureName = when (transition.current) {
+            PostureLabel.PRONE -> "疑似俯卧"
+            PostureLabel.SIDE -> "疑似侧卧"
+            PostureLabel.SUPINE -> "疑似仰卧"
+            PostureLabel.UNKNOWN -> "姿态不明确"
+        }
+        val faceReason = when (snapshot.faceStatus) {
+            FaceVisibilityStatus.VISIBLE ->
+                "按需头部分析仍检出面部，面部可见性 ${"%.0f".format(snapshot.faceScore * 100)}%"
+            FaceVisibilityStatus.NOT_VISIBLE ->
+                "按需头部分析未确认面部可见，作为遮挡风险的附加证据"
+            FaceVisibilityStatus.NO_HEAD_CROP -> "关键点不足，未能可靠裁出头部区域"
+            FaceVisibilityStatus.MODEL_UNAVAILABLE -> "面部可见性模型当前不可用"
+            FaceVisibilityStatus.DISABLED -> "面部可见性分析未启用"
+            FaceVisibilityStatus.IDLE -> "本次没有运行面部可见性分析"
+        }
+        val refreshReason = when (vision?.refreshStatus) {
+            "refreshed" -> "通知前已补跑一次新画面人体 NPU"
+            "latest_frame" -> "未及时取得新帧，已用最近画面补跑人体 NPU"
+            "timeout" -> "人体 NPU 补跑超过 300ms，按最近可用陪护证据判断"
+            "no_frame" -> "当前没有可用新画面，按最近可用陪护证据判断"
+            "unavailable", "failed", "interrupted" -> "人体 NPU 补跑不可用，保留现有陪护证据"
+            null -> "已有成人或陪护证据，无需为通知重复补跑人体 NPU"
+            else -> "人体 NPU 补跑状态：${vision.refreshStatus}"
+        }
+        val adultReason = when {
+            personCount >= 2 ->
+                "当前画面检测到至少两人，按成人陪护处理，未发送通知"
+            adultPresent -> "当前检测到成人体型或陪护缓冲证据，未发送通知"
+            configured -> "未检测到明确成人，实验性姿态通知已发送"
+            else -> "未检测到明确成人，但尚未配置可用通知设备"
+        }
+        val event = guardianEventStore?.addTriggered(
+            kind = "posture",
+            title = "宝宝守护：${postureName}候选",
+            summary = "连续 6 次分析中至少 5 次得到${postureName}标签",
+            decision = decision,
+            reason = "$adultReason；$refreshReason；$faceReason；这是 2D 关键点启发式，不是医学判断",
+            personCount = personCount,
+            adultLikePersonCount = adultLikeCount,
+            supervisionState = (npu?.supervisionState ?: SupervisionStateMachine.State.UNKNOWN)
+                .name.lowercase(),
+            cryScore = null
+        )
+        event?.let { eventClipRecorder?.capture(it.id) }
+        if (adultPresent) {
+            lastSuppressedAlertAt = now
+            Log.i(TAG, "检测到$postureName，但存在成人陪护证据，仅记录端侧事件")
+            return
+        }
+        if (configured) {
+            barkNotifier?.notify(
+                "宝宝守护：${postureName}候选",
+                "连续姿态分析得到风险候选；$faceReason。请打开实时画面人工确认"
+            )
         }
     }
 

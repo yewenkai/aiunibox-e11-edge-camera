@@ -239,7 +239,7 @@ class NpuDetector(
             Log.w(TAG, "未找到 $MODEL_FILE，NPU 检测停用")
             return false
         }
-        handle = nativeCreate(modelFile.readBytes())
+        handle = synchronized(NpuExecutionGate.lock) { nativeCreate(modelFile.readBytes()) }
         if (handle == 0L) {
             Log.w(TAG, "rknn_init 失败，NPU 检测停用")
             return false
@@ -259,7 +259,7 @@ class NpuDetector(
 
     private fun destroyModel() {
         if (handle != 0L) {
-            nativeDestroy(handle)
+            synchronized(NpuExecutionGate.lock) { nativeDestroy(handle) }
             handle = 0
         }
         modelLoaded = false
@@ -451,7 +451,9 @@ class NpuDetector(
             rgb[i * 3 + 2] = (c and 0xFF).toByte()
         }
 
-        val outputs = nativeRun(handle, rgb, inputW, inputH) ?: return emptyList()
+        val outputs = synchronized(NpuExecutionGate.lock) {
+            nativeRun(handle, rgb, inputW, inputH)
+        } ?: return emptyList()
         if (outputs.size != outputCount || outputs.size !in setOf(6, 9)) return emptyList()
         val candidates = mutableListOf<FloatArray>()
         val outputPerBranch = outputs.size / 3

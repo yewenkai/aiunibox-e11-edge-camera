@@ -20,6 +20,8 @@
 | `/vendor/bin/hw/ipcamera_test` | 特定样机的云台、IR-CUT 和补光接口 | 由设备厂商决定 | 否 |
 | Rockchip RKNN Toolkit / Runtime / C API 头文件 | 可选的 RK3566 NPU 推理与模型转换 | 由 Rockchip 发布条款决定 | 否 |
 | YOLOv8n ONNX / RKNN 模型 | 实验性 person 检测 | 由模型来源及其上游许可证决定 | 否 |
+| YOLOv8n-Pose ONNX / RKNN 模型 | 可选的实验性姿态关键点分析 | 由模型来源及其上游许可证决定 | 否 |
+| RetinaFace mobile320 ONNX / RKNN 模型 | 风险候选时可选的面部可见性分析，不做身份识别 | 由模型来源及其上游许可证决定 | 否 |
 | YAMNet TFLite 模型 | 实验性哭声候选分类 | 由模型来源及其发布条款决定 | 否 |
 
 仓库不包含 FFmpeg、商业 APK、反编译文件、厂商固件、私有库、模型权重或训练数据集。
