@@ -175,6 +175,10 @@
   .event-observation strong { color: #cbd5e1; font-weight: 600; }
   .event-actions { display: flex; align-items: center; gap: 7px; margin-top: 9px; flex-wrap: wrap; }
   .event-actions .toggle-btn { padding: 5px 10px; font-size: 11px; }
+  .feedback-actions { display: flex; align-items: center; gap: 5px; margin-top: 9px; flex-wrap: wrap; }
+  .feedback-label { color: #64748b; font-size: 10px; margin-right: 2px; }
+  .feedback-actions .toggle-btn { padding: 4px 8px; font-size: 10px; }
+  .feedback-actions .toggle-btn.selected { color: #dbeafe; background: #1d4ed8; }
   .clip-state { color: #718096; font-size: 10px; }
   .event-video { width: 100%; margin-top: 9px; border-radius: 8px; background: #000; }
 
@@ -347,7 +351,7 @@
     <div class="event-head">
       <div>
         <div class="section-title">事件解释时间线</div>
-        <div class="event-subtitle">最新事件在上，可在框内上下滑动；记录判断原因和端侧画面短片（暂不含声音）</div>
+        <div class="event-subtitle">最新事件在上，可在框内上下滑动；反馈只作端侧复盘，不会自动改阈值</div>
       </div>
       <div class="event-head-actions">
         <button class="toggle-btn" id="testClipBtn" type="button">测试短片</button>
@@ -637,7 +641,7 @@ async function loadGuardianEvents(force = false) {
   $('clearClipsBtn').disabled = storedClipCount <= 0;
 
   const events = j.events || [];
-  const signature = events.map(e => `${e.id}:${e.lastOccurredAt}:${e.clipStatus}:${e.clipSizeBytes}:${(e.observations || []).length}`).join('|');
+  const signature = events.map(e => `${e.id}:${e.lastOccurredAt}:${e.clipStatus}:${e.clipSizeBytes}:${e.feedback || ''}:${(e.observations || []).length}`).join('|');
   if (!force && signature === eventRenderSignature) return;
   eventRenderSignature = signature;
 
@@ -707,6 +711,24 @@ async function loadGuardianEvents(force = false) {
       card.appendChild(details);
     }
 
+    if (['incident', 'motion', 'cry'].includes(event.kind)) {
+      const feedback = document.createElement('div');
+      feedback.className = 'feedback-actions';
+      appendText(feedback, 'feedback-label', '这次实际情况：', 'span');
+      const choices = [
+        ['attention', '确实需要关注'],
+        ['false_alarm', '误报'],
+        ['caregiver_present', '成人在场']
+      ];
+      for (const [value, label] of choices) {
+        const button = appendText(feedback, `toggle-btn${event.feedback === value ? ' selected' : ''}`, label, 'button');
+        button.type = 'button';
+        button.dataset.eventFeedback = event.id;
+        button.dataset.feedbackValue = value;
+      }
+      card.appendChild(feedback);
+    }
+
     if (event.clipStatus !== 'none') {
       const actions = document.createElement('div');
       actions.className = 'event-actions';
@@ -739,6 +761,20 @@ async function loadGuardianEvents(force = false) {
 $('eventList').addEventListener('click', async e => {
   const button = e.target.closest('button');
   if (!button) return;
+  if (button.dataset.eventFeedback) {
+    const j = await api(
+      `/api/events?feedback=${encodeURIComponent(button.dataset.eventFeedback)}` +
+      `&value=${encodeURIComponent(button.dataset.feedbackValue)}`
+    );
+    if (j?.ok) {
+      toast('反馈已保存在设备端');
+      eventRenderSignature = '';
+      loadGuardianEvents(true);
+    } else {
+      toast('反馈保存失败');
+    }
+    return;
+  }
   if (button.dataset.eventPlay) {
     const card = button.closest('.event-card');
     const old = card.querySelector('video');

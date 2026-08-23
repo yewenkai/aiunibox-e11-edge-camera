@@ -26,6 +26,8 @@ data class GuardianEventEntry(
     val cryCount: Int = 0,
     val notificationSent: Boolean = false,
     val observations: List<GuardianEventObservation> = emptyList(),
+    val feedback: String? = null,
+    val feedbackAt: Long = 0L,
     val clipStatus: String = GuardianEventStore.CLIP_NONE,
     val clipFileName: String? = null,
     val clipDurationMs: Long = 0L,
@@ -77,7 +79,7 @@ data class GuardianClipCleanupResult(
 class GuardianEventStore(context: Context) {
     companion object {
         private const val TAG = "GuardianEventStore"
-        private const val STORE_VERSION = 2
+        private const val STORE_VERSION = 3
         private const val MAX_EVENTS = 200
         private const val MAX_OBSERVATIONS = 30
         const val MAX_CLIPS = 60
@@ -315,6 +317,17 @@ class GuardianEventStore(context: Context) {
     @Synchronized
     fun list(limit: Int = 50): List<GuardianEventEntry> =
         events.take(limit.coerceIn(1, MAX_EVENTS)).toList()
+
+    /** 只保存端侧复盘标签，不自动改阈值或训练模型。 */
+    @Synchronized
+    fun setFeedback(eventId: String, rawValue: String): Boolean {
+        val value = GuardianFeedbackPolicy.normalize(rawValue) ?: return false
+        val updated = updateLocked(eventId) {
+            it.copy(feedback = value, feedbackAt = System.currentTimeMillis())
+        }
+        if (updated) persistLocked()
+        return updated
+    }
 
     @Synchronized
     fun markClipReady(eventId: String, file: File, durationMs: Long) {
@@ -566,6 +579,8 @@ class GuardianEventStore(context: Context) {
         .put("observations", JSONArray().apply {
             event.observations.forEach { put(toJson(it)) }
         })
+        .put("feedback", event.feedback ?: JSONObject.NULL)
+        .put("feedbackAt", event.feedbackAt)
         .put("clipStatus", event.clipStatus)
         .put("clipFileName", event.clipFileName ?: JSONObject.NULL)
         .put("clipDurationMs", event.clipDurationMs)
@@ -604,6 +619,9 @@ class GuardianEventStore(context: Context) {
             } else if (kind == "cry") 1 else 0,
             notificationSent = json.optBoolean("notificationSent", json.optString("decision") == "notified"),
             observations = observations.takeLast(MAX_OBSERVATIONS),
+            feedback = json.optNullableString("feedback")
+                ?.let(GuardianFeedbackPolicy::normalize),
+            feedbackAt = json.optLong("feedbackAt"),
             clipStatus = json.optString("clipStatus", CLIP_NONE),
             clipFileName = json.optNullableString("clipFileName"),
             clipDurationMs = json.optLong("clipDurationMs"),

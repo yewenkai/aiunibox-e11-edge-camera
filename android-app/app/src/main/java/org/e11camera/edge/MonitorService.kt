@@ -433,6 +433,9 @@ class MonitorService : Service() {
     fun guardianEvents(limit: Int): List<GuardianEventEntry> =
         guardianEventStore?.list(limit) ?: emptyList()
 
+    fun setGuardianEventFeedback(eventId: String, value: String): Boolean =
+        guardianEventStore?.setFeedback(eventId, value) == true
+
     fun guardianClipFile(eventId: String): java.io.File? =
         guardianEventStore?.clipFile(eventId)
 

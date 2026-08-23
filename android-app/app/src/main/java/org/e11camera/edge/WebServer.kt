@@ -568,6 +568,12 @@ class WebServer(
                 return json("""{"ok":false,"error":"event_or_clip_not_found"}""")
             }
         }
+        p["feedback"]?.let { eventId ->
+            val value = p["value"] ?: return json("""{"ok":false,"error":"feedback_value_required"}""")
+            if (!service.setGuardianEventFeedback(eventId, value)) {
+                return json("""{"ok":false,"error":"event_or_feedback_invalid"}""")
+            }
+        }
         val cleanup = if (p["clearClips"]?.toBoolean() == true) {
             service.clearGuardianHistoryClips()
         } else {
@@ -616,6 +622,8 @@ class WebServer(
                     .put("cryCount", event.cryCount)
                     .put("notificationSent", event.notificationSent)
                     .put("observations", observations)
+                    .put("feedback", event.feedback ?: JSONObject.NULL)
+                    .put("feedbackAt", event.feedbackAt)
                     .put("clipStatus", event.clipStatus)
                     .put("clipDurationMs", event.clipDurationMs)
                     .put("clipSizeBytes", event.clipSizeBytes)
