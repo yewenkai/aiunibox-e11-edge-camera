@@ -60,6 +60,13 @@ class NpuDetector(
         observation: SupervisionStateMachine.Observation
     ) -> Unit = { _, _, _ -> }
 ) {
+    private data class InferencePass(
+        val available: Boolean,
+        val boxes: List<FloatArray>,
+        val inferenceMs: Long,
+        val snapshot: AlertVisionSnapshot
+    )
+
     companion object {
         private const val TAG = "NpuDetector"
         private const val MODEL_FILE = "yolov8n_rk3566.rknn"
@@ -155,7 +162,8 @@ class NpuDetector(
         val executor = Executors.newSingleThreadScheduledExecutor()
         scheduler = executor
         running.set(true)
-        executor.scheduleAtFixedRate({ tick() }, 3, SAMPLE_INTERVAL_SEC, TimeUnit.SECONDS)
+        // 守护启动会主动预热；常规轮询稍后开始，避免与 YAMNet 初始化抢 CPU。
+        executor.scheduleAtFixedRate({ tick() }, 5, SAMPLE_INTERVAL_SEC, TimeUnit.SECONDS)
         Log.i(TAG, "NPU 检测已启动（YOLOv8n @${inputW}×${inputH}，每 ${SAMPLE_INTERVAL_SEC}s 一帧）")
     }
 
@@ -309,19 +317,88 @@ class NpuDetector(
         }
     }
 
+    /**
+     * 守护启动时先完成一次可能较慢的首轮推理，避免第一个真实
+     * 告警把 RKNN/Bitmap 预热时间算进 300ms 等待上限。
+     */
+    fun warmUpForGuard(timeoutMs: Long = 8_000L): Boolean {
+        val executor = scheduler
+        if (!running.get() || !modelLoaded || executor == null) return false
+        return try {
+            val future = executor.submit<Boolean> {
+                // 开机时 HTTP 服务可能早于 Camera HAL 就绪，给首帧恢复留足时间。
+                val fresh = streamer.requestFreshJpeg(5_000L)
+                val source = fresh ?: streamer.latestJpegSnapshot()
+                if (source.bytes.isEmpty()) false
+                else {
+                    var passes = 0
+                    var stable = false
+                    var finalPass: InferencePass? = null
+                    while (passes < 4 && !stable) {
+                        // 多轮可复用同一画面做性能预热，但不能把同一帧重复
+                        // 计入陪护防抖，否则一次成人命中会被误当成连续多帧证据。
+                        val result = executeInference(source, "warmup", publishPresence = false)
+                        if (!result.available) return@submit false
+                        finalPass = result
+                        passes++
+                        // 至少两轮；某些 RK3566 运行时需要第三轮才进入稳定时延。
+                        stable = passes >= 2 && result.inferenceMs in 1L..250L
+                    }
+                    val published = finalPass?.let { publishWarmupPresence(it) } == true
+                    Log.i(TAG, "NPU 预热完成 passes=$passes stable=$stable last=${lastInferenceMs}ms")
+                    published
+                }
+            }
+            try {
+                future.get(timeoutMs.coerceAtLeast(1L), TimeUnit.MILLISECONDS)
+            } catch (_: TimeoutException) {
+                future.cancel(false)
+                false
+            }
+        } catch (e: Exception) {
+            if (e is InterruptedException) Thread.currentThread().interrupt()
+            Log.w(TAG, "NPU 预热失败，守护将按降级方式继续", e)
+            false
+        }
+    }
+
     private fun runInference(
         source: CameraStreamer.JpegSnapshot,
         refreshStatus: String
-    ): AlertVisionSnapshot = synchronized(inferenceLock) {
-        if (!running.get() || handle == 0L) return@synchronized currentSnapshot("unavailable")
+    ): AlertVisionSnapshot = executeInference(source, refreshStatus, publishPresence = true).snapshot
+
+    private fun executeInference(
+        source: CameraStreamer.JpegSnapshot,
+        refreshStatus: String,
+        publishPresence: Boolean
+    ): InferencePass = synchronized(inferenceLock) {
+        if (!running.get() || handle == 0L) {
+            return@synchronized InferencePass(
+                available = false,
+                boxes = emptyList(),
+                inferenceMs = 0L,
+                snapshot = currentSnapshot("unavailable")
+            )
+        }
         val t0 = System.currentTimeMillis()
         val boxes = detectPersons(source.bytes)
         val cost = System.currentTimeMillis() - t0
         lastSourceCapturedAt = source.capturedAtMs
         lastInferenceMs = cost
         lastAnalyzedAt = System.currentTimeMillis()
-        updatePresence(boxes, cost)
-        currentSnapshot(refreshStatus)
+        if (publishPresence) updatePresence(boxes, cost)
+        InferencePass(
+            available = true,
+            boxes = boxes,
+            inferenceMs = cost,
+            snapshot = currentSnapshot(refreshStatus)
+        )
+    }
+
+    private fun publishWarmupPresence(result: InferencePass): Boolean = synchronized(inferenceLock) {
+        if (!running.get() || handle == 0L) return@synchronized false
+        updatePresence(result.boxes, result.inferenceMs)
+        true
     }
 
     private fun currentSnapshot(refreshStatus: String): AlertVisionSnapshot = AlertVisionSnapshot(

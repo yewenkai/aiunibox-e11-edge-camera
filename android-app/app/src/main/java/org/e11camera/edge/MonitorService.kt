@@ -133,10 +133,7 @@ class MonitorService : Service() {
                 watcher.setLedSuppressed(true)
                 Thread { LedController.allOff() }.start()
                 if (!state.privacyMode) {
-                    clipRecorder.start(s.h264Encoder)
-                    motion.start()
-                    cry.start()
-                    npu.start()
+                    startGuardianMonitoring(s, clipRecorder, motion, cry, npu)
                 }
             }
 
@@ -264,10 +261,7 @@ class MonitorService : Service() {
             s.resume()
             startRtspPublisher(s)
             if (state.babyMonitorEnabled) {
-                eventClipRecorder?.start(s.h264Encoder)
-                motionDetector?.start()
-                cryDetector?.start()
-                npuDetector?.start()
+                startGuardianMonitoring(s)
             }
         }
         return true
@@ -282,10 +276,7 @@ class MonitorService : Service() {
             viewerWatcher?.setLedSuppressed(true)
             Thread { LedController.allOff() }.start()
             if (!state.privacyMode) {
-                eventClipRecorder?.start(streamer?.h264Encoder)
-                motionDetector?.start()
-                cryDetector?.start()
-                npuDetector?.start()
+                streamer?.let { startGuardianMonitoring(it) }
             }
         } else {
             eventClipRecorder?.stop()
@@ -295,6 +286,23 @@ class MonitorService : Service() {
             viewerWatcher?.setLedSuppressed(false)
         }
         return true
+    }
+
+    private fun startGuardianMonitoring(
+        currentStreamer: CameraStreamer,
+        clipRecorder: EventClipRecorder? = eventClipRecorder,
+        motion: MotionDetector? = motionDetector,
+        cry: CryDetector? = cryDetector,
+        npu: NpuDetector? = npuDetector
+    ) {
+        clipRecorder?.start(currentStreamer.h264Encoder)
+        npu?.start()
+        if (npu?.warmUpForGuard() != true) {
+            Log.w(TAG, "NPU 未完成启动预热，动作与哭声仍按安全侧继续")
+        }
+        // 视觉预热完成后再启动事件源，避免首个告警撞上首轮慢推理。
+        motion?.start()
+        cry?.start()
     }
 
     fun setBabySensitivity(level: Int) {
