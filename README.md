@@ -15,6 +15,8 @@
 
 有研究需要的使用者应自行了解 Android/Gradle 项目的构建方式，审阅代码和依赖，配置合法取得的 Android SDK、JDK 与设备侧组件，并自行编译生成适用于其设备的版本。仓库中的部署配置和命令只用于说明研究过程，不构成开箱即用的安装支持。
 
+不熟悉 Android/RKNN 工具链的使用者，可以按照[使用 Codex 自行完成本地构建](docs/SELF_BUILD_WITH_CODEX.md)在自己的电脑和设备上逐步检查、转换、编译和验收；指南明确要求 Codex 不把第三方二进制、模型、家庭数据或设备信息带入 Git。
+
 GitHub Actions 仅验证源码是否可以编译，不上传 APK 或其他构建产物。
 
 ## 当前能力
@@ -22,8 +24,9 @@ GitHub Actions 仅验证源码是否可以编译，不上传 APK 或其他构建
 - Camera2 采集，当前以 640×480、目标 30fps 运行
 - MediaCodec Surface 硬编码，避免 CPU 侧 YUV 拷贝
 - App 内直接发布 H.264/RTP 到 MediaMTX，不经过 FFmpeg
+- GPU 零拷贝前置合成东八区日期时间，时间戳进入 H.264 画面，可用于全屏、画中画和录像
 - RTSP 与 WebRTC 播放
-- 内置局域网控制页
+- 内置局域网控制页，含独立的整页刷新按钮
 - App 前台 4:3 本地回显
 - 水平云台点动与长按连续调整
 - 红外灯、补光灯、IR-CUT 和 RGB 状态灯控制
@@ -31,6 +34,11 @@ GitHub Actions 仅验证源码是否可以编译，不上传 APK 或其他构建
 - Bearer Token 保护设备 HTTP API
 - Home Assistant / HACS 自定义集成
 - 云台软件零点、常用位置与隐私模式
+- RK3566 NPU 低频通用人体检测（实验性上下文补强，不能识别年龄或宝宝身份）
+- 宝宝守护：可选重点区域动作检测、本地 YAMNet 哭声检测和 Bark 多设备通知
+- 陪护状态判断：检出两人或成人体型证据时暂停通知，陪护证据消失后自动恢复
+- 可解释事件时间线：记录动作/哭声、人数、通知或抑制原因，列表在页面内部滑动
+- 端侧事件短片：复用 H.264 硬编码保存事件前约 10 秒、后约 20 秒，可播放和逐条删除
 - Magisk/service.d 开机启动与健康守护示例
 
 本项目目前是面向 AIUniBOX-E11 样机的实验性实现，不是通用摄像头应用。云台和灯光功能依赖设备已经存在的本地硬件控制接口。
@@ -42,7 +50,9 @@ GitHub Actions 仅验证源码是否可以编译，不上传 APK 或其他构建
    │
    ├─ Camera2 ──> SurfaceView 本地回显
    │
-   └─ MediaCodec H.264 ──> App 内 RTSP Publisher
+   └─ SurfaceTexture ──> GLES 东八区时间戳 ──> MediaCodec H.264
+                                                 ├─> App 内 RTSP Publisher
+                                                 └─> 事件短片循环缓存 / MP4
                               │
                               v
                            MediaMTX
@@ -98,6 +108,8 @@ adb shell pm grant org.e11camera.edge android.permission.CAMERA
 
 首次执行硬件控制时，需要在 Magisk 中授予应用 root 权限。若设备中已有其他进程独占摄像头，应先通过设备自身设置安全地停止该进程；本仓库不提供针对特定商业应用的修改或破解文件。
 
+NPU、YAMNet 和 MediaMTX 都是可选的本地组件，仓库不提供对应模型或二进制。完整的源码自建边界、Codex 提示词和提交前审计见 [docs/SELF_BUILD_WITH_CODEX.md](docs/SELF_BUILD_WITH_CODEX.md)。
+
 ## 部署 MediaMTX
 
 本仓库不分发 MediaMTX 可执行文件。请从 [MediaMTX 官方发布页](https://github.com/bluenviron/mediamtx/releases)自行取得与你设备架构匹配的版本，并遵守其 MIT License。
@@ -149,16 +161,22 @@ Release；标签版本与 `manifest.json` 不一致时会拒绝发布。
 云台位置是软件累计值。首次部署时请把镜头转到希望作为中心的位置，再按一次
 “当前位置设为零点”；如果曾绕过本应用直接执行厂商电机命令，需要重新设置软件零点。
 
-## NPU 与轻量视觉路线
+## NPU 与轻量视觉
 
-RK3566 官方标称约 1 TOPS NPU，适合低频率、轻量化的边缘视觉任务。项目后续优先考虑：
+RK3566 官方标称约 1 TOPS NPU，适合低频率、轻量化的边缘视觉任务。当前已实现第一阶段实验链路：
 
-1. 画面中是否有人：低分辨率、低帧率抽帧，输出“有人/无人”和置信度，不默认保存人脸。
-2. 简单手势识别：先做手掌检测，再做少量静态手势分类，用于本地交互。
-3. 事件触发：仅在有人或手势出现时通知、亮灯或提高分析频率。
-4. 隐私优先：模型在设备本地运行，默认不上传原始画面。
+1. 复用约每秒一张的 JPEG 快照，每 2 秒运行一次 RKNN，不阻塞 Camera2 和编码线程。
+2. 使用 Rockchip 优化版 YOLOv8n 的 9 路输出，只解码 COCO person 类；最近 3 帧至少 2 帧命中才进入“有人”，连续 10 秒未命中才退出。
+3. 保留当前帧的全部人体框和人数供状态判断；人体框不烧进直播，也不持久化。
+4. RKNN SDK、运行库和模型由研究者自行从合法来源取得，缺失时应用自动降级，不影响摄像头与推流。
 
-NPU 推理尚未实现。Rockchip RKNN 工具链和模型文件不会直接提交到本仓库；引入前需要分别确认 SDK、转换工具、模型权重和数据集的许可证。详细设计见 [docs/NPU_ROADMAP.md](docs/NPU_ROADMAP.md)。
+陪护状态采用安全侧策略：当前帧一旦出现两人或成人体型证据，就即时抑制当次 Bark；最近 4 次中至少 3 次出现这些证据后，页面稳定确认为“有人陪护”。陪护证据消失约 20 秒后自动恢复通知。成人体型只是固定机位下基于人体框尺寸的启发式，不是年龄识别。动作、哭声和 NPU 始终继续运行，判断中或视觉漏检时也保持通知武装。
+
+哭声检测使用 16kHz 单声道、约 0.975 秒窗口的本地 YAMNet，直接读取模型输出的 0～1 类别分数并取哭声相关类别最高分。网页显示实时音频 RMS、哭声分数、阈值和最高类别，便于按现场距离与噪声校准。
+
+宝宝不必位于婴儿床或固定位置。用户框选的重点区域只影响动作检测，不参与成人陪护或宝宝身份判断。视觉仍只是“补强信号”：通用 COCO person 模型在侧卧、遮挡、逆光等场景下可能漏检，因此页面只陈述“检出人体 / 未检出人体”，不能把后者解释为确定无人。
+
+动作或哭声事件会写入可解释时间线，并在设备应用私有目录保存带画面时间戳的短片。记录上限为 200 条；短片上限为 60 段或 256 MiB，达到上限时淘汰最旧短片，用户也可逐条手动删除。当前短片不含声音。详细逻辑见 [docs/EVENT_TIMELINE.md](docs/EVENT_TIMELINE.md)，NPU 转换和边界见 [docs/NPU_ROADMAP.md](docs/NPU_ROADMAP.md)。
 
 ## 仓库结构
 
@@ -168,7 +186,7 @@ NPU 推理尚未实现。Rockchip RKNN 工具链和模型文件不会直接提�
 ├── custom_components/     Home Assistant 自定义集成
 ├── brand/                 HACS 展示图标
 ├── deploy/magisk/         MediaMTX 最小配置与开机守护示例
-├── docs/                  移植和 NPU 路线文档
+├── docs/                  移植、NPU、事件短片与源码自建说明
 ├── LICENSE                本项目 MIT License
 ├── SECURITY.md            安全与隐私边界
 └── THIRD_PARTY_NOTICES.md 第三方依赖与未分发组件说明
@@ -181,6 +199,7 @@ NPU 推理尚未实现。Rockchip RKNN 工具链和模型文件不会直接提�
 - 不包含原厂 APK、反编译产物、固件、私有库或设备抓取文件
 - 不包含 MediaMTX、FFmpeg 等第三方可执行文件
 - 不包含 HTTPS 私钥、自签名证书、家庭画面、设备序列号、MAC 或局域网固定地址
+- 不包含 Bark Key、事件数据库、哭声音频、端侧短片或真实校准图片
 - Android 包名和应用名称均使用项目自己的中性标识
 - 第三方依赖由 Gradle 或用户从官方渠道取得，并在 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 中说明
 

@@ -27,9 +27,22 @@ class ViewerWatcher(
 
     private val scheduler = Executors.newSingleThreadScheduledExecutor()
     private val wasWatching = AtomicBoolean(false)
+    private val ledSuppressed = AtomicBoolean(false)
 
     val isWatching: Boolean
         get() = wasWatching.get()
+
+    /**
+     * 宝宝守护开启期间抑制观看提示灯，避免夜间照醒宝宝。
+     * 解除抑制后，若仍有观看者，下一个轮询周期会自动恢复亮灯。
+     */
+    fun setLedSuppressed(suppressed: Boolean) {
+        val was = ledSuppressed.getAndSet(suppressed)
+        if (suppressed && !was && wasWatching.get()) {
+            Log.i(TAG, "LED 已抑制，立即熄灭观看提示灯")
+            Thread { LedController.setLed(watchLed, 0) }.start()
+        }
+    }
 
     fun start() {
         // 标记由 mediamtx 的会话级 hook 维护。这里不主动清零，
@@ -43,6 +56,16 @@ class ViewerWatcher(
             // 用 ShellUtil 读标记文件（避免主线程 IO 限制）
             val content = ShellUtil.execSu("cat $markerPath 2>/dev/null").trim()
             val hasViewers = content == "1"
+
+            if (ledSuppressed.get()) {
+                // 宝宝守护期间不亮任何提示灯；保持 wasWatching=false，
+                // 解除抑制后靠下一个上升沿自动恢复。
+                if (wasWatching.get()) {
+                    LedController.setLed(watchLed, 0)
+                    wasWatching.set(false)
+                }
+                return
+            }
 
             if (hasViewers && !wasWatching.get()) {
                 Log.i(TAG, "检测到观看者，亮灯（$watchLed=$watchLedLevel）")

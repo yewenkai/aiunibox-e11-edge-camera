@@ -13,6 +13,11 @@
     min-height: 100vh; padding: 12px; -webkit-user-select: none;
   }
   .wrap { max-width: 760px; margin: 0 auto; }
+  .page-toolbar {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 10px; margin-bottom: 10px;
+  }
+  .page-title { font-size: 15px; font-weight: 650; color: #dbeafe; }
 
   /* 视频 */
   .video-box {
@@ -22,18 +27,135 @@
   .video-box canvas { width: 100%; height: 100%; display: block; }
   .video-box iframe { width: 100%; height: 100%; border: none; }
   .badge {
-    position: absolute; top: 8px; left: 8px;
-    background: rgba(0,0,0,0.6); color: #4ade80;
+    color: #4ade80;
     font-size: 12px; padding: 3px 8px; border-radius: 4px;
     font-family: monospace;
   }
   .badge.off { color: #f87171; }
   .fps-badge {
-    position: absolute; top: 8px; right: 8px;
-    background: rgba(0,0,0,0.6); color: #93c5fd;
+    color: #93c5fd;
     font-size: 12px; padding: 3px 8px; border-radius: 4px;
     font-family: monospace;
   }
+  .stream-meta {
+    min-height: 30px; display: flex; align-items: center; gap: 6px;
+    padding: 4px 4px 0; color: #6b7280; font-size: 11px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  .frame-health { margin-left: auto; }
+  .frame-health.stale { color: #f87171; }
+  .refresh-page {
+    background: #263248; color: #fff; border: 1px solid #475569;
+    border-radius: 7px; padding: 8px 12px; font-size: 13px;
+    font-family: inherit; cursor: pointer; touch-action: manipulation;
+  }
+  .refresh-page:active { background: #2563eb; }
+
+  /* 宝宝守护总览：先给结论，再展开设置。NPU 只作为上下文，不做硬门控。 */
+  .guardian-overview {
+    margin-top: 12px; padding: 14px; border-radius: 14px;
+    background: linear-gradient(145deg, #182130 0%, #171c25 100%);
+    border: 1px solid #2a3850;
+  }
+  .guardian-head {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 10px; margin-bottom: 12px;
+  }
+  .guardian-title { font-size: 15px; font-weight: 700; color: #f8fafc; }
+  .guardian-chip {
+    padding: 5px 9px; border-radius: 999px; font-size: 11px; font-weight: 650;
+    color: #bfdbfe; background: rgba(59,130,246,.14); border: 1px solid rgba(96,165,250,.25);
+  }
+  .guardian-chip.alert { color: #fecaca; background: rgba(239,68,68,.14); border-color: rgba(248,113,113,.32); }
+  .guardian-chip.off { color: #9ca3af; background: rgba(107,114,128,.12); border-color: #374151; }
+  .guardian-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+  .signal-card {
+    min-width: 0; min-height: 108px; padding: 11px; border-radius: 10px;
+    background: rgba(9,14,22,.58); border: 1px solid #293444;
+  }
+  .signal-card.ok { border-color: rgba(74,222,128,.38); background: rgba(20,83,45,.13); }
+  .signal-card.warn { border-color: rgba(251,191,36,.35); background: rgba(120,53,15,.12); }
+  .signal-card.alert { border-color: rgba(248,113,113,.46); background: rgba(127,29,29,.16); }
+  .signal-card.off { opacity: .7; }
+  .signal-name { display: flex; align-items: center; gap: 7px; color: #9ca3af; font-size: 11px; }
+  .signal-dot { width: 7px; height: 7px; border-radius: 50%; background: #64748b; box-shadow: 0 0 0 3px rgba(100,116,139,.12); }
+  .signal-card.ok .signal-dot { background: #4ade80; box-shadow: 0 0 0 3px rgba(74,222,128,.12); }
+  .signal-card.warn .signal-dot { background: #fbbf24; box-shadow: 0 0 0 3px rgba(251,191,36,.12); }
+  .signal-card.alert .signal-dot { background: #f87171; box-shadow: 0 0 0 3px rgba(248,113,113,.12); }
+  .signal-value {
+    display: block; margin-top: 10px; color: #e5e7eb; font-size: 13px;
+    font-weight: 650; line-height: 1.35; overflow-wrap: anywhere;
+  }
+  .signal-note { display: block; margin-top: 6px; color: #718096; font-size: 10px; line-height: 1.4; }
+  .guardian-note {
+    margin-top: 10px; padding: 9px 10px; border-radius: 8px;
+    color: #aab4c3; background: rgba(15,23,42,.7); font-size: 11px; line-height: 1.55;
+  }
+  .guardian-note strong { color: #fbbf24; font-weight: 650; }
+  .inline-action {
+    margin-left: 6px; padding: 3px 8px; border: 1px solid #475569; border-radius: 999px;
+    color: #bfdbfe; background: #263248; font: inherit; cursor: pointer;
+  }
+
+  /* 可解释事件时间线 */
+  .event-head {
+    display: flex; align-items: flex-start; justify-content: space-between;
+    gap: 10px; margin-bottom: 12px;
+  }
+  .event-head .section-title { margin-bottom: 2px; color: #e5e7eb; }
+  .event-subtitle { color: #718096; font-size: 10px; line-height: 1.5; }
+  .event-storage {
+    flex: none; padding: 4px 8px; border-radius: 999px; color: #93c5fd;
+    background: rgba(37,99,235,.11); border: 1px solid rgba(96,165,250,.2);
+    font-size: 10px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    white-space: nowrap;
+  }
+  .event-head-actions { display: flex; align-items: center; justify-content: flex-end; gap: 6px; flex-wrap: wrap; }
+  .event-head-actions .toggle-btn { padding: 5px 9px; font-size: 10px; }
+  .event-list {
+    display: grid; gap: 9px; max-height: 560px; overflow-y: auto;
+    overscroll-behavior: contain; -webkit-overflow-scrolling: touch;
+    touch-action: pan-y; padding-right: 3px; scrollbar-color: #475569 transparent;
+  }
+  .event-list::-webkit-scrollbar { width: 4px; }
+  .event-list::-webkit-scrollbar-thumb { background: #475569; border-radius: 999px; }
+  .event-empty {
+    padding: 20px 10px; border: 1px dashed #334155; border-radius: 10px;
+    color: #718096; text-align: center; font-size: 12px;
+  }
+  .event-card {
+    position: relative; padding: 11px 11px 11px 15px; border-radius: 10px;
+    background: #111822; border: 1px solid #293444;
+  }
+  .event-card::before {
+    content: ""; position: absolute; left: 0; top: 10px; bottom: 10px;
+    width: 3px; border-radius: 0 4px 4px 0; background: #64748b;
+  }
+  .event-card.suppressed::before { background: #4ade80; }
+  .event-card.notified::before { background: #f87171; }
+  .event-card.armed::before { background: #60a5fa; }
+  .event-card.not_configured::before { background: #fbbf24; }
+  .event-top { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+  .event-time { color: #94a3b8; font-size: 11px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .event-decision {
+    margin-left: auto; padding: 3px 7px; border-radius: 999px; font-size: 10px;
+    color: #cbd5e1; background: rgba(100,116,139,.14);
+  }
+  .event-card.suppressed .event-decision { color: #bbf7d0; background: rgba(34,197,94,.12); }
+  .event-card.notified .event-decision { color: #fecaca; background: rgba(239,68,68,.13); }
+  .event-card.armed .event-decision { color: #bfdbfe; background: rgba(59,130,246,.13); }
+  .event-card.not_configured .event-decision { color: #fde68a; background: rgba(245,158,11,.12); }
+  .event-title { margin-top: 7px; color: #f1f5f9; font-size: 13px; font-weight: 680; }
+  .event-summary { margin-top: 3px; color: #cbd5e1; font-size: 12px; line-height: 1.45; }
+  .event-reason {
+    margin-top: 7px; padding: 7px 8px; border-radius: 7px;
+    color: #aab4c3; background: rgba(15,23,42,.72); font-size: 11px; line-height: 1.5;
+  }
+  .event-meta { margin-top: 7px; color: #64748b; font-size: 10px; }
+  .event-actions { display: flex; align-items: center; gap: 7px; margin-top: 9px; flex-wrap: wrap; }
+  .event-actions .toggle-btn { padding: 5px 10px; font-size: 11px; }
+  .clip-state { color: #718096; font-size: 10px; }
+  .event-video { width: 100%; margin-top: 9px; border-radius: 8px; background: #000; }
 
   /* 云台 */
   .section {
@@ -89,6 +211,33 @@
     margin-top: 14px; text-align: center; font-size: 11px; color: #4b5563;
     font-family: monospace;
   }
+
+  /* 监测区域框选 */
+  .roi-wrap {
+    position: relative; margin-top: 8px; touch-action: none;
+    -webkit-user-select: none; user-select: none; border-radius: 8px; overflow: hidden;
+  }
+  .roi-wrap img { width: 100%; display: block; pointer-events: none; }
+  .roi-box {
+    position: absolute; border: 2px dashed #f87171; background: rgba(248,113,113,0.12);
+    display: none; pointer-events: none;
+  }
+  .roi-hint { color: #8f9bad; font-size: 12px; margin-top: 6px; text-align: center; }
+
+  /* 通知设备列表 */
+  .bark-row {
+    display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+    padding: 8px 0; border-bottom: 1px solid #2a2f3a; font-size: 13px;
+  }
+  .bark-row:last-child { border-bottom: none; }
+  .bark-name { font-weight: 600; min-width: 52px; }
+  .bark-key {
+    color: #6b7280; font-family: monospace; font-size: 11px;
+    max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .bark-row .toggle-btn { padding: 4px 10px; font-size: 12px; }
+  input#barkNameInput { max-width: 110px; }
+  input#barkKeyInput { max-width: 160px; }
   .toast {
     position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
     background: rgba(0,0,0,0.85); color: #fff; padding: 8px 18px;
@@ -96,14 +245,78 @@
     transition: opacity .3s; pointer-events: none; z-index: 999;
   }
   .toast.show { opacity: 1; }
+  @media (max-width: 600px) {
+    .guardian-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .signal-card { min-height: 104px; }
+    .event-head { align-items: flex-start; }
+    .event-head-actions { flex-direction: column; align-items: flex-end; }
+    .event-storage { text-align: right; }
+    .event-list { max-height: 52vh; }
+  }
 </style>
 </head>
 <body>
 <div class="wrap">
+  <div class="page-toolbar">
+    <div class="page-title">AIUniBOX-E11 看护画面</div>
+    <button class="refresh-page" id="refreshPage" type="button">↻ 刷新页面</button>
+  </div>
   <div class="video-box">
-    <iframe id="webrtc" src="" allow="autoplay"></iframe>
+    <iframe id="webrtc" src="" allow="autoplay; picture-in-picture"></iframe>
+  </div>
+  <div class="stream-meta">
     <span class="badge off" id="liveBadge">● 连接中</span>
     <span class="fps-badge" id="fpsBadge">WebRTC</span>
+    <span class="frame-health stale" id="frameHealth">等待首帧</span>
+  </div>
+
+  <div class="guardian-overview" id="guardianOverview">
+    <div class="guardian-head">
+      <div class="guardian-title">宝宝守护</div>
+      <span class="guardian-chip off" id="guardianChip">读取状态…</span>
+    </div>
+    <div class="guardian-grid">
+      <div class="signal-card off" id="npuSignalCard">
+        <span class="signal-name"><i class="signal-dot"></i>人体感知 · NPU</span>
+        <strong class="signal-value" id="npuPersonVal">读取中…</strong>
+        <small class="signal-note" id="npuSignalNote">只识别通用人体，不区分宝宝与成人</small>
+      </div>
+      <div class="signal-card off" id="motionSignalCard">
+        <span class="signal-name"><i class="signal-dot"></i>画面动作</span>
+        <strong class="signal-value" id="motionSignalVal">读取中…</strong>
+        <small class="signal-note" id="motionSignalNote">按选定监测区域独立判断</small>
+      </div>
+      <div class="signal-card off" id="crySignalCard">
+        <span class="signal-name"><i class="signal-dot"></i>哭声识别</span>
+        <strong class="signal-value" id="crySignalVal">读取中…</strong>
+        <small class="signal-note" id="crySignalNote">等待音频诊断数据</small>
+      </div>
+      <div class="signal-card off" id="guardianSignalCard">
+        <span class="signal-name"><i class="signal-dot"></i>陪护状态</span>
+        <strong class="signal-value" id="babyMotionVal">读取中…</strong>
+        <small class="signal-note" id="guardianSignalNote">人体漏检时按安全侧继续守护</small>
+      </div>
+    </div>
+    <div class="guardian-note">
+      <strong>判断方式：</strong><span id="guardianRoiHint">正在读取监测区域…</span>
+      <button class="inline-action" id="jumpToRoi" type="button">设置动作区域</button>
+    </div>
+  </div>
+
+  <div class="section" id="eventCenter">
+    <div class="event-head">
+      <div>
+        <div class="section-title">事件解释时间线</div>
+        <div class="event-subtitle">最新事件在上，可在框内上下滑动；记录判断原因和端侧画面短片（暂不含声音）</div>
+      </div>
+      <div class="event-head-actions">
+        <button class="toggle-btn" id="testClipBtn" type="button">测试短片</button>
+        <span class="event-storage" id="eventStorageVal">读取端侧存储…</span>
+      </div>
+    </div>
+    <div class="event-list" id="eventList">
+      <div class="event-empty">暂无守护事件</div>
+    </div>
   </div>
 
   <div class="section" id="authSection" style="display:none">
@@ -192,6 +405,72 @@
     </div>
   </div>
 
+  <!-- 宝宝守护设置 -->
+  <div class="section" id="babySettings">
+    <div class="section-title">宝宝守护设置</div>
+
+    <div class="ctrl-row">
+      <span class="ctrl-label">守护开关 <span class="ctrl-val" id="babyModeVal">关</span></span>
+      <div class="toggle-group">
+        <button class="toggle-btn" id="babyOn">开启</button>
+        <button class="toggle-btn" id="babyOff" style="background:#7f1d1d;color:#fff">关闭</button>
+      </div>
+    </div>
+
+    <div class="ctrl-row">
+      <span class="ctrl-label">灵敏度 <span class="ctrl-val" id="babySensVal">中</span></span>
+      <div class="toggle-group">
+        <button class="toggle-btn" data-baby-sens="0">低</button>
+        <button class="toggle-btn" data-baby-sens="1">中</button>
+        <button class="toggle-btn" data-baby-sens="2">高</button>
+      </div>
+    </div>
+
+    <div class="ctrl-row">
+      <span class="ctrl-label">动作监测区域 <span class="ctrl-val" id="motionRoiVal">全画面</span></span>
+      <div class="toggle-group">
+        <button class="toggle-btn" id="roiSelect">框选区域</button>
+        <button class="toggle-btn" id="roiFull">全画面</button>
+      </div>
+    </div>
+
+    <div id="roiSection" style="display:none">
+      <div class="roi-wrap" id="roiWrap">
+        <img id="roiImg" src="" alt="当前画面快照">
+        <div class="roi-box" id="roiSavedBox"></div>
+        <div class="roi-box" id="roiDrawBox" style="border-color:#4ade80;background:rgba(74,222,128,0.12)"></div>
+      </div>
+      <div class="roi-hint">在快照上框出需要关注动作的区域（绿框）。它不参与宝宝身份或成人陪护判断。</div>
+      <div class="ctrl-row">
+        <span class="ctrl-label">保存框选</span>
+        <div class="toggle-group">
+          <button class="toggle-btn" id="roiSave" style="background:#166534;color:#fff">保存</button>
+          <button class="toggle-btn" id="roiCancel">取消</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="ctrl-row">
+      <span class="ctrl-label">通知设备 <span class="ctrl-val" id="barkStateVal">未配置</span></span>
+      <div class="toggle-group">
+        <button class="toggle-btn" id="barkTestAll">全部测试</button>
+      </div>
+    </div>
+
+    <div id="barkTargetList"></div>
+
+    <div class="ctrl-row">
+      <span class="ctrl-label">添加设备</span>
+      <div class="toggle-group">
+        <input type="text" id="barkNameInput" placeholder="备注（如 妈妈）">
+        <input type="password" id="barkKeyInput" placeholder="Bark Key（App 内复制）">
+        <button class="toggle-btn" id="barkAdd">添加</button>
+      </div>
+    </div>
+
+    <div class="pan-hint">重点区域仅限定动作检测；哭声和成人陪护判断仍使用完整声音与画面。事件短片保存在设备端，可在时间线中逐条删除。</div>
+  </div>
+
   <div class="status" id="status">连接中...</div>
 </div>
 <div class="toast" id="toast"></div>
@@ -245,6 +524,162 @@ $('saveToken').addEventListener('click', () => {
   sessionStorage.setItem(tokenKey, apiToken);
   $('authSection').style.display = 'none';
   refreshStatus();
+});
+
+$('refreshPage').addEventListener('click', () => {
+  $('refreshPage').textContent = '刷新中…';
+  window.location.reload();
+});
+
+// ===== 可解释事件时间线（日期和时间固定按东八区显示） =====
+const shanghaiDateTime = new Intl.DateTimeFormat('zh-CN', {
+  timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit',
+  hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
+});
+const decisionNames = {
+  suppressed: '成人在场 · 未通知',
+  notified: '已触发通知',
+  armed: '通知已恢复',
+  not_configured: '仅端侧记录',
+  recorded: '已记录'
+};
+const eventKindNames = { motion: '⚠ 画面动作', cry: '◉ 哭声', state: '● 状态变化', test: '▣ 手动测试' };
+let eventRenderSignature = '';
+
+function formatBytes(value) {
+  const n = Number(value || 0);
+  if (n < 1024 * 1024) return `${Math.max(0, n / 1024).toFixed(0)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function appendText(parent, className, text, tag = 'div') {
+  const el = document.createElement(tag);
+  el.className = className;
+  el.textContent = text;
+  parent.appendChild(el);
+  return el;
+}
+
+async function loadGuardianEvents(force = false) {
+  const j = await api('/api/events?limit=40');
+  if (!j || !j.ok) return;
+  const storage = j.storage || {};
+  $('eventStorageVal').textContent =
+    `端侧 ${storage.clipCount || 0}/${storage.maxClipCount || 60} 段 · ${formatBytes(storage.totalBytes)}`;
+
+  const events = j.events || [];
+  const signature = events.map(e => `${e.id}:${e.clipStatus}:${e.clipSizeBytes}`).join('|');
+  if (!force && signature === eventRenderSignature) return;
+  eventRenderSignature = signature;
+
+  const list = $('eventList');
+  list.replaceChildren();
+  if (!events.length) {
+    appendText(list, 'event-empty', '暂无守护事件');
+    return;
+  }
+
+  for (const event of events) {
+    const card = document.createElement('article');
+    card.className = `event-card ${event.decision || 'recorded'}`;
+    card.dataset.eventId = event.id;
+
+    const top = document.createElement('div');
+    top.className = 'event-top';
+    appendText(top, 'event-time', shanghaiDateTime.format(new Date(event.occurredAt)), 'time');
+    appendText(top, 'event-time', eventKindNames[event.kind] || '● 守护事件', 'span');
+    appendText(top, 'event-decision', decisionNames[event.decision] || '已记录', 'span');
+    card.appendChild(top);
+    appendText(card, 'event-title', event.title);
+    appendText(card, 'event-summary', event.summary);
+    appendText(card, 'event-reason', `判断原因：${event.reason}`);
+
+    const metrics = [];
+    if (event.kind !== 'state' || Number(event.personCount || 0) > 0) {
+      metrics.push(`画面人体 ${Number(event.personCount || 0)}`);
+    }
+    if (Number(event.adultLikePersonCount || 0) > 0) {
+      metrics.push(`成人体型证据 ${event.adultLikePersonCount}`);
+    }
+    if (event.cryScore !== null && event.cryScore !== undefined) {
+      metrics.push(`哭声匹配 ${Math.round(Number(event.cryScore) * 100)}%`);
+    }
+    if (metrics.length) appendText(card, 'event-meta', metrics.join(' · '));
+
+    if (event.clipStatus !== 'none') {
+      const actions = document.createElement('div');
+      actions.className = 'event-actions';
+      if (event.clipStatus === 'ready') {
+        appendText(
+          actions, 'clip-state',
+          `端侧画面 ${Math.max(1, Math.round(Number(event.clipDurationMs || 0) / 1000))} 秒 · ${formatBytes(event.clipSizeBytes)}`,
+          'span'
+        );
+        const play = appendText(actions, 'toggle-btn', '播放短片', 'button');
+        play.type = 'button'; play.dataset.eventPlay = event.id;
+        const del = appendText(actions, 'toggle-btn', '删除短片', 'button');
+        del.type = 'button'; del.dataset.eventDelete = event.id;
+        del.style.background = '#7f1d1d'; del.style.color = '#fff';
+      } else {
+        const clipText = {
+          pending: '正在录制：事件前约 10 秒 + 事件后约 20 秒',
+          failed: `短片未生成${event.clipError ? `：${event.clipError}` : ''}`,
+          deleted: '端侧短片已手动删除，解释记录仍保留',
+          expired: '端侧短片已达到容量上限并自动淘汰'
+        }[event.clipStatus] || '短片状态未知';
+        appendText(actions, 'clip-state', clipText, 'span');
+      }
+      card.appendChild(actions);
+    }
+    list.appendChild(card);
+  }
+}
+
+$('eventList').addEventListener('click', async e => {
+  const button = e.target.closest('button');
+  if (!button) return;
+  if (button.dataset.eventPlay) {
+    const card = button.closest('.event-card');
+    const old = card.querySelector('video');
+    if (old) {
+      old.pause(); old.remove(); button.textContent = '播放短片';
+    } else {
+      const video = document.createElement('video');
+      video.className = 'event-video';
+      video.controls = true;
+      video.preload = 'metadata';
+      video.playsInline = true;
+      video.src = `/event-clip?id=${encodeURIComponent(button.dataset.eventPlay)}`;
+      card.appendChild(video);
+      button.textContent = '收起短片';
+      video.play().catch(() => {});
+    }
+  }
+  if (button.dataset.eventDelete) {
+    if (!window.confirm('只删除这段端侧短片？事件时间、判断原因仍会保留。')) return;
+    const j = await api(`/api/events?deleteClip=${encodeURIComponent(button.dataset.eventDelete)}`);
+    if (j && j.ok) {
+      toast('端侧短片已删除');
+      eventRenderSignature = '';
+      loadGuardianEvents(true);
+    } else {
+      toast('短片删除失败');
+    }
+  }
+});
+
+$('testClipBtn').addEventListener('click', async () => {
+  const button = $('testClipBtn');
+  button.disabled = true;
+  const j = await api('/api/events?testClip=true');
+  button.disabled = false;
+  if (j && j.ok) {
+    toast('测试短片录制中，约 20 秒后可播放');
+    eventRenderSignature = '';
+    loadGuardianEvents(true);
+  } else {
+    toast('请先开启宝宝守护和摄像头');
+  }
 });
 
 function getSteps() { return parseInt($('steps').value); }
@@ -310,7 +745,171 @@ document.addEventListener('click', async (e) => {
     await api(`/api/scene?mode=${mode}`);
     toast(`场景: ${names[mode]}`);
   }
+
+  // data-baby-sens 属性（宝宝守护灵敏度）
+  if (btn.dataset.babySens !== undefined) {
+    const s = parseInt(btn.dataset.babySens);
+    await api(`/api/baby?sensitivity=${s}`);
+    $('babySensVal').textContent = ['低', '中', '高'][s];
+    toast(`灵敏度: ${['低', '中', '高'][s]}`);
+  }
 });
+
+// 宝宝守护开关
+async function setBaby(on) {
+  const j = await api(`/api/baby?on=${on}`);
+  if (j && j.ok) {
+    toast(on ? '宝宝守护已开启，指示灯已全部熄灭' : '宝宝守护已关闭');
+    refreshStatus();
+  }
+}
+$('babyOn').addEventListener('click', () => setBaby(true));
+$('babyOff').addEventListener('click', () => setBaby(false));
+
+// ===== Bark 多设备通知管理 =====
+async function loadBarkTargets() {
+  const j = await api('/api/notify');
+  if (!j) return;
+  const box = $('barkTargetList');
+  box.innerHTML = '';
+  const enabled = (j.targets || []).filter(t => t.enabled).length;
+  $('barkStateVal').textContent = (j.targets || []).length
+    ? `已启用 ${enabled}/${j.targets.length}` : '未配置';
+  for (const t of (j.targets || [])) {
+    const row = document.createElement('div');
+    row.className = 'bark-row';
+    const keyAttr = encodeURIComponent(t.key);
+    row.innerHTML = `
+      <span class="bark-name">${t.name.replace(/</g, '&lt;')}</span>
+      <span class="bark-key">${t.key.slice(0, 6)}…</span>
+      <span class="toggle-group" style="margin-left:auto">
+        <button class="toggle-btn" data-bark-toggle="${keyAttr}" data-on="${t.enabled ? '0' : '1'}"
+          style="${t.enabled ? '' : 'opacity:.55'}">${t.enabled ? '已启用' : '已停用'}</button>
+        <button class="toggle-btn" data-bark-test="${keyAttr}">测试</button>
+        <button class="toggle-btn" data-bark-del="${keyAttr}" style="background:#7f1d1d;color:#fff">删</button>
+      </span>`;
+    box.appendChild(row);
+  }
+}
+
+$('barkTestAll').addEventListener('click', async () => {
+  const j = await api('/api/notify?test=all');
+  if (!j) return;
+  toast(j.ok ? '测试推送已发往所有启用设备' : '没有已启用的通知设备');
+});
+
+$('barkAdd').addEventListener('click', async () => {
+  const k = $('barkKeyInput').value.trim();
+  const n = $('barkNameInput').value.trim();
+  if (!k) { toast('请填写 Bark Key'); return; }
+  const j = await api(`/api/notify?add=${encodeURIComponent(k)}&name=${encodeURIComponent(n)}`);
+  if (!j) return;
+  if (j.ok) {
+    toast('通知设备已添加');
+    $('barkKeyInput').value = '';
+    $('barkNameInput').value = '';
+    loadBarkTargets();
+  } else {
+    toast(j.error === 'invalid_or_duplicate_key' ? 'Key 无效或已存在' : '添加失败');
+  }
+});
+
+document.addEventListener('click', async (e) => {
+  const btn = e.target.closest('button');
+  if (!btn) return;
+  if (btn.dataset.barkToggle !== undefined) {
+    await api(`/api/notify?toggle=${btn.dataset.barkToggle}&on=${btn.dataset.on === '1'}`);
+    loadBarkTargets();
+  }
+  if (btn.dataset.barkTest !== undefined) {
+    await api(`/api/notify?test=${btn.dataset.barkTest}`);
+    toast('测试推送已发出');
+  }
+  if (btn.dataset.barkDel !== undefined) {
+    await api(`/api/notify?remove=${btn.dataset.barkDel}`);
+    toast('已删除');
+    loadBarkTargets();
+  }
+});
+loadBarkTargets();
+
+// ===== 监测区域框选 =====
+let motionRoi = [0, 0, 1, 1];
+let roiDraft = null;
+
+function isFullRoi(r) { return r[0] <= 0.001 && r[1] <= 0.001 && r[2] >= 0.999 && r[3] >= 0.999; }
+
+function showRoiBox(boxEl, r) {
+  const wrap = $('roiWrap');
+  boxEl.style.left = (r[0] * wrap.clientWidth) + 'px';
+  boxEl.style.top = (r[1] * wrap.clientHeight) + 'px';
+  boxEl.style.width = (r[2] * wrap.clientWidth) + 'px';
+  boxEl.style.height = (r[3] * wrap.clientHeight) + 'px';
+  boxEl.style.display = 'block';
+}
+
+$('roiSelect').addEventListener('click', () => {
+  $('roiImg').src = '/snapshot?_ts=' + Date.now();
+  $('roiSection').style.display = 'block';
+  $('roiDrawBox').style.display = 'none';
+  if (!isFullRoi(motionRoi)) showRoiBox($('roiSavedBox'), motionRoi);
+  else $('roiSavedBox').style.display = 'none';
+  $('roiSection').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+});
+
+$('jumpToRoi').addEventListener('click', () => {
+  $('babySettings').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  setTimeout(() => $('roiSelect').click(), 350);
+});
+
+$('roiCancel').addEventListener('click', () => { $('roiSection').style.display = 'none'; });
+
+$('roiFull').addEventListener('click', async () => {
+  await api('/api/baby?roi=full');
+  toast('已恢复全画面监测');
+  refreshStatus();
+});
+
+$('roiSave').addEventListener('click', async () => {
+  if (!roiDraft) { toast('请先在快照上拖出一个框'); return; }
+  const [x, y, w, h] = roiDraft;
+  const j = await api(`/api/baby?roi=${x.toFixed(3)},${y.toFixed(3)},${w.toFixed(3)},${h.toFixed(3)}`);
+  if (j && j.ok) {
+    toast('监测区域已保存');
+    $('roiSection').style.display = 'none';
+    refreshStatus();
+  }
+});
+
+(function bindRoiDrag() {
+  const wrap = $('roiWrap'), box = $('roiDrawBox');
+  let start = null;
+  wrap.addEventListener('pointerdown', e => {
+    e.preventDefault();
+    wrap.setPointerCapture(e.pointerId);
+    const rect = wrap.getBoundingClientRect();
+    start = {
+      x: Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width)),
+      y: Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height))
+    };
+    box.style.display = 'block';
+  });
+  wrap.addEventListener('pointermove', e => {
+    if (!start) return;
+    const rect = wrap.getBoundingClientRect();
+    const cur = {
+      x: Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width)),
+      y: Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height))
+    };
+    const r = [Math.min(start.x, cur.x), Math.min(start.y, cur.y),
+               Math.abs(cur.x - start.x), Math.abs(cur.y - start.y)];
+    showRoiBox(box, r);
+    roiDraft = r;
+  });
+  const end = () => { start = null; };
+  wrap.addEventListener('pointerup', end);
+  wrap.addEventListener('pointercancel', end);
+})();
 
 // 补光灯滑块
 $('fillSlider').addEventListener('input', () => $('fillVal').textContent = $('fillSlider').value);
@@ -328,6 +927,17 @@ $('allOff').addEventListener('click', async () => {
 
 // ===== 状态与自动恢复 =====
 let lastFrameCount = 0, lastStatusAt = Date.now();
+const yamnetLabels = {
+  0: '语音', 1: '儿童说话', 19: '哭泣/啜泣', 20: '婴儿哭声',
+  21: '呜咽', 22: '哀号'
+};
+function setSignal(cardId, valueId, text, state) {
+  const card = $(cardId);
+  card.classList.remove('ok', 'warn', 'alert', 'off');
+  card.classList.add(state);
+  $(valueId).textContent = text;
+}
+
 async function refreshStatus() {
   try {
     const j = await api('/api/status');
@@ -342,8 +952,119 @@ async function refreshStatus() {
     $('liveBadge').textContent = live ? '● LIVE' : '● 恢复中';
     $('liveBadge').classList.toggle('off', !live);
     $('fpsBadge').textContent = fps > 0 ? `${fps.toFixed(1)} fps` : 'WebRTC';
+    const capturedAt = Number(j.frameCapturedAt || 0);
+    const stale = capturedAt <= 0 || now - capturedAt > 5000;
+    $('frameHealth').textContent = capturedAt > 0 ? (stale ? '快照可能卡住' : '快照正常') : '等待首帧';
+    $('frameHealth').classList.toggle('stale', stale);
     $('status').textContent =
       `IP: ${j.ip} | 摄像头: ${j.cameraOn ? '开' : '恢复中'} | 运行: ${Math.floor(j.uptimeSeconds / 60)} 分钟`;
+
+    // 宝宝守护面板
+    $('babyModeVal').textContent = j.babyMonitorEnabled ? '开' : '关';
+    $('babySensVal').textContent = ['低', '中', '高'][j.babySensitivity] || '中';
+    motionRoi = j.motionRoi || [0, 0, 1, 1];
+    const fullMotionRoi = isFullRoi(motionRoi);
+    $('motionRoiVal').textContent = fullMotionRoi
+      ? '全画面'
+      : `${Math.round(motionRoi[2] * 100)}% × ${Math.round(motionRoi[3] * 100)}% @ (${Math.round(motionRoi[0] * 100)},${Math.round(motionRoi[1] * 100)})`;
+    $('guardianRoiHint').textContent = fullMotionRoi
+      ? 'NPU 不识别年龄。当前画面发现两人或成人体型证据时暂停通知；否则保持武装。'
+      : '重点区域只限定动作检测。成人陪护仍按全画面人数和体型证据判断，不推断宝宝位置。';
+    $('motionSignalNote').textContent = fullMotionRoi
+      ? '当前按全画面判断持续动作'
+      : '当前只在重点区域内判断持续动作';
+    const chip = $('guardianChip');
+    chip.classList.remove('alert', 'off');
+    if (!j.babyMonitorEnabled) {
+      chip.textContent = '未启用';
+      chip.classList.add('off');
+      setSignal('npuSignalCard', 'npuPersonVal', '未启用', 'off');
+      setSignal('motionSignalCard', 'motionSignalVal', '未启用', 'off');
+      setSignal('crySignalCard', 'crySignalVal', '未启用', 'off');
+      setSignal('guardianSignalCard', 'babyMotionVal', '守护已关闭', 'off');
+      $('npuSignalNote').textContent = '只识别通用人体，不区分宝宝与成人';
+      $('crySignalNote').textContent = '开启守护后显示实时音频分数';
+      $('guardianSignalNote').textContent = '开启后按陪护状态决定是否推送';
+    } else if (j.privacy) {
+      chip.textContent = '隐私模式暂停';
+      chip.classList.add('off');
+      setSignal('npuSignalCard', 'npuPersonVal', '摄像头已暂停', 'off');
+      setSignal('motionSignalCard', 'motionSignalVal', '画面已暂停', 'off');
+      setSignal('crySignalCard', 'crySignalVal', '音频已暂停', 'off');
+      setSignal('guardianSignalCard', 'babyMotionVal', '隐私模式暂停', 'off');
+      $('npuSignalNote').textContent = '隐私模式不采集画面';
+      $('crySignalNote').textContent = '隐私模式不采集声音';
+      $('guardianSignalNote').textContent = '关闭隐私模式后自动恢复';
+    } else {
+      const alerting = j.babyCryActive || j.babyMotionActive;
+      const supervised = j.notificationsArmed === false;
+      const confirmedSupervised = j.supervisionState === 'caregiver_present';
+      const caregiverNow = j.caregiverEvidenceNow === true;
+      if (alerting && !supervised) {
+        chip.textContent = '需要关注';
+        chip.classList.add('alert');
+      } else if (supervised) {
+        chip.textContent = alerting
+          ? '检测到成人 · 已记录动静'
+          : (confirmedSupervised ? '有人陪护' : '检测到成人 · 通知暂停');
+      } else {
+        chip.textContent = '未确认成人 · 已武装';
+      }
+
+      if (!j.npuModelLoaded) {
+        setSignal('npuSignalCard', 'npuPersonVal', '模型未加载', 'warn');
+        $('npuSignalNote').textContent = '视觉不可用，通知按安全侧保持开启';
+      } else if (Number(j.personCount || 0) > 0) {
+        const count = Number(j.personCount || 0);
+        const adultLike = Number(j.adultLikePersonCount || 0);
+        const peopleText = adultLike > 0
+          ? `当前检出 ${count} 人 · 成人体型候选`
+          : `当前检出 ${count} 人`;
+        setSignal('npuSignalCard', 'npuPersonVal', peopleText, supervised ? 'ok' : 'warn');
+        $('npuSignalNote').textContent =
+          `成人体型证据 ${adultLike} · 最高人体匹配 ${Math.round(j.personConfidence * 100)}%`;
+      } else {
+        setSignal('npuSignalCard', 'npuPersonVal', '本帧未检出人体', 'warn');
+        $('npuSignalNote').textContent = '遮挡或睡姿可能漏检，不会因此关闭通知';
+      }
+
+      setSignal(
+        'motionSignalCard', 'motionSignalVal',
+        j.babyMotionActive ? '检测到持续动作' : '动作监测中',
+        j.babyMotionActive ? 'alert' : 'ok'
+      );
+      if (!j.cryModelLoaded) {
+        setSignal('crySignalCard', 'crySignalVal', '模型未加载', 'warn');
+        $('crySignalNote').textContent = '动作检测仍会继续运行';
+      } else {
+        const cryPct = Math.round(Number(j.cryScore || 0) * 100);
+        const thresholdPct = Math.round(Number(j.cryThreshold || 0) * 100);
+        const rms = Number(j.cryAudioRms || 0).toFixed(3);
+        const topIndex = Number(j.cryTopClassIndex ?? -1);
+        const topName = yamnetLabels[topIndex] || (topIndex >= 0 ? `类别 #${topIndex}` : '安静');
+        setSignal(
+          'crySignalCard', 'crySignalVal',
+          j.babyCryActive ? `哭声事件中 · 当前 ${cryPct}%` : `哭声 ${cryPct}% / 阈值 ${thresholdPct}%`,
+          j.babyCryActive ? 'alert' : 'ok'
+        );
+        $('crySignalNote').textContent = `音频能量 ${rms} · 当前最高 ${topName}`;
+      }
+
+      let guardianText, guardianState, guardianNote;
+      if (supervised) {
+        guardianText = caregiverNow ? '检测到成人，暂停推送' : '有人陪护，暂停推送';
+        guardianState = 'ok';
+        guardianNote = caregiverNow
+          ? '当前成人证据即时抑制通知；动作和哭声仍在本地记录'
+          : '陪护者离开约 20 秒后自动恢复通知';
+      } else {
+        guardianText = alerting ? '未检测到成人，需要关注' : '未检测到明确成人，通知已武装';
+        guardianState = alerting ? 'alert' : 'warn';
+        guardianNote = 'NPU 不负责确认宝宝身份；未检测到成人时，动作或哭声达到阈值即通知';
+      }
+      setSignal('guardianSignalCard', 'babyMotionVal', guardianText, guardianState);
+      $('guardianSignalNote').textContent = guardianNote;
+    }
   } catch (_) {
     $('liveBadge').textContent = '● 已断开';
     $('liveBadge').classList.add('off');
@@ -351,7 +1072,9 @@ async function refreshStatus() {
   }
 }
 refreshStatus();
-setInterval(refreshStatus, 3000);
+setInterval(refreshStatus, 1000);
+loadGuardianEvents();
+setInterval(loadGuardianEvents, 3000);
 </script>
 </body>
 </html>

@@ -6,6 +6,7 @@ import fi.iki.elonen.NanoHTTPD
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayInputStream
+import java.io.FileInputStream
 import java.io.InputStream
 
 /**
@@ -20,6 +21,10 @@ import java.io.InputStream
  *  GET /api/filllight    ?level=0-255
  *  GET /api/ircut        ?on=true|false
  *  GET /api/scene        ?mode=0|1|2
+ *  GET /api/baby         ?on=true|false [&sensitivity=0|1|2]（无参数=查询）
+ *  GET /api/notify       ?add=KEY[&name=备注] ?remove=KEY ?toggle=KEY&on= ?test=KEY|all
+ *  GET /api/events       解释时间线；?deleteClip=EVENT_ID 手动删除端侧短片
+ *  GET /event-clip       ?id=EVENT_ID，支持 HTTP Range
  *  GET /api/status       状态 JSON
  */
 class WebServer(
@@ -49,6 +54,7 @@ class WebServer(
                 uri == "/stream" -> serveMjpeg()
                 uri == "/snapshot" -> serveSnapshot()
                 uri == "/h264" -> serveH264()
+                uri == "/event-clip" -> serveEventClip(params["id"], session.headers["range"])
                 uri.startsWith("/api/motor") -> apiMotor(params)
                 uri.startsWith("/api/preset") -> apiPreset(params)
                 uri.startsWith("/api/position") -> apiPosition(params)
@@ -59,6 +65,9 @@ class WebServer(
                 uri.startsWith("/api/ircut") -> apiIrcut(params)
                 uri.startsWith("/api/scene") -> apiScene(params)
                 uri.startsWith("/api/privacy") -> apiPrivacy(params)
+                uri.startsWith("/api/baby") -> apiBaby(params)
+                uri.startsWith("/api/notify") -> apiNotify(params)
+                uri.startsWith("/api/events") -> apiEvents(params)
                 uri.startsWith("/api/status") -> apiStatus()
                 else -> newFixedLengthResponse(
                     Response.Status.NOT_FOUND, MIME_PLAINTEXT, "404"
@@ -135,7 +144,9 @@ class WebServer(
     /** 返回控制网页（从 assets 读取） */
     private fun serveIndex(): Response {
         val html = context.assets.open("web/index.html").bufferedReader().use { it.readText() }
-        return newFixedLengthResponse(Response.Status.OK, "text/html; charset=utf-8", html)
+        return newFixedLengthResponse(Response.Status.OK, "text/html; charset=utf-8", html).apply {
+            addHeader("Cache-Control", "no-store, no-cache, must-revalidate")
+        }
     }
 
     /** MJPEG 流：multipart/x-mixed-replace */
@@ -200,12 +211,16 @@ class WebServer(
         when (action) {
             "left" -> {
                 val steps = (p["steps"] ?: "83").toIntOrNull() ?: 83
+                invalidateMotionReference()
                 val accepted = motor.turnLeft(steps, speed)
+                invalidateMotionReference()
                 return json("""{"ok":$accepted,"action":"left","steps":$steps,"speed":$speed,"busy":${motor.isBusy()}${if (accepted) "" else ",\"error\":\"motor_busy\""}}""")
             }
             "right" -> {
                 val steps = (p["steps"] ?: "83").toIntOrNull() ?: 83
+                invalidateMotionReference()
                 val accepted = motor.turnRight(steps, speed)
+                invalidateMotionReference()
                 return json("""{"ok":$accepted,"action":"right","steps":$steps,"speed":$speed,"busy":${motor.isBusy()}${if (accepted) "" else ",\"error\":\"motor_busy\""}}""")
             }
             "reset" -> {
@@ -242,7 +257,9 @@ class WebServer(
             "goto" -> {
                 val target = state.presetPosition(name)
                     ?: return json("""{"ok":false,"error":"preset_not_found"}""")
+                invalidateMotionReference()
                 val accepted = motor.moveTo(target, speed)
+                invalidateMotionReference()
                 json(
                     JSONObject()
                         .put("ok", accepted)
@@ -277,9 +294,11 @@ class WebServer(
     private fun apiLed(p: Map<String, String>): Response {
         val name = p["name"] ?: "ir"
         val level = (p["level"] ?: "0").toIntOrNull() ?: 0
+        invalidateMotionReference()
         if (!LedController.setLed(name, level)) {
             return json("""{"ok":false,"error":"unsupported_led"}""")
         }
+        invalidateMotionReference()
         return json("""{"ok":true,"led":"$name","level":$level}""")
     }
 
@@ -301,27 +320,35 @@ class WebServer(
     }
 
     private fun apiAllOff(): Response {
+        invalidateMotionReference()
         LedController.allOff()
+        invalidateMotionReference()
         return json("""{"ok":true,"action":"all_off"}""")
     }
 
     private fun apiFillLight(p: Map<String, String>): Response {
         val level = (p["level"] ?: "0").toIntOrNull() ?: 0
+        invalidateMotionReference()
         LedController.setFillLight(level)
+        invalidateMotionReference()
         state.fillLightLevel = level
         return json("""{"ok":true,"filllight":${level.coerceIn(0, 255)}}""")
     }
 
     private fun apiIrcut(p: Map<String, String>): Response {
         val on = p["on"]?.toBoolean() ?: false
+        invalidateMotionReference()
         LedController.setIrcut(on)
+        invalidateMotionReference()
         state.ircutEnabled = on
         return json("""{"ok":true,"ircut":${if (on) "night" else "day"}}""")
     }
 
     private fun apiScene(p: Map<String, String>): Response {
         val mode = (p["mode"] ?: "0").toIntOrNull() ?: 0
+        invalidateMotionReference()
         LedController.setSceneMode(mode)
+        invalidateMotionReference()
         state.sceneMode = mode
         val names = arrayOf("day", "night", "auto")
         return json("""{"ok":true,"scene":"${names[mode.coerceIn(0, 2)]}"}""")
@@ -339,6 +366,41 @@ class WebServer(
         )
     }
 
+    /** 宝宝守护：开关、灵敏度、监测区域；无参数时查询当前状态。 */
+    private fun apiBaby(p: Map<String, String>): Response {
+        val service = MonitorService.instance
+            ?: return json("""{"ok":false,"error":"service_unavailable"}""")
+        try {
+            p["on"]?.let { service.setBabyMode(it.toBoolean()) }
+            p["sensitivity"]?.toIntOrNull()?.let { service.setBabySensitivity(it) }
+            p["roi"]?.let { raw ->
+                val v = raw.split(",").map { it.trim().toFloatOrNull() }
+                if (v.size == 4 && v.all { it != null && it in 0f..1f } &&
+                    (v[2] ?: 0f) > 0f && (v[3] ?: 0f) > 0f
+                ) {
+                    state.motionRoi = v.joinToString(",") { "%.3f".format(it) }
+                } else if (raw.equals("full", ignoreCase = true)) {
+                    state.motionRoi = "0,0,1,1"
+                } else {
+                    return json("""{"ok":false,"error":"invalid_roi"}""")
+                }
+            }
+        } catch (e: Exception) {
+            return json("""{"ok":false,"error":"${e.message}"}""")
+        }
+        val roi = JSONArray()
+        for (part in state.motionRoi.split(",")) roi.put(part.trim().toDouble())
+        return json(
+            JSONObject()
+                .put("ok", true)
+                .put("babyMonitorEnabled", state.babyMonitorEnabled)
+                .put("babySensitivity", state.babySensitivity)
+                .put("motionRoi", roi)
+                .put("babyMotionActive", service.isBabyMotionActive())
+                .toString()
+        )
+    }
+
     private fun apiInfo(): Response {
         val id = android.provider.Settings.Secure.getString(
             context.contentResolver,
@@ -350,7 +412,7 @@ class WebServer(
                 .put("name", "AIUniBOX-E11 Edge Camera")
                 .put("model", android.os.Build.MODEL)
                 .put("deviceId", id)
-                .put("apiVersion", 2)
+                .put("apiVersion", 4)
                 .put("appVersion", BuildConfig.VERSION_NAME)
                 .put("authRequired", security.isEnabled)
                 .toString()
@@ -363,6 +425,18 @@ class WebServer(
         val service = MonitorService.instance
         val leds = JSONObject()
         for (name in LedController.allLeds) leds.put(name, LedController.getLed(name))
+        val lastBabyEvent: Any = service?.babyLastEventAt() ?: JSONObject.NULL
+        val babyEvents = JSONArray()
+        for ((ts, kind) in service?.babyRecentEvents() ?: emptyList()) {
+            babyEvents.put(JSONObject().put("t", ts).put("k", kind))
+        }
+        val motionRoi = JSONArray()
+        for (part in state.motionRoi.split(",")) motionRoi.put(part.trim().toDouble())
+        val personBoxes = JSONArray()
+        for (box in service?.personBoxes() ?: emptyList()) {
+            personBoxes.put(JSONArray(box.toList()))
+        }
+        val clipStorage = service?.guardianClipStorageInfo()
         return json(JSONObject()
             .put("ok", true)
             .put("ip", ip)
@@ -370,6 +444,7 @@ class WebServer(
             .put("streamReady", encoder?.isOutputHealthy() == true)
             .put("rtspPublishing", service?.isRtspPublishing() == true)
             .put("encodedFrames", encoder?.outputFrameCount ?: 0)
+            .put("frameCapturedAt", streamer.latestJpegCapturedAtMs)
             .put("motorBusy", motor.isBusy())
             .put("uptimeSeconds", service?.uptimeSeconds() ?: 0)
             .put("watching", service?.isWatching() == true)
@@ -381,8 +456,211 @@ class WebServer(
             .put("ircut", state.ircutEnabled)
             .put("fillLight", state.fillLightLevel)
             .put("leds", leds)
+            .put("babyMonitorEnabled", state.babyMonitorEnabled)
+            .put("babyMotionActive", service?.isBabyMotionActive() == true)
+            .put("babyCryActive", service?.isBabyCryActive() == true)
+            .put("cryModelLoaded", service?.isCryModelLoaded() == true)
+            .put("cryAudioRms", service?.cryAudioRms() ?: 0f)
+            .put("cryScore", service?.cryScore() ?: 0f)
+            .put("cryThreshold", service?.cryThreshold() ?: 0f)
+            .put("cryTopClassIndex", service?.cryTopClassIndex() ?: -1)
+            .put("cryTopClassScore", service?.cryTopClassScore() ?: 0f)
+            .put("cryAnalyzedAt", service?.cryAnalyzedAt() ?: 0L)
+            .put("npuModelLoaded", service?.isNpuModelLoaded() == true)
+            .put("personPresent", service?.isPersonPresent() == true)
+            .put("personConfidence", service?.personConfidence() ?: 0f)
+            .put("personBox", JSONArray(service?.personBox()?.toList() ?: emptyList<Float>()))
+            .put("personBoxes", personBoxes)
+            .put("personCount", service?.personCount() ?: 0)
+            .put("adultLikePersonCount", service?.adultLikePersonCount() ?: 0)
+            .put("caregiverEvidenceNow", service?.caregiverEvidenceNow() == true)
+            .put("supervisionState", service?.supervisionState() ?: "unknown")
+            .put("notificationsArmed", service?.notificationsArmed() != false)
+            .put("lastSuppressedAlertAt", service?.lastSuppressedAlertAt() ?: 0L)
+            .put("babySensitivity", state.babySensitivity)
+            .put("babyLastEventAt", lastBabyEvent)
+            .put("babyRecentEvents", babyEvents)
+            .put("motionRoi", motionRoi)
+            .put("barkConfigured", service?.isBarkConfigured() == true)
+            .put("guardianEventCount", service?.guardianEvents(200)?.size ?: 0)
+            .put("guardianClipCount", clipStorage?.clipCount ?: 0)
+            .put("guardianClipBytes", clipStorage?.totalBytes ?: 0L)
             .toString()
         )
+    }
+
+    /** 可解释事件时间线，以及端侧短片的手动删除入口。 */
+    private fun apiEvents(p: Map<String, String>): Response {
+        val service = MonitorService.instance
+            ?: return json("""{"ok":false,"error":"service_unavailable"}""")
+        p["deleteClip"]?.let { eventId ->
+            if (!service.deleteGuardianClip(eventId)) {
+                return json("""{"ok":false,"error":"event_or_clip_not_found"}""")
+            }
+        }
+        if (p["testClip"]?.toBoolean() == true && !service.createGuardianTestClip()) {
+            return json("""{"ok":false,"error":"clip_recorder_unavailable"}""")
+        }
+        val limit = (p["limit"]?.toIntOrNull() ?: 40).coerceIn(1, 100)
+        val items = JSONArray()
+        for (event in service.guardianEvents(limit)) {
+            items.put(
+                JSONObject()
+                    .put("id", event.id)
+                    .put("occurredAt", event.occurredAt)
+                    .put("kind", event.kind)
+                    .put("title", event.title)
+                    .put("summary", event.summary)
+                    .put("decision", event.decision)
+                    .put("reason", event.reason)
+                    .put("personCount", event.personCount)
+                    .put("adultLikePersonCount", event.adultLikePersonCount)
+                    .put("supervisionState", event.supervisionState)
+                    .put("cryScore", event.cryScore ?: JSONObject.NULL)
+                    .put("clipStatus", event.clipStatus)
+                    .put("clipDurationMs", event.clipDurationMs)
+                    .put("clipSizeBytes", event.clipSizeBytes)
+                    .put("clipError", event.clipError ?: JSONObject.NULL)
+            )
+        }
+        val storage = service.guardianClipStorageInfo()
+        return json(
+            JSONObject()
+                .put("ok", true)
+                .put("events", items)
+                .put(
+                    "storage",
+                    JSONObject()
+                        .put("location", "device_internal")
+                        .put("clipCount", storage.clipCount)
+                        .put("totalBytes", storage.totalBytes)
+                        .put("maxClipCount", storage.maxClipCount)
+                        .put("maxBytes", storage.maxBytes)
+                        .put("preRollSeconds", 10)
+                        .put("postRollSeconds", 20)
+                        .put("includesAudio", false)
+                )
+                .toString()
+        )
+    }
+
+    /**
+     * Safari/iOS 播放 MP4 会先发 Range 请求；只返回指定区间，避免把整段视频读进内存。
+     */
+    private fun serveEventClip(eventId: String?, rangeHeader: String?): Response {
+        if (eventId.isNullOrBlank()) {
+            return newFixedLengthResponse(Response.Status.BAD_REQUEST, MIME_PLAINTEXT, "缺少事件 ID")
+        }
+        val file = MonitorService.instance?.guardianClipFile(eventId)
+            ?: return newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "短片不存在")
+        val total = file.length()
+        if (total <= 0L) {
+            return newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "短片为空")
+        }
+
+        var start = 0L
+        var end = total - 1L
+        var partial = false
+        if (!rangeHeader.isNullOrBlank() && rangeHeader.startsWith("bytes=")) {
+            val range = rangeHeader.removePrefix("bytes=").substringBefore(',').trim()
+            val parts = range.split('-', limit = 2)
+            try {
+                if (parts.firstOrNull().isNullOrBlank()) {
+                    val suffix = parts.getOrNull(1)?.toLongOrNull()?.coerceAtLeast(1L) ?: total
+                    start = (total - suffix).coerceAtLeast(0L)
+                } else {
+                    start = parts[0].toLong().coerceAtLeast(0L)
+                    end = parts.getOrNull(1)?.toLongOrNull()?.coerceAtMost(total - 1L) ?: end
+                }
+                partial = true
+            } catch (_: Exception) {
+                return newFixedLengthResponse(Response.Status.BAD_REQUEST, MIME_PLAINTEXT, "无效 Range")
+            }
+        }
+        if (start >= total || end < start) {
+            return newFixedLengthResponse(Response.Status.BAD_REQUEST, MIME_PLAINTEXT, "无效 Range")
+        }
+
+        val length = end - start + 1L
+        val source = FileInputStream(file)
+        var skipped = 0L
+        while (skipped < start) {
+            val amount = source.skip(start - skipped)
+            if (amount <= 0L) break
+            skipped += amount
+        }
+        val limited = object : InputStream() {
+            private var remaining = length
+
+            override fun read(): Int {
+                if (remaining <= 0L) return -1
+                val value = source.read()
+                if (value >= 0) remaining--
+                return value
+            }
+
+            override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                if (remaining <= 0L) return -1
+                val count = source.read(buffer, offset, minOf(length.toLong(), remaining).toInt())
+                if (count > 0) remaining -= count.toLong()
+                return count
+            }
+
+            override fun close() = source.close()
+        }
+        val status = if (partial) Response.Status.PARTIAL_CONTENT else Response.Status.OK
+        return newFixedLengthResponse(status, "video/mp4", limited, length).apply {
+            addHeader("Accept-Ranges", "bytes")
+            addHeader("Content-Disposition", "inline; filename=guardian-event.mp4")
+            addHeader("Cache-Control", "no-store")
+            if (partial) addHeader("Content-Range", "bytes $start-$end/$total")
+        }
+    }
+
+    /** 通知设备管理：添加/删除/启停/测试 Bark 推送目标。 */
+    private fun apiNotify(p: Map<String, String>): Response {
+        val service = MonitorService.instance
+            ?: return json("""{"ok":false,"error":"service_unavailable"}""")
+        var opError: String? = null
+
+        p["add"]?.let { key ->
+            if (!service.barkAdd(p["name"] ?: "", key)) opError = "invalid_or_duplicate_key"
+        }
+        p["remove"]?.let { service.barkRemove(it) }
+        p["toggle"]?.let { key ->
+            service.barkSetEnabled(key, p["on"]?.toBoolean() ?: true)
+        }
+        p["test"]?.let { target ->
+            if (target == "all" || target == "true") {
+                if (!service.isBarkConfigured()) opError = "no_enabled_target"
+                else service.sendTestBark(null)
+            } else {
+                service.sendTestBark(target)
+            }
+        }
+
+        val targets = JSONArray()
+        for (t in service.barkTargets()) {
+            targets.put(
+                JSONObject()
+                    .put("name", t.name)
+                    .put("key", t.key)
+                    .put("enabled", t.enabled)
+            )
+        }
+        return json(
+            JSONObject()
+                .put("ok", opError == null)
+                .put("barkConfigured", service.isBarkConfigured())
+                .put("targets", targets)
+                .apply { opError?.let { put("error", it) } }
+                .toString()
+        )
+    }
+
+    /** 硬件动作会整幅改变画面，通知动作检测丢弃参考帧。 */
+    private fun invalidateMotionReference() {
+        MonitorService.instance?.invalidateMotionReference()
     }
 
     private fun json(s: String): Response =

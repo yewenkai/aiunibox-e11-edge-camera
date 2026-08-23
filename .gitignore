@@ -14,6 +14,26 @@ local.properties
 *.key
 *.crt
 .playwright-cli/
+**/.cxx/
+**/__pycache__/
+*.pyc
+*.rknn
+*.onnx
+*.tflite
+*.mp4
+*.h264
+*.wav
+*.m4a
+*.env
+*.env.*
+*.log
+
+# Local-only model inputs, calibration media, device captures and event evidence.
+models/
+calibration/
+captures/
+device-data/
+guardian-events/
 
 # Do not commit third-party firmware, extracted applications or native binaries.
 apk/
@@ -22,3 +42,5 @@ vendor/
 mediamtx
 ffmpeg
 ffprobe
+android-app/app/src/main/cpp/rknn_api.h
+android-app/app/src/main/jniLibs/

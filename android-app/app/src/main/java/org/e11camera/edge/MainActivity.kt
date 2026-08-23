@@ -106,11 +106,23 @@ private fun AppScreen(
     onStopService: () -> Unit
 ) {
     var serviceRunning by remember { mutableStateOf(MonitorService.instance != null) }
+    var babyStatus by remember { mutableStateOf("") }
     val url = remember(ip) { "http://$ip:${MonitorService.PORT}" }
 
     LaunchedEffect(Unit) {
         while (true) {
-            serviceRunning = MonitorService.instance?.isWebRunning() == true
+            val svc = MonitorService.instance
+            serviceRunning = svc?.isWebRunning() == true
+            babyStatus = if (svc == null || !svc.isBabyModeEnabled()) {
+                ""
+            } else {
+                when {
+                    svc.isBabyCryActive() -> "宝宝守护：开启 · 检测到哭声"
+                    svc.isBabyMotionActive() -> "宝宝守护：开启 · 检测到活动"
+                    svc.isPrivacyModeOn() -> "宝宝守护：开启 · 隐私模式暂停"
+                    else -> "宝宝守护：开启 · 监测中"
+                }
+            }
             delay(1000)
         }
     }
@@ -188,6 +200,14 @@ private fun AppScreen(
                     fontSize = 12.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
+                if (babyStatus.isNotEmpty()) {
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        babyStatus,
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
             }
         }
 

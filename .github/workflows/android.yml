@@ -1,4 +1,4 @@
-name: Android build
+name: Android source validation
 
 on:
   push:
@@ -7,7 +7,7 @@ on:
   pull_request:
 
 jobs:
-  assemble:
+  validate:
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -19,5 +19,5 @@ jobs:
           distribution: temurin
           java-version: '17'
           cache: gradle
-      - name: Build debug APK
-        run: ./gradlew --no-daemon assembleDebug
+      - name: Test, build and lint source
+        run: ./gradlew --no-daemon testDebugUnitTest assembleDebug lintDebug

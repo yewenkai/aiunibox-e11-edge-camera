@@ -7,7 +7,6 @@ STATE_DIR=/data/local/tmp/e11-edge-camera
 WATCHDOG_STATE="$STATE_DIR/watchdog.state"
 LEGACY_WATCHDOG_PID=/data/local/tmp/e11_camera_watchdog.pid
 APP_PKG=org.e11camera.edge
-LEGACY_APP_PKG=com.unicom.ptzmonitor
 TOKEN_FILE="$STATE_DIR/api_token"
 BOOT_ID=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)
 [ -n "$BOOT_ID" ] || BOOT_ID=$(awk '/^btime / { print $2 }' /proc/stat 2>/dev/null)
@@ -40,7 +39,6 @@ media_port_ready() {
 start_monitor_app() {
     # 部分定制系统禁止以 Service 作为第三方 App 的冷启动入口。
     # 先启动 Activity 让 App 进程创建前台 Service，成功后回到桌面。
-    am force-stop "$LEGACY_APP_PKG" >/dev/null 2>&1
     am start -n "$APP_PKG/.MainActivity" >> "$LOG" 2>&1
     sleep 5
     input keyevent HOME
@@ -117,10 +115,8 @@ for i in $(seq 1 20); do
     sleep 1
 done
 
-# 2) 禁用旧应用，避免定制桌面在重启后恢复它并抢占摄像头和 8080。
+# 2) 确保监控 App 处于启用状态（历史版本曾被手动禁用）。
 pm enable --user 0 "$APP_PKG" >> "$LOG" 2>&1
-am force-stop "$LEGACY_APP_PKG" >/dev/null 2>&1
-pm disable-user --user 0 "$LEGACY_APP_PKG" >> "$LOG" 2>&1
 
 # 3) 通过 Activity 冷启动，服务建立后自动回到桌面。
 sleep 2

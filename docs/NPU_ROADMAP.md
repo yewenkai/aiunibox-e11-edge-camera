@@ -4,7 +4,7 @@
 
 目标是在不影响 30fps 采集和推流稳定性的前提下，利用 RK3566 约 1 TOPS NPU 完成低频率、轻量化、本地运行的视觉判断。
 
-第一阶段不做人脸身份识别，不默认保存原始图片，不把视频上传到云端。
+第一阶段不做人脸或年龄识别，不把 NPU 框烧进视频，也不把视频上传到云端。动作或哭声事件可以按明确的容量上限在设备端保存短片，详见 [EVENT_TIMELINE.md](EVENT_TIMELINE.md)。
 
 ## 推荐数据流
 
@@ -38,6 +38,56 @@ Camera2
 - 连续运行稳定
 - 逆光、夜视、局部遮挡下可接受
 - 有明确的误报/漏报统计，而不是只展示单次演示
+
+### 当前实现（实验性）
+
+- 模型：Rockchip RKNN Model Zoo 优化版 YOLOv8n，640×640 输入，RK3566 INT8。
+- 运行：APK 可选加载 RKNN Runtime 2.3.0，通过 JNI 调用设备 NPU；每 2 秒复用一张 JPEG 快照。
+- 后处理：按 3 个尺度的 box/class/score-sum 共 9 路输出解码 DFL，只保留 person 类并做 NMS。
+- 防抖：最近 3 帧至少 2 帧命中后进入“有人”，连续 10 秒未命中后退出。
+- 陪护状态：当前帧一旦检出两人或成人体型证据，就即时抑制当次 Bark；最近 4 次中
+  至少 3 次出现这些证据后，稳定判定“有人陪护”。
+  陪护证据消失约 20 秒后恢复通知。UNKNOWN 和视觉漏检都保持通知武装。
+- 降级：缺少 SDK 头文件、运行库或模型时，普通摄像头版本仍可构建和运行。
+
+真机 RK3566 / Android 11 上已验证模型初始化和持续推理，稳定单帧约 90～125ms，
+GPU 时间戳合成和 H.264 推流同时运行约 30fps。通用 person 模型对“侧卧且被褥大面积
+遮挡”的场景存在明显漏检，因此 UI 只陈述“检出人体 / 未检出人体”，不能把后者解释为
+确定无人。当前 NPU 结果只作为守护上下文，不作为动作检测或哭声检测的硬开关：即使
+暂未检出人体，这两条守护链路也会继续运行，避免因遮挡漏检造成监护空窗。COCO person
+类别只能说明画面中检出通用人体，不能据此判断目标是宝宝还是成人。
+
+当前逻辑不要求宝宝位于婴儿床，也不依据重点区域内外位置推断身份。重点区域只供
+`MotionDetector` 计算帧差，NPU 始终使用全画面人数和人体框尺寸寻找成人陪护证据。
+成人体型证据不是年龄分类；兄弟姐妹、访客、近距离宝宝、镜面反射或固定阈值都可能
+造成误判，不能作为医疗或人身安全系统的唯一依据。
+
+动作、哭声以及陪护状态变化会进入事件解释时间线。动作和哭声触发时复用 H.264 主链路
+保存事件前约 10 秒、后约 20 秒的端侧 MP4；NPU 框不写入视频。短片数量、容量、手动
+删除和 iOS Range 播放规则见 [EVENT_TIMELINE.md](EVENT_TIMELINE.md)。
+
+### 自行转换与部署
+
+仓库仅提供 `scripts/convert_yolov8_rknn.py`，不分发 SDK、运行库、模型、校准图或家庭画面。
+
+1. 在 Rockchip 支持的 Linux x86_64 环境安装 RKNN Toolkit 2，并从官方 Model Zoo 取得优化版 YOLOv8n ONNX。
+2. 准备已授权、已清理隐私的校准图片列表，运行：
+
+   ```bash
+   python scripts/convert_yolov8_rknn.py \
+     --onnx /path/to/yolov8n.onnx \
+     --dataset /path/to/dataset.txt \
+     --output /path/to/yolov8n_rk3566.rknn
+   ```
+
+3. 自行取得与设备兼容的 `rknn_api.h` 和 Android arm64 `librknnrt.so`，分别放到
+   `android-app/app/src/main/cpp/` 与 `android-app/app/src/main/jniLibs/arm64-v8a/` 后编译 APK。
+4. 把模型放入应用私有目录，文件名必须为 `yolov8n_rk3566.rknn`。模型、运行库、
+   SDK 头文件和校准数据均已被 `.gitignore` 排除。
+
+如果希望让 Codex 检查本机环境并逐步指导上述流程，请使用
+[SELF_BUILD_WITH_CODEX.md](SELF_BUILD_WITH_CODEX.md) 中的提示词。Codex 只能协助执行和
+核对，第三方许可证与设备使用授权仍需由使用者确认。
 
 ## 阶段 2：简单手势
 

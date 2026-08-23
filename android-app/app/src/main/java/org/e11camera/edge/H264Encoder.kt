@@ -9,7 +9,8 @@ import java.util.concurrent.LinkedBlockingQueue
 
 data class EncodedFrame(
     val data: ByteArray,
-    val presentationTimeUs: Long
+    val presentationTimeUs: Long,
+    val flags: Int
 )
 
 /**
@@ -33,6 +34,7 @@ class H264Encoder(
 
     private var codec: MediaCodec? = null
     @Volatile private var running = false
+    @Volatile private var encodedFormat: MediaFormat? = null
 
     /** 编码后的 H.264 NAL 队列（主缓冲，drainAll 消费） */
     private val nalQueue = LinkedBlockingQueue<ByteArray>(MAX_QUEUE)
@@ -130,7 +132,7 @@ class H264Encoder(
                                     nalQueue.poll()
                                 }
                                 // 分发给所有订阅者（多客户端模式）
-                                val frame = EncodedFrame(data, info.presentationTimeUs)
+                                val frame = EncodedFrame(data, info.presentationTimeUs, info.flags)
                                 for (sub in subscribers) {
                                     while (!sub.offer(frame)) {
                                         sub.poll()
@@ -141,7 +143,8 @@ class H264Encoder(
                         c.releaseOutputBuffer(idx, false)
                     }
                     idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                        Log.i(TAG, "编码格式变更: ${c.outputFormat}")
+                        encodedFormat = c.outputFormat
+                        Log.i(TAG, "编码格式变更: $encodedFormat")
                     }
                 }
             } catch (e: Exception) {
@@ -157,6 +160,9 @@ class H264Encoder(
     }
 
     fun getSpsPps(): ByteArray = spsPps
+
+    /** MediaMuxer 写端侧事件短片所需的编码格式（包含 SPS/PPS）。 */
+    fun getEncodedFormat(): MediaFormat? = encodedFormat
 
     fun available(): Int = nalQueue.size
 
@@ -182,6 +188,7 @@ class H264Encoder(
         } catch (_: Exception) {}
         codec = null
         inputSurface = null
+        encodedFormat = null
         nalQueue.clear()
         Log.i(TAG, "H.264 编码器停止")
     }

@@ -36,8 +36,15 @@ class MonitorService : Service() {
     private var viewerWatcher: ViewerWatcher? = null
     private var rtspPublisher: RtspPublisher? = null
     private var deviceState: DeviceStateStore? = null
+    private var motionDetector: MotionDetector? = null
+    private var cryDetector: CryDetector? = null
+    private var npuDetector: NpuDetector? = null
+    private var barkNotifier: BarkNotifier? = null
+    private var guardianEventStore: GuardianEventStore? = null
+    private var eventClipRecorder: EventClipRecorder? = null
     private var startedAtMs: Long = 0
     private val healthScheduler = Executors.newSingleThreadScheduledExecutor()
+    @Volatile private var lastSuppressedAlertAt: Long = 0
     @Volatile private var initializing = false
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -65,6 +72,27 @@ class MonitorService : Service() {
             val s = CameraStreamer(this)
             val state = DeviceStateStore(this)
             val m = MotorController(state)
+            val bark = BarkNotifier(state)
+            val eventStore = GuardianEventStore(this)
+            val clipRecorder = EventClipRecorder(eventStore)
+            val motion = MotionDetector(s, state, m) {
+                notifyGuardianEvent(
+                    kind = "motion",
+                    title = "宝宝守护：检测到动作",
+                    summary = "画面检测到持续动作"
+                )
+            }
+            val cry = CryDetector(this, state) { score ->
+                notifyGuardianEvent(
+                    kind = "cry",
+                    title = "宝宝守护：检测到疑似哭声",
+                    summary = "本地音频模型检测到哭声候选，匹配分 ${"%.0f".format(score * 100)}%",
+                    cryScore = score
+                )
+            }
+            val npu = NpuDetector(this, s) { previous, current, observation ->
+                recordSupervisionTransition(previous, current, observation)
+            }
 
             // 局域网 HTTP 控制服务。
             val srv = WebServer(this, s, m, state, ApiSecurity(), PORT)
@@ -75,6 +103,12 @@ class MonitorService : Service() {
             motor = m
             deviceState = state
             server = srv
+            motionDetector = motion
+            cryDetector = cry
+            npuDetector = npu
+            barkNotifier = bark
+            guardianEventStore = eventStore
+            eventClipRecorder = clipRecorder
             startedAtMs = System.currentTimeMillis()
 
             if (!state.privacyMode) {
@@ -88,6 +122,19 @@ class MonitorService : Service() {
             val watcher = ViewerWatcher()
             watcher.start()
             viewerWatcher = watcher
+
+            // 宝宝守护：开机若已启用则恢复动作+哭声检测并压制所有 LED
+            // （补光灯硬件默认常亮 255，必须主动熄灭）。
+            if (state.babyMonitorEnabled) {
+                watcher.setLedSuppressed(true)
+                Thread { LedController.allOff() }.start()
+                if (!state.privacyMode) {
+                    clipRecorder.start(s.h264Encoder)
+                    motion.start()
+                    cry.start()
+                    npu.start()
+                }
+            }
 
             healthScheduler.scheduleAtFixedRate({
                 val current = streamer ?: return@scheduleAtFixedRate
@@ -122,6 +169,10 @@ class MonitorService : Service() {
     private fun cleanupResources() {
         try {
             rtspPublisher?.stop()
+            eventClipRecorder?.release()
+            motionDetector?.stop()
+            cryDetector?.stop()
+            npuDetector?.stop()
             viewerWatcher?.stop()
             server?.stop()
             streamer?.stop()
@@ -130,6 +181,11 @@ class MonitorService : Service() {
             Log.w(TAG, "停止异常", e)
         }
         rtspPublisher = null
+        motionDetector = null
+        cryDetector = null
+        npuDetector = null
+        eventClipRecorder = null
+        guardianEventStore = null
         viewerWatcher = null
         server = null
         streamer = null
@@ -189,14 +245,257 @@ class MonitorService : Service() {
 
         state.privacyMode = enabled
         if (enabled) {
+            eventClipRecorder?.stop()
+            motionDetector?.stop()
+            cryDetector?.stop()
+            npuDetector?.stop()
             rtspPublisher?.stop()
             rtspPublisher = null
             s.pause()
         } else {
             s.resume()
             startRtspPublisher(s)
+            if (state.babyMonitorEnabled) {
+                eventClipRecorder?.start(s.h264Encoder)
+                motionDetector?.start()
+                cryDetector?.start()
+                npuDetector?.start()
+            }
         }
         return true
+    }
+
+    /** 宝宝守护开关：持久化 + 启停动作/哭声检测 + LED 抑制。 */
+    @Synchronized
+    fun setBabyMode(enabled: Boolean): Boolean {
+        val state = deviceState ?: return false
+        state.babyMonitorEnabled = enabled
+        if (enabled) {
+            viewerWatcher?.setLedSuppressed(true)
+            Thread { LedController.allOff() }.start()
+            if (!state.privacyMode) {
+                eventClipRecorder?.start(streamer?.h264Encoder)
+                motionDetector?.start()
+                cryDetector?.start()
+                npuDetector?.start()
+            }
+        } else {
+            eventClipRecorder?.stop()
+            motionDetector?.stop()
+            cryDetector?.stop()
+            npuDetector?.stop()
+            viewerWatcher?.setLedSuppressed(false)
+        }
+        return true
+    }
+
+    fun setBabySensitivity(level: Int) {
+        deviceState?.babySensitivity = level
+    }
+
+    fun barkTargets(): List<BarkNotifier.Target> =
+        barkNotifier?.targets() ?: emptyList()
+
+    fun barkAdd(name: String, key: String): Boolean =
+        barkNotifier?.add(name, key) == true
+
+    fun barkRemove(key: String) {
+        barkNotifier?.remove(key)
+    }
+
+    fun barkSetEnabled(key: String, enabled: Boolean) {
+        barkNotifier?.setEnabled(key, enabled)
+    }
+
+    fun isBarkConfigured(): Boolean = barkNotifier?.configured == true
+
+    /** key 为空时测试所有启用目标。 */
+    fun sendTestBark(key: String?) {
+        if (key.isNullOrBlank()) {
+            barkNotifier?.notify("宝宝守护测试", "收到这条说明设备直推链路正常")
+        } else {
+            barkNotifier?.notifyOne(key, "宝宝守护测试", "收到这条说明该设备推送正常")
+        }
+    }
+
+    fun invalidateMotionReference() {
+        motionDetector?.notifyReferenceInvalid()
+    }
+
+    fun isBabyMotionActive(): Boolean = motionDetector?.isActive == true
+
+    fun isBabyCryActive(): Boolean = cryDetector?.isActive == true
+
+    fun isCryModelLoaded(): Boolean = cryDetector?.modelLoaded == true
+
+    fun cryAudioRms(): Float = cryDetector?.lastAudioRms ?: 0f
+
+    fun cryScore(): Float = cryDetector?.lastCryScore ?: 0f
+
+    fun cryThreshold(): Float = cryDetector?.currentThreshold ?: 0f
+
+    fun cryTopClassIndex(): Int = cryDetector?.topClassIndex ?: -1
+
+    fun cryTopClassScore(): Float = cryDetector?.topClassScore ?: 0f
+
+    fun cryAnalyzedAt(): Long = cryDetector?.lastAnalyzedAt ?: 0L
+
+    fun isNpuModelLoaded(): Boolean = npuDetector?.modelLoaded == true
+
+    fun isPersonPresent(): Boolean = npuDetector?.personPresent == true
+
+    fun personConfidence(): Float = npuDetector?.personConfidence ?: 0f
+
+    fun personBox(): FloatArray = npuDetector?.personBox ?: FloatArray(0)
+
+    fun personCount(): Int = npuDetector?.personCount ?: 0
+
+    fun adultLikePersonCount(): Int = npuDetector?.adultLikePersonCount ?: 0
+
+    fun caregiverEvidenceNow(): Boolean = npuDetector?.caregiverEvidenceNow == true
+
+    fun personBoxes(): List<FloatArray> = npuDetector?.personBoxes ?: emptyList()
+
+    fun supervisionState(): String =
+        (npuDetector?.supervisionState ?: SupervisionStateMachine.State.UNKNOWN).name.lowercase()
+
+    fun notificationsArmed(): Boolean = npuDetector?.notificationsSuppressed != true
+
+    fun lastSuppressedAlertAt(): Long = lastSuppressedAlertAt
+
+    fun isBabyModeEnabled(): Boolean = deviceState?.babyMonitorEnabled == true
+
+    fun isPrivacyModeOn(): Boolean = deviceState?.privacyMode == true
+
+    fun babyLastEventAt(): Long? = guardianEventStore?.list(1)?.firstOrNull()?.occurredAt
+
+    /** 动作+哭声事件合并（新→旧），kind: "motion" | "cry"。 */
+    fun babyRecentEvents(): List<Pair<Long, String>> {
+        return (guardianEventStore?.list(50) ?: emptyList())
+            .filter { it.kind == "motion" || it.kind == "cry" }
+            .map { it.occurredAt to it.kind }
+            .take(20)
+    }
+
+    fun guardianEvents(limit: Int): List<GuardianEventEntry> =
+        guardianEventStore?.list(limit) ?: emptyList()
+
+    fun guardianClipFile(eventId: String): java.io.File? =
+        guardianEventStore?.clipFile(eventId)
+
+    fun deleteGuardianClip(eventId: String): Boolean =
+        guardianEventStore?.deleteClip(eventId) == true
+
+    fun guardianClipStorageInfo(): GuardianClipStorageInfo =
+        guardianEventStore?.storageInfo()
+            ?: GuardianClipStorageInfo(0, 0L, GuardianEventStore.MAX_CLIPS, GuardianEventStore.MAX_CLIP_BYTES)
+
+    /** 手动验证端侧短片链路，不发送 Bark。 */
+    fun createGuardianTestClip(): Boolean {
+        val store = guardianEventStore ?: return false
+        val recorder = eventClipRecorder ?: return false
+        val npu = npuDetector
+        val event = store.addTriggered(
+            kind = "test",
+            title = "短片录制测试",
+            summary = "手动发起端侧画面短片测试",
+            decision = "recorded",
+            reason = "仅验证事件前后画面的保存和播放，不会发送 Bark 通知",
+            personCount = npu?.personCount ?: 0,
+            adultLikePersonCount = npu?.adultLikePersonCount ?: 0,
+            supervisionState = (npu?.supervisionState ?: SupervisionStateMachine.State.UNKNOWN)
+                .name.lowercase(),
+            cryScore = null
+        )
+        return recorder.capture(event.id)
+    }
+
+    /**
+     * 动作和哭声检测始终记录事件。当前帧出现两人或成人体型证据时立即暂停 Bark；
+     * 多帧确认后进入陪护缓冲状态。其余 UNKNOWN 按安全侧继续推送，避免人体漏检造成守护空窗。
+     */
+    private fun notifyGuardianEvent(
+        kind: String,
+        title: String,
+        summary: String,
+        cryScore: Float? = null
+    ) {
+        val npu = npuDetector
+        val personCount = npu?.personCount ?: 0
+        val adultLikeCount = npu?.adultLikePersonCount ?: 0
+        val suppressed = npu?.notificationsSuppressed == true
+        val configured = barkNotifier?.configured == true
+        val decision = when {
+            suppressed -> "suppressed"
+            configured -> "notified"
+            else -> "not_configured"
+        }
+        val reason = when {
+            suppressed && personCount >= 2 ->
+                "当前画面检测到 ${personCount} 人，按有人陪护处理，因此未发送通知"
+            suppressed && adultLikeCount > 0 ->
+                "当前检测到成人体型证据，按有人陪护处理，因此未发送通知"
+            suppressed ->
+                "刚刚确认过有人陪护，仍在离开缓冲期，因此未发送通知"
+            configured ->
+                "未检测到明确成人，已触发 Bark 通知"
+            else ->
+                "未检测到明确成人，但尚未配置可用的通知设备"
+        }
+        val event = guardianEventStore?.addTriggered(
+            kind = kind,
+            title = title,
+            summary = summary,
+            decision = decision,
+            reason = reason,
+            personCount = personCount,
+            adultLikePersonCount = adultLikeCount,
+            supervisionState = (npu?.supervisionState ?: SupervisionStateMachine.State.UNKNOWN)
+                .name.lowercase(),
+            cryScore = cryScore
+        )
+        event?.let { eventClipRecorder?.capture(it.id) }
+
+        if (suppressed) {
+            lastSuppressedAlertAt = System.currentTimeMillis()
+            Log.i(TAG, "检测到${title}，当前有人陪护，仅记录事件和短片，不发送 Bark")
+            return
+        }
+        barkNotifier?.notify(title, "$summary，打开控制页查看实时画面")
+    }
+
+    private fun recordSupervisionTransition(
+        previous: SupervisionStateMachine.State,
+        current: SupervisionStateMachine.State,
+        observation: SupervisionStateMachine.Observation
+    ) {
+        if (previous == current) return
+        if (current == SupervisionStateMachine.State.CAREGIVER_PRESENT) {
+            val reason = if (observation.totalPeople >= 2) {
+                "连续多帧检测到 ${observation.totalPeople} 人，确认有人陪护"
+            } else {
+                "连续多帧检测到成人体型证据，确认有人陪护"
+            }
+            guardianEventStore?.addState(
+                title = "通知已暂停",
+                summary = "检测到成人陪护",
+                decision = "suppressed",
+                reason = "$reason；动作和哭声仍继续记录",
+                personCount = observation.totalPeople,
+                adultLikePersonCount = observation.adultLikePeople,
+                supervisionState = current.name.lowercase()
+            )
+        } else if (previous == SupervisionStateMachine.State.CAREGIVER_PRESENT) {
+            guardianEventStore?.addState(
+                title = "通知已恢复",
+                summary = "未再检测到明确成人",
+                decision = "armed",
+                reason = "陪护证据消失并经过 20 秒缓冲期，动作或哭声事件将重新触发通知",
+                personCount = observation.totalPeople,
+                adultLikePersonCount = observation.adultLikePeople,
+                supervisionState = current.name.lowercase()
+            )
+        }
     }
 
     private fun startRtspPublisher(s: CameraStreamer) {

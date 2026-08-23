@@ -48,12 +48,19 @@ class CameraStreamer(private val context: Context) {
     var latestJpeg: ByteArray = ByteArray(0)
         private set
 
+    /** 最新 JPEG 快照完成转换的系统时间，用于页面判断采集链路是否卡住。 */
+    @Volatile
+    var latestJpegCapturedAtMs: Long = 0L
+        private set
+
     @Volatile
     private var camera: CameraDevice? = null
     @Volatile
     private var session: CameraCaptureSession? = null
     @Volatile
     private var imageReader: ImageReader? = null
+    @Volatile
+    private var timestampCompositor: VideoTimestampCompositor? = null
 
     /** H.264 硬件编码器（用于 RTSP 推流）*/
     @Volatile
@@ -137,12 +144,26 @@ class CameraStreamer(private val context: Context) {
     private fun startCapture(c: CameraDevice) {
         // 编码器 Surface（零拷贝主路径）
         val encSurface = h264Encoder?.inputSurface
+        val encodedTarget = if (encSurface != null) {
+            timestampCompositor?.cameraSurface ?: VideoTimestampCompositor(
+                encSurface, WIDTH, HEIGHT
+            ).let { compositor ->
+                val target = compositor.start()
+                if (target != null) {
+                    timestampCompositor = compositor
+                    target
+                } else {
+                    Log.w(TAG, "时间戳合成不可用，回退 Camera2 直连编码器")
+                    encSurface
+                }
+            }
+        } else null
 
         // 组装输出 Surface：编码器零拷贝主路径 + 低频 JPEG 快照 + 本地预览。
         // ImageReader 每帧只做快速丢弃，每 30 帧才压缩一张 JPEG，不回退到
         // 早期“每帧 YUV 转 JPEG”的高 CPU 路径。
         val targets = ArrayList<Surface>()
-        if (encSurface != null) targets.add(encSurface)
+        if (encodedTarget != null) targets.add(encodedTarget)
         previewSurface?.let { targets.add(it) }
         val reader = ImageReader.newInstance(WIDTH, HEIGHT, ImageFormat.YUV_420_888, 2)
         reader.setOnImageAvailableListener({ onImage(it) }, handler)
@@ -164,7 +185,7 @@ class CameraStreamer(private val context: Context) {
                         session = s
                         try {
                             val req = c.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
-                            if (encSurface != null) req.addTarget(encSurface)
+                            if (encodedTarget != null) req.addTarget(encodedTarget)
                             imageReader?.let { req.addTarget(it.surface) }
                             previewSurface?.takeIf { it.isValid }?.let { req.addTarget(it) }
                             req.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
@@ -176,7 +197,7 @@ class CameraStreamer(private val context: Context) {
                             s.setRepeatingRequest(req.build(), null, handler)
                             Log.i(
                                 TAG,
-                                "采集已启动 ${WIDTH}x$HEIGHT Surface=${encSurface != null} targets=${targets.size}"
+                                "采集已启动 ${WIDTH}x$HEIGHT Surface=${encodedTarget != null} timestamp=${timestampCompositor != null} targets=${targets.size}"
                             )
                         } catch (e: IllegalStateException) {
                             Log.w(TAG, "CameraDevice 状态已变化，重新建立采集会话", e)
@@ -219,10 +240,13 @@ class CameraStreamer(private val context: Context) {
         desiredRunning.set(false)
         handler.removeCallbacks(retryRunnable)
         closeCameraOnly()
+        timestampCompositor?.stop()
+        timestampCompositor = null
         h264Encoder?.stop()
         h264Encoder = null
         synchronized(this) {
             latestJpeg = ByteArray(0)
+            latestJpegCapturedAtMs = 0L
         }
         Log.i(TAG, "摄像头已暂停")
     }
@@ -252,13 +276,14 @@ class CameraStreamer(private val context: Context) {
         val image = reader.acquireNextImage() ?: return
         try {
             // H.264 编码走 Surface 零拷贝，不需要在这里喂编码器
-            // JPEG 快照：每 15 帧做一次（大幅省 CPU）
+            // JPEG 快照：每 30 帧做一次（约每秒一张，大幅省 CPU）
             jpegSkipCounter++
             if (jpegSkipCounter >= 30) {
                 jpegSkipCounter = 0
                 val jpeg = yuvToJpeg(image)
                 synchronized(this) {
                     latestJpeg = jpeg
+                    latestJpegCapturedAtMs = System.currentTimeMillis()
                 }
             } else {
                 // 不做 JPEG 的帧也要快速丢弃，避免 ImageReader 积压
@@ -354,6 +379,8 @@ class CameraStreamer(private val context: Context) {
         try {
             closeCameraOnly()
             callbackThread.quitSafely()
+            timestampCompositor?.stop()
+            timestampCompositor = null
             h264Encoder?.stop()
             h264Encoder = null
             executor.shutdownNow()
