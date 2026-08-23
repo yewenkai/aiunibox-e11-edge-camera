@@ -62,12 +62,20 @@
     gap: 10px; margin-bottom: 12px;
   }
   .guardian-title { font-size: 15px; font-weight: 700; color: #f8fafc; }
+  .guardian-head-actions { display: flex; align-items: center; justify-content: flex-end; gap: 7px; }
   .guardian-chip {
     padding: 5px 9px; border-radius: 999px; font-size: 11px; font-weight: 650;
     color: #bfdbfe; background: rgba(59,130,246,.14); border: 1px solid rgba(96,165,250,.25);
   }
   .guardian-chip.alert { color: #fecaca; background: rgba(239,68,68,.14); border-color: rgba(248,113,113,.32); }
   .guardian-chip.off { color: #9ca3af; background: rgba(107,114,128,.12); border-color: #374151; }
+  .guardian-quick-toggle {
+    padding: 6px 10px; border: 1px solid rgba(74,222,128,.38); border-radius: 8px;
+    color: #dcfce7; background: #166534; font: inherit; font-size: 11px; font-weight: 650;
+    cursor: pointer; touch-action: manipulation;
+  }
+  .guardian-quick-toggle.is-on { color: #fecaca; background: #4c1d1d; border-color: rgba(248,113,113,.34); }
+  .guardian-quick-toggle:disabled, .toggle-btn:disabled { opacity: .5; cursor: default; }
   .guardian-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
   .signal-card {
     min-width: 0; min-height: 108px; padding: 11px; border-radius: 10px;
@@ -112,6 +120,7 @@
   }
   .event-head-actions { display: flex; align-items: center; justify-content: flex-end; gap: 6px; flex-wrap: wrap; }
   .event-head-actions .toggle-btn { padding: 5px 9px; font-size: 10px; }
+  .event-head-actions .danger { color: #fecaca; background: #4c1d1d; border: 1px solid rgba(248,113,113,.28); }
   .event-list {
     display: grid; gap: 9px; max-height: 560px; overflow-y: auto;
     overscroll-behavior: contain; -webkit-overflow-scrolling: touch;
@@ -273,7 +282,10 @@
   <div class="guardian-overview" id="guardianOverview">
     <div class="guardian-head">
       <div class="guardian-title">宝宝守护</div>
-      <span class="guardian-chip off" id="guardianChip">读取状态…</span>
+      <div class="guardian-head-actions">
+        <span class="guardian-chip off" id="guardianChip">读取状态…</span>
+        <button class="guardian-quick-toggle" id="guardianQuickToggle" data-next-on="true" type="button">开启守护</button>
+      </div>
     </div>
     <div class="guardian-grid">
       <div class="signal-card off" id="npuSignalCard">
@@ -311,6 +323,7 @@
       </div>
       <div class="event-head-actions">
         <button class="toggle-btn" id="testClipBtn" type="button">测试短片</button>
+        <button class="toggle-btn danger" id="clearClipsBtn" type="button" disabled>清理历史</button>
         <span class="event-storage" id="eventStorageVal">读取端侧存储…</span>
       </div>
     </div>
@@ -545,6 +558,7 @@ const decisionNames = {
 };
 const eventKindNames = { motion: '⚠ 画面动作', cry: '◉ 哭声', state: '● 状态变化', test: '▣ 手动测试' };
 let eventRenderSignature = '';
+let latestGuardianStorage = {};
 
 function formatBytes(value) {
   const n = Number(value || 0);
@@ -564,8 +578,11 @@ async function loadGuardianEvents(force = false) {
   const j = await api('/api/events?limit=40');
   if (!j || !j.ok) return;
   const storage = j.storage || {};
+  latestGuardianStorage = storage;
+  const storedClipCount = Number(storage.clipCount || 0);
   $('eventStorageVal').textContent =
-    `端侧 ${storage.clipCount || 0}/${storage.maxClipCount || 60} 段 · ${formatBytes(storage.totalBytes)}`;
+    `端侧 ${storedClipCount}/${storage.maxClipCount || 60} 段 · ${formatBytes(storage.totalBytes)}`;
+  $('clearClipsBtn').disabled = storedClipCount <= 0;
 
   const events = j.events || [];
   const signature = events.map(e => `${e.id}:${e.clipStatus}:${e.clipSizeBytes}`).join('|');
@@ -624,7 +641,7 @@ async function loadGuardianEvents(force = false) {
         const clipText = {
           pending: '正在录制：事件前约 10 秒 + 事件后约 20 秒',
           failed: `短片未生成${event.clipError ? `：${event.clipError}` : ''}`,
-          deleted: '端侧短片已手动删除，解释记录仍保留',
+          deleted: '端侧短片已清理，解释记录仍保留',
           expired: '端侧短片已达到容量上限并自动淘汰'
         }[event.clipStatus] || '短片状态未知';
         appendText(actions, 'clip-state', clipText, 'span');
@@ -679,6 +696,37 @@ $('testClipBtn').addEventListener('click', async () => {
     loadGuardianEvents(true);
   } else {
     toast('请先开启宝宝守护和摄像头');
+  }
+});
+
+$('clearClipsBtn').addEventListener('click', async () => {
+  const button = $('clearClipsBtn');
+  const count = Number(latestGuardianStorage.clipCount || 0);
+  const bytes = Number(latestGuardianStorage.totalBytes || 0);
+  if (count <= 0) {
+    toast('当前没有可清理的历史短片');
+    return;
+  }
+  if (!window.confirm(
+    `确定清理设备端全部 ${count} 段历史短片（${formatBytes(bytes)}）吗？\n\n` +
+    '事件时间、检测结果和判断原因会继续保留；此操作无法撤销。'
+  )) return;
+
+  button.disabled = true;
+  button.textContent = '清理中…';
+  const j = await api('/api/events?clearClips=true');
+  button.textContent = '清理历史';
+  if (j && j.ok) {
+    const cleanup = j.cleanup || {};
+    const failed = Number(cleanup.failedCount || 0);
+    toast(failed > 0
+      ? `已清理 ${cleanup.deletedCount || 0} 段，另有 ${failed} 段失败`
+      : `已清理 ${cleanup.deletedCount || 0} 段，释放 ${formatBytes(cleanup.freedBytes)}`);
+    eventRenderSignature = '';
+    await loadGuardianEvents(true);
+  } else {
+    button.disabled = false;
+    toast('历史短片清理失败');
   }
 });
 
@@ -760,11 +808,23 @@ async function setBaby(on) {
   const j = await api(`/api/baby?on=${on}`);
   if (j && j.ok) {
     toast(on ? '宝宝守护已开启，指示灯已全部熄灭' : '宝宝守护已关闭');
-    refreshStatus();
+    await refreshStatus();
+    return true;
   }
+  return false;
 }
 $('babyOn').addEventListener('click', () => setBaby(true));
 $('babyOff').addEventListener('click', () => setBaby(false));
+$('guardianQuickToggle').addEventListener('click', async () => {
+  const button = $('guardianQuickToggle');
+  const turnOn = button.dataset.nextOn === 'true';
+  button.disabled = true;
+  button.textContent = turnOn ? '开启中…' : '关闭中…';
+  if (!await setBaby(turnOn)) {
+    button.disabled = false;
+    button.textContent = turnOn ? '开启守护' : '关闭守护';
+  }
+});
 
 // ===== Bark 多设备通知管理 =====
 async function loadBarkTargets() {
@@ -974,6 +1034,11 @@ async function refreshStatus() {
       ? '当前按全画面判断持续动作'
       : '当前只在重点区域内判断持续动作';
     const chip = $('guardianChip');
+    const quickToggle = $('guardianQuickToggle');
+    quickToggle.disabled = false;
+    quickToggle.dataset.nextOn = j.babyMonitorEnabled ? 'false' : 'true';
+    quickToggle.textContent = j.babyMonitorEnabled ? '关闭守护' : '开启守护';
+    quickToggle.classList.toggle('is-on', j.babyMonitorEnabled);
     chip.classList.remove('alert', 'off');
     if (!j.babyMonitorEnabled) {
       chip.textContent = '未启用';

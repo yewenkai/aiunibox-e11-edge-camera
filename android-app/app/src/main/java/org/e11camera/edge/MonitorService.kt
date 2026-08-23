@@ -386,6 +386,9 @@ class MonitorService : Service() {
     fun deleteGuardianClip(eventId: String): Boolean =
         guardianEventStore?.deleteClip(eventId) == true
 
+    fun clearGuardianHistoryClips(): GuardianClipCleanupResult =
+        guardianEventStore?.clearHistoryClips() ?: GuardianClipCleanupResult(0, 0, 0L)
+
     fun guardianClipStorageInfo(): GuardianClipStorageInfo =
         guardianEventStore?.storageInfo()
             ?: GuardianClipStorageInfo(0, 0L, GuardianEventStore.MAX_CLIPS, GuardianEventStore.MAX_CLIP_BYTES)

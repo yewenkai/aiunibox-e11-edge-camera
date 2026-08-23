@@ -35,6 +35,12 @@ data class GuardianClipStorageInfo(
     val maxBytes: Long
 )
 
+data class GuardianClipCleanupResult(
+    val deletedCount: Int,
+    val failedCount: Int,
+    val freedBytes: Long
+)
+
 /**
  * 事件和短片都保存在应用私有目录 files/guardian-events/。
  *
@@ -172,6 +178,43 @@ class GuardianEventStore(context: Context) {
         )
         persistLocked()
         return true
+    }
+
+    /** 一键删除所有已生成的历史短片，保留事件时间、检测结果和判断原因。 */
+    @Synchronized
+    fun clearHistoryClips(): GuardianClipCleanupResult {
+        var deletedCount = 0
+        var failedCount = 0
+        var freedBytes = 0L
+        clipsDir.listFiles()
+            ?.filter { it.extension == "mp4" && isManagedClip(it) }
+            ?.forEach { file ->
+                val size = file.length()
+                if (file.delete() || !file.exists()) {
+                    deletedCount++
+                    freedBytes += size
+                } else {
+                    failedCount++
+                }
+            }
+
+        for (i in events.indices) {
+            val event = events[i]
+            if (event.clipStatus != CLIP_READY) continue
+            val fileStillExists = event.clipFileName
+                ?.let { safeClipFile(it) }
+                ?.isFile == true
+            if (!fileStillExists) {
+                events[i] = event.copy(
+                    clipStatus = CLIP_DELETED,
+                    clipFileName = null,
+                    clipSizeBytes = 0L,
+                    clipError = null
+                )
+            }
+        }
+        persistLocked()
+        return GuardianClipCleanupResult(deletedCount, failedCount, freedBytes)
     }
 
     @Synchronized

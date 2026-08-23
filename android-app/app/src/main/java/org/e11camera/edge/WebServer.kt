@@ -23,7 +23,7 @@ import java.io.InputStream
  *  GET /api/scene        ?mode=0|1|2
  *  GET /api/baby         ?on=true|false [&sensitivity=0|1|2]（无参数=查询）
  *  GET /api/notify       ?add=KEY[&name=备注] ?remove=KEY ?toggle=KEY&on= ?test=KEY|all
- *  GET /api/events       解释时间线；?deleteClip=EVENT_ID 手动删除端侧短片
+ *  GET /api/events       解释时间线；?deleteClip=EVENT_ID 或 ?clearClips=true 清理端侧短片
  *  GET /event-clip       ?id=EVENT_ID，支持 HTTP Range
  *  GET /api/status       状态 JSON
  */
@@ -412,7 +412,7 @@ class WebServer(
                 .put("name", "AIUniBOX-E11 Edge Camera")
                 .put("model", android.os.Build.MODEL)
                 .put("deviceId", id)
-                .put("apiVersion", 4)
+                .put("apiVersion", 5)
                 .put("appVersion", BuildConfig.VERSION_NAME)
                 .put("authRequired", security.isEnabled)
                 .toString()
@@ -489,7 +489,7 @@ class WebServer(
         )
     }
 
-    /** 可解释事件时间线，以及端侧短片的手动删除入口。 */
+    /** 可解释事件时间线，以及端侧短片的逐条删除和一键清理入口。 */
     private fun apiEvents(p: Map<String, String>): Response {
         val service = MonitorService.instance
             ?: return json("""{"ok":false,"error":"service_unavailable"}""")
@@ -497,6 +497,11 @@ class WebServer(
             if (!service.deleteGuardianClip(eventId)) {
                 return json("""{"ok":false,"error":"event_or_clip_not_found"}""")
             }
+        }
+        val cleanup = if (p["clearClips"]?.toBoolean() == true) {
+            service.clearGuardianHistoryClips()
+        } else {
+            null
         }
         if (p["testClip"]?.toBoolean() == true && !service.createGuardianTestClip()) {
             return json("""{"ok":false,"error":"clip_recorder_unavailable"}""")
@@ -528,6 +533,17 @@ class WebServer(
             JSONObject()
                 .put("ok", true)
                 .put("events", items)
+                .apply {
+                    cleanup?.let {
+                        put(
+                            "cleanup",
+                            JSONObject()
+                                .put("deletedCount", it.deletedCount)
+                                .put("failedCount", it.failedCount)
+                                .put("freedBytes", it.freedBytes)
+                        )
+                    }
+                }
                 .put(
                     "storage",
                     JSONObject()
