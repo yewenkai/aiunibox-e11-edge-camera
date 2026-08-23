@@ -91,7 +91,12 @@ class GuardianEventStore(context: Context) {
         const val CLIP_FAILED = "failed"
         const val CLIP_DELETED = "deleted"
         const val CLIP_EXPIRED = "expired"
+
+        private const val STORAGE_INFO_TTL_MS = 5_000L
     }
+
+    private var cachedStorageInfo: GuardianClipStorageInfo? = null
+    private var cachedStorageInfoAt = 0L
 
     private val rootDir = File(context.filesDir, "guardian-events")
     private val clipsDir = File(rootDir, "clips")
@@ -438,15 +443,22 @@ class GuardianEventStore(context: Context) {
 
     @Synchronized
     fun storageInfo(): GuardianClipStorageInfo {
+        // /api/status 每秒轮询，逐文件 length() 是持锁 IO；缓存 5 秒足够展示用。
+        cachedStorageInfo?.let {
+            if (System.currentTimeMillis() - cachedStorageInfoAt < STORAGE_INFO_TTL_MS) return it
+        }
         val files = events.mapNotNull { event ->
             if (event.clipStatus == CLIP_READY) event.clipFileName?.let { safeClipFile(it) } else null
         }.filter { it.isFile }
-        return GuardianClipStorageInfo(
+        val info = GuardianClipStorageInfo(
             clipCount = files.size,
             totalBytes = files.sumOf { it.length() },
             maxClipCount = MAX_CLIPS,
             maxBytes = MAX_CLIP_BYTES
         )
+        cachedStorageInfo = info
+        cachedStorageInfoAt = System.currentTimeMillis()
+        return info
     }
 
     internal fun newClipFile(eventId: String): File = File(clipsDir, "$eventId.mp4")
