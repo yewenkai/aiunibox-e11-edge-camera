@@ -25,6 +25,7 @@ import java.io.InputStream
  *  GET /api/calibration  ?action=ambient|adult|cancel|reset，场景校准不保存音视频
  *  GET /api/notify       ?add=KEY[&name=备注] ?remove=KEY ?toggle=KEY&on= ?test=KEY|all
  *  GET /api/events       解释时间线；?deleteClip=EVENT_ID 或 ?clearClips=true 清理端侧短片
+ *  GET /api/health       滚动 24 小时摄像头、NPU、音频与存储健康统计
  *  GET /event-clip       ?id=EVENT_ID，支持 HTTP Range
  *  GET /api/status       状态 JSON
  */
@@ -70,6 +71,7 @@ class WebServer(
                 uri.startsWith("/api/calibration") -> apiCalibration(params)
                 uri.startsWith("/api/notify") -> apiNotify(params)
                 uri.startsWith("/api/events") -> apiEvents(params)
+                uri.startsWith("/api/health") -> apiHealth()
                 uri.startsWith("/api/status") -> apiStatus()
                 else -> newFixedLengthResponse(
                     Response.Status.NOT_FOUND, MIME_PLAINTEXT, "404"
@@ -558,6 +560,47 @@ class WebServer(
             .toString()
         )
     }
+
+    private fun apiHealth(): Response {
+        val summary = MonitorService.instance?.healthSummary()
+            ?: return json("""{"ok":false,"error":"health_not_ready"}""")
+        val coverageMinutes = if (summary.sampleCount <= 0) 0L else {
+            ((summary.lastSampleAt - summary.firstSampleAt).coerceAtLeast(0L) / 60_000L) + 1L
+        }
+        return json(
+            JSONObject()
+                .put("ok", true)
+                .put("windowHours", 24)
+                .put("sampleIntervalSeconds", 60)
+                .put("sampleCount", summary.sampleCount)
+                .put("coverageMinutes", coverageMinutes)
+                .put("firstSampleAt", summary.firstSampleAt)
+                .put("lastSampleAt", summary.lastSampleAt)
+                .putNullableMetric("cameraAvailabilityPercent", summary.cameraAvailabilityPercent)
+                .putNullableMetric("streamAvailabilityPercent", summary.streamAvailabilityPercent)
+                .put("cameraFreezeEpisodes", summary.cameraFreezeEpisodes)
+                .putNullableMetric("averageEncodedFps", summary.averageEncodedFps)
+                .putNullableMetric("minimumEncodedFps", summary.minimumEncodedFps)
+                .putNullableMetric("npuAvailabilityPercent", summary.npuAvailabilityPercent)
+                .putNullableMetric("averageNpuInferenceMs", summary.averageNpuInferenceMs)
+                .put("maximumNpuInferenceMs", summary.maximumNpuInferenceMs)
+                .putNullableMetric("audioAvailabilityPercent", summary.audioAvailabilityPercent)
+                .put("serviceStartCount", summary.serviceStartCount)
+                .put("additionalRestartCount", summary.additionalRestartCount)
+                .put("freeStorageBytes", summary.freeStorageBytes)
+                .put("minimumFreeStorageBytes", summary.minimumFreeStorageBytes)
+                .put("freeStorageDeltaBytes", summary.freeStorageDeltaBytes)
+                .put("clipStorageBytes", summary.clipStorageBytes)
+                .put("clipStorageDeltaBytes", summary.clipStorageDeltaBytes)
+                .put("currentIssues", JSONArray(summary.currentIssues))
+                .put("thermalStatus", summary.thermalStatus)
+                .put("thermalNote", "当前设备 Thermal HAL 不可用，健康判断不依赖温度数据")
+                .toString()
+        )
+    }
+
+    private fun JSONObject.putNullableMetric(key: String, value: Float): JSONObject =
+        put(key, if (value < 0f) JSONObject.NULL else value.toDouble())
 
     /** 可解释事件时间线，以及端侧短片的逐条删除和一键清理入口。 */
     private fun apiEvents(p: Map<String, String>): Response {

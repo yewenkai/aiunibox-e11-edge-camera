@@ -197,6 +197,20 @@
   .calibration-progress i { display: block; width: 0; height: 100%; background: #60a5fa; transition: width .25s; }
   .calibration-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
 
+  /* 24 小时健康诊断 */
+  .health-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+  .health-chip {
+    flex: none; padding: 4px 8px; border-radius: 999px; color: #bbf7d0;
+    background: rgba(34,197,94,.11); border: 1px solid rgba(74,222,128,.2); font-size: 10px;
+  }
+  .health-chip.warn { color: #fde68a; background: rgba(245,158,11,.11); border-color: rgba(251,191,36,.22); }
+  .health-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin-top: 10px; }
+  .health-card { padding: 9px; border-radius: 8px; background: #111822; border: 1px solid #293444; }
+  .health-card span { display: block; color: #718096; font-size: 10px; }
+  .health-card strong { display: block; margin-top: 5px; color: #e2e8f0; font-size: 12px; line-height: 1.4; }
+  .health-card small { display: block; margin-top: 4px; color: #64748b; font-size: 9px; line-height: 1.45; }
+  .health-note { margin-top: 8px; color: #64748b; font-size: 9px; line-height: 1.5; }
+
   /* 云台 */
   .section {
     margin-top: 12px; background: #1a1f29; border-radius: 12px; padding: 16px;
@@ -293,6 +307,7 @@
     .event-storage { text-align: right; }
     .event-list { max-height: 52vh; }
     .calibration-steps { grid-template-columns: 1fr; }
+    .health-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   }
 </style>
 </head>
@@ -362,6 +377,23 @@
     <div class="event-list" id="eventList">
       <div class="event-empty">暂无守护事件</div>
     </div>
+  </div>
+
+  <div class="section" id="healthCenter">
+    <div class="health-head">
+      <div>
+        <div class="section-title" style="margin-bottom:2px">24 小时健康诊断</div>
+        <div class="event-subtitle" id="healthCoverage">正在建立本机健康基线…</div>
+      </div>
+      <span class="health-chip" id="healthChip">采集中</span>
+    </div>
+    <div class="health-grid">
+      <div class="health-card"><span>摄像头与编码</span><strong id="healthCamera">采集中</strong><small id="healthCameraNote">等待首个分钟样本</small></div>
+      <div class="health-card"><span>NPU 分析</span><strong id="healthNpu">采集中</strong><small id="healthNpuNote">守护关闭时不计入故障率</small></div>
+      <div class="health-card"><span>音频分析</span><strong id="healthAudio">采集中</strong><small id="healthAudioNote">守护关闭时不计入故障率</small></div>
+      <div class="health-card"><span>运行与存储</span><strong id="healthRuntime">采集中</strong><small id="healthRuntimeNote">等待存储样本</small></div>
+    </div>
+    <div class="health-note" id="healthThermalNote">Thermal HAL 在当前设备不可用，诊断以画面、帧率、NPU、音频和存储实际更新为准。</div>
   </div>
 
   <div class="section" id="authSection" style="display:none">
@@ -620,6 +652,62 @@ function formatBytes(value) {
   const n = Number(value || 0);
   if (n < 1024 * 1024) return `${Math.max(0, n / 1024).toFixed(0)} KB`;
   return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function formatCapacity(value) {
+  const n = Math.max(0, Number(value || 0));
+  if (n >= 1024 ** 3) return `${(n / 1024 ** 3).toFixed(1)} GB`;
+  return formatBytes(n);
+}
+
+function formatSignedCapacity(value) {
+  const n = Number(value || 0);
+  if (Math.abs(n) < 1024) return '无明显变化';
+  return `${n > 0 ? '+' : '−'}${formatCapacity(Math.abs(n))}`;
+}
+
+function hasMetric(value) { return value !== null && value !== undefined && Number.isFinite(Number(value)); }
+
+async function loadHealth() {
+  const j = await api('/api/health');
+  if (!j?.ok) return;
+  const issues = j.currentIssues || [];
+  const chip = $('healthChip');
+  chip.classList.toggle('warn', issues.length > 0);
+  chip.textContent = Number(j.sampleCount || 0) <= 0
+    ? '采集中' : (issues.length ? `需检查 ${issues.length} 项` : '当前正常');
+  $('healthCoverage').textContent = Number(j.sampleCount || 0) > 0
+    ? `滚动 24 小时 · ${j.sampleCount} 个分钟样本 · 已覆盖约 ${j.coverageMinutes} 分钟`
+    : '等待首个健康样本…';
+
+  $('healthCamera').textContent = hasMetric(j.cameraAvailabilityPercent)
+    ? `画面 ${Number(j.cameraAvailabilityPercent).toFixed(1)}% · ${hasMetric(j.averageEncodedFps) ? Number(j.averageEncodedFps).toFixed(1) : '—'} fps`
+    : '尚无应运行样本';
+  $('healthCameraNote').textContent = hasMetric(j.streamAvailabilityPercent)
+    ? `编码可用 ${Number(j.streamAvailabilityPercent).toFixed(1)}% · 卡帧 ${j.cameraFreezeEpisodes || 0} 次`
+    : '隐私模式或等待采集时不计为故障';
+
+  $('healthNpu').textContent = hasMetric(j.npuAvailabilityPercent)
+    ? `更新 ${Number(j.npuAvailabilityPercent).toFixed(1)}% · ${hasMetric(j.averageNpuInferenceMs) ? Math.round(Number(j.averageNpuInferenceMs)) : '—'} ms`
+    : '守护未运行';
+  $('healthNpuNote').textContent = hasMetric(j.npuAvailabilityPercent)
+    ? `单次最高 ${j.maximumNpuInferenceMs || 0} ms`
+    : '守护关闭时不计入故障率';
+
+  $('healthAudio').textContent = hasMetric(j.audioAvailabilityPercent)
+    ? `音频更新 ${Number(j.audioAvailabilityPercent).toFixed(1)}%`
+    : '守护未运行';
+  $('healthAudioNote').textContent = hasMetric(j.audioAvailabilityPercent)
+    ? '按最近音频分析时间判断，不保存录音'
+    : '守护关闭时不计入故障率';
+
+  $('healthRuntime').textContent = `可用 ${formatCapacity(j.freeStorageBytes)}`;
+  $('healthRuntimeNote').textContent =
+    `24 小时启动 ${j.serviceStartCount || 0} 次 · 额外重启 ${j.additionalRestartCount || 0} · ` +
+    `空间 ${formatSignedCapacity(j.freeStorageDeltaBytes)} · 短片 ${formatSignedCapacity(j.clipStorageDeltaBytes)}`;
+  $('healthThermalNote').textContent = issues.length
+    ? `当前：${issues.join('；')}。${j.thermalNote || ''}`
+    : (j.thermalNote || 'Thermal HAL 不可用，不依赖温度数据。');
 }
 
 function appendText(parent, className, text, tag = 'div') {
@@ -1317,6 +1405,8 @@ refreshStatus();
 setInterval(refreshStatus, 1000);
 loadGuardianEvents();
 setInterval(loadGuardianEvents, 3000);
+loadHealth();
+setInterval(loadHealth, 10_000);
 </script>
 </body>
 </html>

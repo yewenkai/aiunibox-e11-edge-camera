@@ -42,6 +42,7 @@ class MonitorService : Service() {
     private var barkNotifier: BarkNotifier? = null
     private var guardianEventStore: GuardianEventStore? = null
     private var eventClipRecorder: EventClipRecorder? = null
+    private var healthDiagnostics: HealthDiagnostics? = null
     private var startedAtMs: Long = 0
     private val healthScheduler = Executors.newSingleThreadScheduledExecutor()
     @Volatile private var lastSuppressedAlertAt: Long = 0
@@ -75,6 +76,7 @@ class MonitorService : Service() {
             val bark = BarkNotifier(state)
             val eventStore = GuardianEventStore(this)
             val clipRecorder = EventClipRecorder(eventStore)
+            val diagnostics = HealthDiagnostics(this)
             val motion = MotionDetector(s, state, m) {
                 notifyGuardianEvent(
                     kind = "motion",
@@ -109,7 +111,9 @@ class MonitorService : Service() {
             barkNotifier = bark
             guardianEventStore = eventStore
             eventClipRecorder = clipRecorder
+            healthDiagnostics = diagnostics
             startedAtMs = System.currentTimeMillis()
+            diagnostics.recordServiceStart(startedAtMs)
 
             if (!state.privacyMode) {
                 s.start()
@@ -148,6 +152,9 @@ class MonitorService : Service() {
                     current.restartCapture()
                 }
             }, 15, 10, TimeUnit.SECONDS)
+            healthScheduler.scheduleAtFixedRate({
+                recordHealthSample()
+            }, 5, 60, TimeUnit.SECONDS)
         } catch (e: Exception) {
             Log.e(TAG, "服务启动失败", e)
             cleanupResources()
@@ -186,6 +193,7 @@ class MonitorService : Service() {
         npuDetector = null
         eventClipRecorder = null
         guardianEventStore = null
+        healthDiagnostics = null
         viewerWatcher = null
         server = null
         streamer = null
@@ -448,6 +456,39 @@ class MonitorService : Service() {
     fun guardianClipStorageInfo(): GuardianClipStorageInfo =
         guardianEventStore?.storageInfo()
             ?: GuardianClipStorageInfo(0, 0L, GuardianEventStore.MAX_CLIPS, GuardianEventStore.MAX_CLIP_BYTES)
+
+    fun healthSummary(): DeviceHealthSummary? = healthDiagnostics?.summary()
+
+    private fun recordHealthSample() {
+        try {
+            val diagnostics = healthDiagnostics ?: return
+            val state = deviceState ?: return
+            val currentStreamer = streamer ?: return
+            val encoder = currentStreamer.h264Encoder
+            val cameraExpected = !state.privacyMode
+            val guardianExpected = state.babyMonitorEnabled && cameraExpected
+            diagnostics.sample(
+                DeviceHealthInput(
+                    cameraExpected = cameraExpected,
+                    cameraOn = currentStreamer.isRunning,
+                    frameCapturedAt = currentStreamer.latestJpegCapturedAtMs,
+                    streamReady = encoder?.isOutputHealthy() == true,
+                    encodedFrameCount = encoder?.outputFrameCount ?: 0L,
+                    npuExpected = guardianExpected,
+                    npuLoaded = npuDetector?.modelLoaded == true,
+                    npuAnalyzedAt = npuDetector?.lastAnalyzedAt ?: 0L,
+                    npuInferenceMs = npuDetector?.lastInferenceMs ?: 0L,
+                    audioExpected = guardianExpected,
+                    audioLoaded = cryDetector?.modelLoaded == true,
+                    audioAnalyzedAt = cryDetector?.lastAnalyzedAt ?: 0L,
+                    freeStorageBytes = filesDir.usableSpace,
+                    clipStorageBytes = guardianEventStore?.storageInfo()?.totalBytes ?: 0L
+                )
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "记录设备健康样本失败", e)
+        }
+    }
 
     /** 手动验证端侧短片链路，不发送 Bark。 */
     fun createGuardianTestClip(): Boolean {
