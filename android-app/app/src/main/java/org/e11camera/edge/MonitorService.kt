@@ -90,7 +90,7 @@ class MonitorService : Service() {
                     cryScore = score
                 )
             }
-            val npu = NpuDetector(this, s) { previous, current, observation ->
+            val npu = NpuDetector(this, s, state) { previous, current, observation ->
                 recordSupervisionTransition(previous, current, observation)
             }
 
@@ -334,6 +334,8 @@ class MonitorService : Service() {
 
     fun cryThreshold(): Float = cryDetector?.currentThreshold ?: 0f
 
+    fun crySilenceRmsGate(): Float = cryDetector?.silenceRmsGate ?: 0f
+
     fun cryTopClassIndex(): Int = cryDetector?.topClassIndex ?: -1
 
     fun cryTopClassScore(): Float = cryDetector?.topClassScore ?: 0f
@@ -365,6 +367,38 @@ class MonitorService : Service() {
     fun npuAlertRefreshStatus(): String = npuDetector?.lastAlertRefreshStatus ?: "unavailable"
 
     fun npuAlertRefreshAt(): Long = npuDetector?.lastAlertRefreshAt ?: 0L
+
+    fun startAmbientCalibration(): Boolean =
+        deviceState?.babyMonitorEnabled == true && deviceState?.privacyMode != true &&
+            cryDetector?.startAmbientCalibration() == true
+
+    fun startAdultCalibration(): Boolean =
+        deviceState?.babyMonitorEnabled == true && deviceState?.privacyMode != true &&
+            npuDetector?.startAdultCalibration() == true
+
+    fun cancelSceneCalibration() {
+        cryDetector?.cancelCalibration()
+        npuDetector?.cancelAdultCalibration()
+    }
+
+    fun resetSceneCalibration() {
+        deviceState?.resetSceneCalibration()
+        cryDetector?.resetCalibration()
+        npuDetector?.resetAdultCalibration()
+    }
+
+    fun cryCalibrationStatus(): CryCalibrationStatus =
+        cryDetector?.calibrationStatus() ?: CryCalibrationStatus(
+            state = "unavailable", startedAt = 0L, calibratedAt = 0L,
+            sampleCount = 0, targetSamples = 15, noiseRms = 0f, noiseScore = 0f
+        )
+
+    fun adultCalibrationStatus(): AdultCalibrationStatus =
+        npuDetector?.adultCalibrationStatus() ?: AdultCalibrationStatus(
+            state = "unavailable", startedAt = 0L, calibratedAt = 0L,
+            sampleCount = 0, targetSamples = 8, currentPersonCount = 0,
+            medianHeight = 0f, medianArea = 0f, minHeight = 0.48f, minArea = 0.14f
+        )
 
     fun supervisionState(): String =
         (npuDetector?.supervisionState ?: SupervisionStateMachine.State.UNKNOWN).name.lowercase()

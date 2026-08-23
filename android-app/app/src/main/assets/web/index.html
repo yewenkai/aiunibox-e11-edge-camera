@@ -178,6 +178,21 @@
   .clip-state { color: #718096; font-size: 10px; }
   .event-video { width: 100%; margin-top: 9px; border-radius: 8px; background: #000; }
 
+  /* 场景校准向导 */
+  .calibration-box {
+    margin: 10px 0; padding: 11px; border: 1px solid #334155; border-radius: 10px;
+    background: rgba(15,23,42,.52);
+  }
+  .calibration-title { color: #e2e8f0; font-size: 12px; font-weight: 650; }
+  .calibration-note { margin-top: 3px; color: #718096; font-size: 10px; line-height: 1.5; }
+  .calibration-steps { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 9px; }
+  .calibration-step { padding: 9px; border-radius: 8px; background: #111822; border: 1px solid #293444; }
+  .calibration-step strong { display: block; color: #cbd5e1; font-size: 11px; }
+  .calibration-status { min-height: 30px; margin: 5px 0 7px; color: #94a3b8; font-size: 10px; line-height: 1.5; }
+  .calibration-progress { height: 4px; margin-bottom: 7px; overflow: hidden; border-radius: 999px; background: #263244; }
+  .calibration-progress i { display: block; width: 0; height: 100%; background: #60a5fa; transition: width .25s; }
+  .calibration-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+
   /* 云台 */
   .section {
     margin-top: 12px; background: #1a1f29; border-radius: 12px; padding: 16px;
@@ -273,6 +288,7 @@
     .event-head-actions { flex-direction: column; align-items: flex-end; }
     .event-storage { text-align: right; }
     .event-list { max-height: 52vh; }
+    .calibration-steps { grid-template-columns: 1fr; }
   }
 </style>
 </head>
@@ -472,6 +488,29 @@
           <button class="toggle-btn" id="roiSave" style="background:#166534;color:#fff">保存</button>
           <button class="toggle-btn" id="roiCancel">取消</button>
         </div>
+      </div>
+    </div>
+
+    <div class="calibration-box" id="calibrationBox">
+      <div class="calibration-title">场景校准向导</div>
+      <div class="calibration-note">建议按 1→2 完成；只保存底噪和体型比例统计，不保存录音、截图或身份。</div>
+      <div class="calibration-steps">
+        <div class="calibration-step">
+          <strong>1. 房间底噪</strong>
+          <div class="calibration-status" id="ambientCalibrationStatus">等待校准</div>
+          <div class="calibration-progress"><i id="ambientCalibrationProgress"></i></div>
+          <button class="toggle-btn" id="startAmbientCalibration" type="button">开始约 15 秒校准</button>
+        </div>
+        <div class="calibration-step">
+          <strong>2. 成人常见站位</strong>
+          <div class="calibration-status" id="adultCalibrationStatus">等待校准</div>
+          <div class="calibration-progress"><i id="adultCalibrationProgress"></i></div>
+          <button class="toggle-btn" id="startAdultCalibration" type="button">开始约 16 秒校准</button>
+        </div>
+      </div>
+      <div class="calibration-actions">
+        <button class="toggle-btn" id="cancelCalibration" type="button">取消当前校准</button>
+        <button class="toggle-btn" id="resetCalibration" type="button">恢复默认参考</button>
       </div>
     </div>
 
@@ -871,6 +910,62 @@ $('guardianQuickToggle').addEventListener('click', async () => {
   }
 });
 
+// ===== 场景校准：只落盘统计值，不保存音视频 =====
+function renderCalibration(calibration) {
+  const ambient = calibration?.ambient || {};
+  const adult = calibration?.adult || {};
+  const ambientCount = Number(ambient.sampleCount || 0);
+  const ambientTarget = Math.max(1, Number(ambient.targetSamples || 15));
+  const adultCount = Number(adult.sampleCount || 0);
+  const adultTarget = Math.max(1, Number(adult.targetSamples || 8));
+  $('ambientCalibrationProgress').style.width = ambient.state === 'complete'
+    ? '100%' : `${Math.min(100, ambientCount / ambientTarget * 100)}%`;
+  $('adultCalibrationProgress').style.width = adult.state === 'complete'
+    ? '100%' : `${Math.min(100, adultCount / adultTarget * 100)}%`;
+
+  $('ambientCalibrationStatus').textContent = ambient.state === 'running'
+    ? `请保持房间日常安静状态… ${ambientCount}/${ambientTarget}`
+    : ambient.state === 'complete'
+      ? `已校准 · 当前有效哭声阈值 ${Math.round(Number(ambient.effectiveThreshold || 0) * 100)}%`
+      : ambient.state === 'failed' ? '校准失败，可重新开始' : '尚未校准，使用默认底噪参考';
+
+  $('adultCalibrationStatus').textContent = adult.state === 'running'
+    ? (Number(adult.currentPersonCount || 0) === 1
+      ? `请保持常用站位… ${adultCount}/${adultTarget}`
+      : `请让画面中只保留 1 名成人… ${adultCount}/${adultTarget}`)
+    : adult.state === 'complete'
+      ? '已校准 · 成人体型只作为陪护证据'
+      : adult.state === 'failed' ? '校准失败，可重新开始' : '尚未校准，使用默认体型参考';
+
+  $('startAmbientCalibration').disabled = ambient.state === 'running';
+  $('startAdultCalibration').disabled = adult.state === 'running';
+}
+
+$('startAmbientCalibration').addEventListener('click', async () => {
+  if (!window.confirm('开始后请保持房间平时的安静状态约 15 秒。校准期间不触发哭声通知。')) return;
+  const j = await api('/api/calibration?action=ambient');
+  if (!j?.ok) toast('请先开启宝宝守护，并确认哭声模型已加载');
+  else { toast('底噪校准已开始'); renderCalibration(j); }
+});
+
+$('startAdultCalibration').addEventListener('click', async () => {
+  if (!window.confirm('请让画面中只有 1 名成人，站在平时最常出现的陪护位置约 16 秒。')) return;
+  const j = await api('/api/calibration?action=adult');
+  if (!j?.ok) toast('请先开启宝宝守护，并确认 NPU 已加载');
+  else { toast('成人站位校准已开始'); renderCalibration(j); }
+});
+
+$('cancelCalibration').addEventListener('click', async () => {
+  const j = await api('/api/calibration?action=cancel');
+  if (j?.ok) { toast('当前校准已取消'); renderCalibration(j); }
+});
+
+$('resetCalibration').addEventListener('click', async () => {
+  if (!window.confirm('恢复默认底噪和成人体型参考？')) return;
+  const j = await api('/api/calibration?action=reset');
+  if (j?.ok) { toast('已恢复默认参考'); renderCalibration(j); }
+});
+
 // ===== Bark 多设备通知管理 =====
 async function loadBarkTargets() {
   const j = await api('/api/notify');
@@ -1047,6 +1142,7 @@ async function refreshStatus() {
   try {
     const j = await api('/api/status');
     if (!j) return;
+    renderCalibration(j.sceneCalibration || {});
     const now = Date.now();
     const elapsed = Math.max((now - lastStatusAt) / 1000, 0.1);
     const fps = lastFrameCount > 0 ? Math.max(0, (j.encodedFrames - lastFrameCount) / elapsed) : 0;

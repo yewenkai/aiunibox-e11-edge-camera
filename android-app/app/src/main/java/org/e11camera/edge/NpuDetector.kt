@@ -27,6 +27,19 @@ data class AlertVisionSnapshot(
     val notificationsSuppressed: Boolean
 )
 
+data class AdultCalibrationStatus(
+    val state: String,
+    val startedAt: Long,
+    val calibratedAt: Long,
+    val sampleCount: Int,
+    val targetSamples: Int,
+    val currentPersonCount: Int,
+    val medianHeight: Float,
+    val medianArea: Float,
+    val minHeight: Float,
+    val minArea: Float
+)
+
 /**
  * 宝宝守护：RK3566 NPU 端侧视觉补强（NPU_ROADMAP 阶段 1：有人/无人）。
  *
@@ -40,6 +53,7 @@ data class AlertVisionSnapshot(
 class NpuDetector(
     private val context: android.content.Context,
     private val streamer: CameraStreamer,
+    private val deviceState: DeviceStateStore,
     private val onSupervisionChanged: (
         previous: SupervisionStateMachine.State,
         current: SupervisionStateMachine.State,
@@ -63,16 +77,21 @@ class NpuDetector(
         private const val ENTER_HITS = 2
         private const val LEAVE_DELAY_MS = 10_000L
 
-        // 固定看护机位下的成人体型启发式；只用于陪护上下文，不宣称年龄分类。
-        private const val ADULT_LIKE_MIN_HEIGHT = 0.48f
-        private const val ADULT_LIKE_MIN_AREA = 0.14f
+        private const val ADULT_CALIBRATION_SAMPLES = 8
     }
 
     private val running = AtomicBoolean(false)
     private val inferenceLock = Any()
     private val recentDetections = ArrayDeque<Boolean>(ENTER_WINDOW)
     private val supervision = SupervisionStateMachine()
+    private val calibrationLock = Any()
+    private val adultCalibrationBoxes = mutableListOf<Pair<Float, Float>>()
     private var scheduler: ScheduledExecutorService? = null
+
+    @Volatile private var adultCalibrationState =
+        if (deviceState.adultCalibratedAt > 0L) "complete" else "idle"
+    @Volatile private var adultCalibrationStartedAt = 0L
+    @Volatile private var adultCalibrationPersonCount = 0
 
     private var handle = 0L
     private var inputW = INPUT_SIZE
@@ -143,6 +162,7 @@ class NpuDetector(
     @Synchronized
     fun stop() {
         if (!running.getAndSet(false) && handle == 0L) return
+        cancelAdultCalibration()
         scheduler?.shutdownNow()
         scheduler = null
         synchronized(inferenceLock) {
@@ -150,6 +170,52 @@ class NpuDetector(
             resetPresence()
         }
         Log.i(TAG, "NPU 检测已停止")
+    }
+
+    fun startAdultCalibration(): Boolean {
+        if (!running.get() || !modelLoaded) return false
+        synchronized(calibrationLock) {
+            adultCalibrationBoxes.clear()
+            adultCalibrationStartedAt = System.currentTimeMillis()
+            adultCalibrationPersonCount = 0
+            adultCalibrationState = "running"
+        }
+        Log.i(TAG, "开始成人常见站位校准，仅保存体型比例统计")
+        return true
+    }
+
+    fun cancelAdultCalibration() {
+        synchronized(calibrationLock) {
+            adultCalibrationBoxes.clear()
+            adultCalibrationStartedAt = 0L
+            adultCalibrationPersonCount = 0
+            adultCalibrationState = if (deviceState.adultCalibratedAt > 0L) "complete" else "idle"
+        }
+    }
+
+    fun resetAdultCalibration() {
+        cancelAdultCalibration()
+        deviceState.adultLikeMinHeight = 0.48f
+        deviceState.adultLikeMinArea = 0.14f
+        deviceState.adultMedianHeight = 0f
+        deviceState.adultMedianArea = 0f
+        deviceState.adultCalibratedAt = 0L
+        adultCalibrationState = "idle"
+    }
+
+    fun adultCalibrationStatus(): AdultCalibrationStatus = synchronized(calibrationLock) {
+        AdultCalibrationStatus(
+            state = adultCalibrationState,
+            startedAt = adultCalibrationStartedAt,
+            calibratedAt = deviceState.adultCalibratedAt,
+            sampleCount = adultCalibrationBoxes.size.coerceAtMost(ADULT_CALIBRATION_SAMPLES),
+            targetSamples = ADULT_CALIBRATION_SAMPLES,
+            currentPersonCount = adultCalibrationPersonCount,
+            medianHeight = deviceState.adultMedianHeight,
+            medianArea = deviceState.adultMedianArea,
+            minHeight = deviceState.adultLikeMinHeight,
+            minArea = deviceState.adultLikeMinArea
+        )
     }
 
     private fun loadNativeAndModel(): Boolean {
@@ -389,8 +455,9 @@ class NpuDetector(
         personCount = immutableBoxes.size
         adultLikePersonCount = immutableBoxes.count {
             val area = it[2] * it[3]
-            it[3] >= ADULT_LIKE_MIN_HEIGHT && area >= ADULT_LIKE_MIN_AREA
+            it[3] >= deviceState.adultLikeMinHeight && area >= deviceState.adultLikeMinArea
         }
+        collectAdultCalibration(immutableBoxes)
 
         val observation = SupervisionStateMachine.Observation(
             totalPeople = personCount,
@@ -446,6 +513,48 @@ class NpuDetector(
             } catch (e: Exception) {
                 Log.w(TAG, "陪护状态回调异常", e)
             }
+        }
+    }
+
+    private fun collectAdultCalibration(boxes: List<FloatArray>) {
+        if (adultCalibrationState != "running") return
+        var completed: List<Pair<Float, Float>>? = null
+        synchronized(calibrationLock) {
+            if (adultCalibrationState != "running") return
+            adultCalibrationPersonCount = boxes.size
+            if (boxes.size != 1) return
+            val box = boxes.single()
+            adultCalibrationBoxes += box[3] to (box[2] * box[3])
+            if (adultCalibrationBoxes.size >= ADULT_CALIBRATION_SAMPLES) {
+                completed = adultCalibrationBoxes.toList()
+                adultCalibrationState = "saving"
+            }
+        }
+        val samples = completed ?: return
+        try {
+            val medianHeight = SceneCalibrationPolicy.median(samples.map { it.first })
+            val medianArea = SceneCalibrationPolicy.median(samples.map { it.second })
+            val thresholds = SceneCalibrationPolicy.adultThresholds(medianHeight, medianArea)
+            // 低于成人站位中位值留出坐姿和距离波动余量。
+            deviceState.adultMedianHeight = medianHeight
+            deviceState.adultMedianArea = medianArea
+            deviceState.adultLikeMinHeight = thresholds.minHeight
+            deviceState.adultLikeMinArea = thresholds.minArea
+            deviceState.adultCalibratedAt = System.currentTimeMillis()
+            synchronized(calibrationLock) {
+                adultCalibrationState = "complete"
+                adultCalibrationStartedAt = 0L
+            }
+            Log.i(
+                TAG,
+                "成人体型校准完成 median=${"%.2f".format(medianHeight)}/" +
+                    "${"%.2f".format(medianArea)} threshold=" +
+                    "${"%.2f".format(deviceState.adultLikeMinHeight)}/" +
+                    "${"%.2f".format(deviceState.adultLikeMinArea)}"
+            )
+        } catch (e: Exception) {
+            adultCalibrationState = "failed"
+            Log.w(TAG, "保存成人体型校准失败", e)
         }
     }
 

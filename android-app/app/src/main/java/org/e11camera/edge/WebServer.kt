@@ -22,6 +22,7 @@ import java.io.InputStream
  *  GET /api/ircut        ?on=true|false
  *  GET /api/scene        ?mode=0|1|2
  *  GET /api/baby         ?on=true|false [&sensitivity=0|1|2]（无参数=查询）
+ *  GET /api/calibration  ?action=ambient|adult|cancel|reset，场景校准不保存音视频
  *  GET /api/notify       ?add=KEY[&name=备注] ?remove=KEY ?toggle=KEY&on= ?test=KEY|all
  *  GET /api/events       解释时间线；?deleteClip=EVENT_ID 或 ?clearClips=true 清理端侧短片
  *  GET /event-clip       ?id=EVENT_ID，支持 HTTP Range
@@ -66,6 +67,7 @@ class WebServer(
                 uri.startsWith("/api/scene") -> apiScene(params)
                 uri.startsWith("/api/privacy") -> apiPrivacy(params)
                 uri.startsWith("/api/baby") -> apiBaby(params)
+                uri.startsWith("/api/calibration") -> apiCalibration(params)
                 uri.startsWith("/api/notify") -> apiNotify(params)
                 uri.startsWith("/api/events") -> apiEvents(params)
                 uri.startsWith("/api/status") -> apiStatus()
@@ -401,6 +403,67 @@ class WebServer(
         )
     }
 
+    private fun apiCalibration(p: Map<String, String>): Response {
+        val service = MonitorService.instance
+            ?: return json("""{"ok":false,"error":"service_unavailable"}""")
+        val action = p["action"]?.lowercase()
+        val accepted = when (action) {
+            null, "status" -> true
+            "ambient" -> service.startAmbientCalibration()
+            "adult" -> service.startAdultCalibration()
+            "cancel" -> {
+                service.cancelSceneCalibration()
+                true
+            }
+            "reset" -> {
+                service.resetSceneCalibration()
+                true
+            }
+            else -> return json("""{"ok":false,"error":"invalid_action"}""")
+        }
+        return json(
+            calibrationJson(service)
+                .put("ok", accepted)
+                .apply {
+                    if (!accepted) put("error", "guardian_or_detector_unavailable")
+                }
+                .toString()
+        )
+    }
+
+    private fun calibrationJson(service: MonitorService): JSONObject {
+        val cry = service.cryCalibrationStatus()
+        val adult = service.adultCalibrationStatus()
+        return JSONObject()
+            .put(
+                "ambient",
+                JSONObject()
+                    .put("state", cry.state)
+                    .put("startedAt", cry.startedAt)
+                    .put("calibratedAt", cry.calibratedAt)
+                    .put("sampleCount", cry.sampleCount)
+                    .put("targetSamples", cry.targetSamples)
+                    .put("noiseRms", cry.noiseRms)
+                    .put("noiseScore", cry.noiseScore)
+                    .put("silenceGate", service.crySilenceRmsGate())
+                    .put("effectiveThreshold", service.cryThreshold())
+            )
+            .put(
+                "adult",
+                JSONObject()
+                    .put("state", adult.state)
+                    .put("startedAt", adult.startedAt)
+                    .put("calibratedAt", adult.calibratedAt)
+                    .put("sampleCount", adult.sampleCount)
+                    .put("targetSamples", adult.targetSamples)
+                    .put("currentPersonCount", adult.currentPersonCount)
+                    .put("medianHeight", adult.medianHeight)
+                    .put("medianArea", adult.medianArea)
+                    .put("minHeight", adult.minHeight)
+                    .put("minArea", adult.minArea)
+            )
+    }
+
     private fun apiInfo(): Response {
         val id = android.provider.Settings.Secure.getString(
             context.contentResolver,
@@ -463,6 +526,7 @@ class WebServer(
             .put("cryAudioRms", service?.cryAudioRms() ?: 0f)
             .put("cryScore", service?.cryScore() ?: 0f)
             .put("cryThreshold", service?.cryThreshold() ?: 0f)
+            .put("crySilenceRmsGate", service?.crySilenceRmsGate() ?: 0f)
             .put("cryTopClassIndex", service?.cryTopClassIndex() ?: -1)
             .put("cryTopClassScore", service?.cryTopClassScore() ?: 0f)
             .put("cryAnalyzedAt", service?.cryAnalyzedAt() ?: 0L)
@@ -490,6 +554,7 @@ class WebServer(
             .put("guardianEventCount", service?.guardianEvents(200)?.size ?: 0)
             .put("guardianClipCount", clipStorage?.clipCount ?: 0)
             .put("guardianClipBytes", clipStorage?.totalBytes ?: 0L)
+            .apply { service?.let { put("sceneCalibration", calibrationJson(it)) } }
             .toString()
         )
     }

@@ -16,6 +16,16 @@ import java.nio.MappedByteBuffer
 import java.nio.channels.FileChannel
 import kotlin.math.sqrt
 
+data class CryCalibrationStatus(
+    val state: String,
+    val startedAt: Long,
+    val calibratedAt: Long,
+    val sampleCount: Int,
+    val targetSamples: Int,
+    val noiseRms: Float,
+    val noiseScore: Float
+)
+
 /**
  * 宝宝守护：哭声检测（本地 YAMNet 分类，不联网）。
  *
@@ -55,9 +65,16 @@ class CryDetector(
 
         private const val MODEL_FILE = "yamnet.tflite"
         private const val HISTORY_LIMIT = 20
+        private const val CALIBRATION_SAMPLES = 15
     }
 
     private val events = ArrayDeque<Long>()
+    private val calibrationLock = Any()
+    private val calibrationRms = mutableListOf<Float>()
+    private val calibrationScores = mutableListOf<Float>()
+
+    @Volatile private var calibrationState = if (state.cryCalibratedAt > 0L) "complete" else "idle"
+    @Volatile private var calibrationStartedAt = 0L
 
     @Volatile
     private var running = false
@@ -89,7 +106,18 @@ class CryDetector(
         private set
 
     val currentThreshold: Float
-        get() = CRY_THRESHOLD_BY_SENSITIVITY[state.babySensitivity.coerceIn(0, 2)]
+        get() {
+            val base = CRY_THRESHOLD_BY_SENSITIVITY[state.babySensitivity.coerceIn(0, 2)]
+            val calibrated = if (state.cryCalibratedAt > 0L) state.cryNoiseScore + 0.08f else 0f
+            return maxOf(base, calibrated).coerceAtMost(0.85f)
+        }
+
+    val silenceRmsGate: Float
+        get() = if (state.cryCalibratedAt > 0L) {
+            maxOf(SILENCE_RMS_GATE, state.cryNoiseRms * 1.8f).coerceAtMost(0.06f)
+        } else {
+            SILENCE_RMS_GATE
+        }
 
     val isActive: Boolean
         get() = inCryEpisode
@@ -112,6 +140,7 @@ class CryDetector(
 
     fun stop() {
         running = false
+        cancelCalibration()
         thread?.interrupt()
         thread = null
         inCryEpisode = false
@@ -121,6 +150,85 @@ class CryDetector(
     fun lastEventAt(): Long? = synchronized(events) { events.lastOrNull() }
 
     fun recentEvents(): List<Long> = synchronized(events) { events.toList() }
+
+    fun startAmbientCalibration(): Boolean {
+        if (!running) return false
+        synchronized(calibrationLock) {
+            calibrationRms.clear()
+            calibrationScores.clear()
+            calibrationStartedAt = System.currentTimeMillis()
+            calibrationState = "running"
+        }
+        inCryEpisode = false
+        lastCryAt = 0L
+        Log.i(TAG, "开始环境底噪校准，仅保存统计量")
+        return true
+    }
+
+    fun cancelCalibration() {
+        synchronized(calibrationLock) {
+            calibrationRms.clear()
+            calibrationScores.clear()
+            calibrationStartedAt = 0L
+            calibrationState = if (state.cryCalibratedAt > 0L) "complete" else "idle"
+        }
+    }
+
+    fun resetCalibration() {
+        cancelCalibration()
+        state.cryNoiseRms = 0f
+        state.cryNoiseScore = 0f
+        state.cryCalibratedAt = 0L
+        calibrationState = "idle"
+    }
+
+    fun calibrationStatus(): CryCalibrationStatus = synchronized(calibrationLock) {
+        CryCalibrationStatus(
+            state = calibrationState,
+            startedAt = calibrationStartedAt,
+            calibratedAt = state.cryCalibratedAt,
+            sampleCount = calibrationRms.size.coerceAtMost(CALIBRATION_SAMPLES),
+            targetSamples = CALIBRATION_SAMPLES,
+            noiseRms = state.cryNoiseRms,
+            noiseScore = state.cryNoiseScore
+        )
+    }
+
+    private fun isCalibrating(): Boolean = calibrationState == "running"
+
+    private fun collectCalibration(rms: Float, cryScore: Float) {
+        var completedRms: List<Float>? = null
+        var completedScores: List<Float>? = null
+        synchronized(calibrationLock) {
+            if (calibrationState != "running") return
+            calibrationRms += rms
+            calibrationScores += cryScore
+            if (calibrationRms.size >= CALIBRATION_SAMPLES) {
+                completedRms = calibrationRms.toList()
+                completedScores = calibrationScores.toList()
+                calibrationState = "saving"
+            }
+        }
+        val rmsSamples = completedRms ?: return
+        val scoreSamples = completedScores ?: return
+        try {
+            state.cryNoiseRms = SceneCalibrationPolicy.percentile(rmsSamples, 0.90f)
+            state.cryNoiseScore = SceneCalibrationPolicy.percentile(scoreSamples, 0.95f)
+            state.cryCalibratedAt = System.currentTimeMillis()
+            synchronized(calibrationLock) {
+                calibrationState = "complete"
+                calibrationStartedAt = 0L
+            }
+            Log.i(
+                TAG,
+                "底噪校准完成 rms=${"%.4f".format(state.cryNoiseRms)} " +
+                    "cry=${"%.3f".format(state.cryNoiseScore)} threshold=${"%.2f".format(currentThreshold)}"
+            )
+        } catch (e: Exception) {
+            calibrationState = "failed"
+            Log.w(TAG, "保存底噪校准失败", e)
+        }
+    }
 
     private fun loadModel(): MappedByteBuffer? {
         val f = File(context.filesDir, MODEL_FILE)
@@ -175,7 +283,8 @@ class CryDetector(
                 val rms = sqrt(sum / WINDOW_SAMPLES).toFloat()
                 lastAudioRms = rms
                 lastAnalyzedAt = System.currentTimeMillis()
-                if (rms < SILENCE_RMS_GATE) {
+                val calibrating = isCalibrating()
+                if (rms < silenceRmsGate && !calibrating) {
                     lastCryScore = 0f
                     topClassIndex = -1
                     topClassScore = 0f
@@ -203,6 +312,11 @@ class CryDetector(
                         "threshold=${"%.2f".format(threshold)} top=$topIdx(${"%.3f".format(scores[topIdx])})"
                 )
 
+                if (calibrating) {
+                    collectCalibration(rms, cry)
+                    handleWindow(isCry = false, cry = 0f)
+                    continue
+                }
                 handleWindow(cry >= threshold, cry)
             }
         } catch (e: Exception) {

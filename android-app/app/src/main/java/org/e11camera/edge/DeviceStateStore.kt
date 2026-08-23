@@ -25,6 +25,14 @@ class DeviceStateStore(context: Context) {
         private const val LEGACY_KEY_BABY_ROI = "baby_roi"
         private const val KEY_BARK_KEY = "bark_key"
         private const val KEY_BARK_TARGETS = "bark_targets"
+        private const val KEY_CRY_NOISE_RMS = "cry_noise_rms"
+        private const val KEY_CRY_NOISE_SCORE = "cry_noise_score"
+        private const val KEY_CRY_CALIBRATED_AT = "cry_calibrated_at"
+        private const val KEY_ADULT_MIN_HEIGHT = "adult_min_height"
+        private const val KEY_ADULT_MIN_AREA = "adult_min_area"
+        private const val KEY_ADULT_MEDIAN_HEIGHT = "adult_median_height"
+        private const val KEY_ADULT_MEDIAN_AREA = "adult_median_area"
+        private const val KEY_ADULT_CALIBRATED_AT = "adult_calibrated_at"
     }
 
     private val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -169,4 +177,50 @@ class DeviceStateStore(context: Context) {
         set(value) {
             prefs.edit().putString(KEY_BARK_TARGETS, value).commit()
         }
+
+    /** 场景校准只保存统计量，不保存录音或画面。 */
+    var cryNoiseRms: Float
+        get() = prefs.getFloat(KEY_CRY_NOISE_RMS, 0f)
+        set(value) { prefs.edit().putFloat(KEY_CRY_NOISE_RMS, value.coerceIn(0f, 1f)).commit() }
+
+    var cryNoiseScore: Float
+        get() = prefs.getFloat(KEY_CRY_NOISE_SCORE, 0f)
+        set(value) { prefs.edit().putFloat(KEY_CRY_NOISE_SCORE, value.coerceIn(0f, 1f)).commit() }
+
+    var cryCalibratedAt: Long
+        get() = prefs.getLong(KEY_CRY_CALIBRATED_AT, 0L)
+        set(value) { prefs.edit().putLong(KEY_CRY_CALIBRATED_AT, value.coerceAtLeast(0L)).commit() }
+
+    var adultLikeMinHeight: Float
+        get() = prefs.getFloat(KEY_ADULT_MIN_HEIGHT, 0.48f)
+        set(value) { prefs.edit().putFloat(KEY_ADULT_MIN_HEIGHT, value.coerceIn(0.20f, 0.80f)).commit() }
+
+    var adultLikeMinArea: Float
+        get() = prefs.getFloat(KEY_ADULT_MIN_AREA, 0.14f)
+        set(value) { prefs.edit().putFloat(KEY_ADULT_MIN_AREA, value.coerceIn(0.03f, 0.40f)).commit() }
+
+    var adultMedianHeight: Float
+        get() = prefs.getFloat(KEY_ADULT_MEDIAN_HEIGHT, 0f)
+        set(value) { prefs.edit().putFloat(KEY_ADULT_MEDIAN_HEIGHT, value.coerceIn(0f, 1f)).commit() }
+
+    var adultMedianArea: Float
+        get() = prefs.getFloat(KEY_ADULT_MEDIAN_AREA, 0f)
+        set(value) { prefs.edit().putFloat(KEY_ADULT_MEDIAN_AREA, value.coerceIn(0f, 1f)).commit() }
+
+    var adultCalibratedAt: Long
+        get() = prefs.getLong(KEY_ADULT_CALIBRATED_AT, 0L)
+        set(value) { prefs.edit().putLong(KEY_ADULT_CALIBRATED_AT, value.coerceAtLeast(0L)).commit() }
+
+    fun resetSceneCalibration() {
+        prefs.edit()
+            .remove(KEY_CRY_NOISE_RMS)
+            .remove(KEY_CRY_NOISE_SCORE)
+            .remove(KEY_CRY_CALIBRATED_AT)
+            .remove(KEY_ADULT_MIN_HEIGHT)
+            .remove(KEY_ADULT_MIN_AREA)
+            .remove(KEY_ADULT_MEDIAN_HEIGHT)
+            .remove(KEY_ADULT_MEDIAN_AREA)
+            .remove(KEY_ADULT_CALIBRATED_AT)
+            .commit()
+    }
 }
