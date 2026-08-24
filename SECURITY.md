@@ -4,7 +4,7 @@
 
 ## 默认安全边界
 
-- HTTP API 支持 Bearer Token；RTSP/WebRTC 端口仍需单独配置身份认证。
+- HTTP API 支持 Bearer Token；同源 HLS `/media/cam/` 与 RTSP/WebRTC 仍需单独配置身份认证。
 - HTTP API 包含云台、灯光、IR-CUT 和隐私模式等会改变设备状态的操作。
 - 项目只应运行在可信局域网，或通过由用户管理的可信 VPN 访问。
 - 不要通过路由器端口转发、反向代理或公网 IP 直接暴露 8080、8554、8889。

@@ -12,7 +12,15 @@ encryption: "no"
 rtspAddress: :8554
 
 rtmp: no
-hls: no
+hls: yes
+hlsAddress: :8888
+hlsEncryption: no
+hlsAllowOrigin: '*'
+hlsAlwaysRemux: no
+# 普通 fMP4 HLS 更适合经过极空间一类多层 HTTP 代理；代价是比 WebRTC 多数秒延迟。
+hlsVariant: fmp4
+hlsSegmentCount: 4
+hlsSegmentDuration: 1s
 srt: no
 
 webrtc: yes

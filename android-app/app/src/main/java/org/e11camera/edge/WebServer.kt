@@ -7,7 +7,10 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayInputStream
 import java.io.FileInputStream
+import java.io.FilterInputStream
 import java.io.InputStream
+import java.net.HttpURLConnection
+import java.net.URL
 
 /**
  * 内嵌 HTTP 服务器（NanoHTTPD）。
@@ -15,6 +18,7 @@ import java.io.InputStream
  *
  * 路由：
  *  GET /                 控制网页
+ *  GET /media/cam/...    同源代理 MediaMTX HLS 播放页、清单与分片
  *  GET /stream           MJPEG 视频流
  *  GET /api/motor        ?dir=left|right|reset [&steps=&speed=]
  *  GET /api/led          ?name=ir&level=255
@@ -49,11 +53,18 @@ class WebServer(
     override fun serve(session: IHTTPSession): Response {
         val uri = session.uri
         val params = session.parms
-        Log.i(TAG, "请求: ${session.method} $uri")
+        if (uri.startsWith(HlsProxyPolicy.PUBLIC_CAMERA_PREFIX)) {
+            Log.d(TAG, "HLS 请求: ${session.method} $uri")
+        } else {
+            Log.i(TAG, "请求: ${session.method} $uri")
+        }
         return try {
             when {
                 uri == "/" || uri == "/index.html" -> serveIndex()
                 uri == "/api/info" -> apiInfo()
+                uri == HlsProxyPolicy.PUBLIC_CAMERA_PREFIX ||
+                    uri.startsWith("${HlsProxyPolicy.PUBLIC_CAMERA_PREFIX}/") ->
+                    serveHlsProxy(session)
                 !security.isAuthorized(session) -> unauthorized()
                 uri == "/stream" -> serveMjpeg()
                 uri == "/snapshot" -> serveSnapshot()
@@ -154,6 +165,95 @@ class WebServer(
         val html = context.assets.open("web/index.html").bufferedReader().use { it.readText() }
         return newFixedLengthResponse(Response.Status.OK, "text/html; charset=utf-8", html).apply {
             addHeader("Cache-Control", "no-store, no-cache, must-revalidate")
+        }
+    }
+
+    /**
+     * 把浏览器同源的 HLS 请求流式转发到设备本机 MediaMTX。
+     *
+     * 该路由与首页一样不要求 Bearer Token：MediaMTX 播放页中的 video/hls.js 请求无法
+     * 注入控制 API 的 Authorization 头，且原 WebRTC 端口也不受应用 API Token 保护。
+     */
+    private fun serveHlsProxy(session: IHTTPSession): Response {
+        if (session.method != Method.GET) {
+            return newFixedLengthResponse(
+                Response.Status.METHOD_NOT_ALLOWED,
+                MIME_PLAINTEXT,
+                "仅支持 GET"
+            ).apply { addHeader("Allow", "GET") }
+        }
+
+        val upstreamUrl = HlsProxyPolicy.upstreamUrl(
+            session.uri,
+            session.queryParameterString
+        ) ?: return newFixedLengthResponse(
+            Response.Status.BAD_REQUEST,
+            MIME_PLAINTEXT,
+            "无效的 HLS 路径"
+        )
+
+        var connection: HttpURLConnection? = null
+        return try {
+            val upstreamConnection = URL(upstreamUrl).openConnection() as HttpURLConnection
+            connection = upstreamConnection
+            upstreamConnection.instanceFollowRedirects = false
+            upstreamConnection.connectTimeout = 2_000
+            upstreamConnection.readTimeout = 20_000
+            upstreamConnection.requestMethod = "GET"
+            for (header in listOf("accept", "range", "if-none-match", "if-modified-since", "user-agent")) {
+                session.headers[header]?.let { upstreamConnection.setRequestProperty(header, it) }
+            }
+
+            val code = upstreamConnection.responseCode
+            val status = Response.Status.lookup(code) ?: Response.Status.SERVICE_UNAVAILABLE
+            val rawStream = if (code >= 400) upstreamConnection.errorStream else upstreamConnection.inputStream
+            val body = DisconnectingInputStream(
+                rawStream ?: ByteArrayInputStream(ByteArray(0)),
+                upstreamConnection
+            )
+            val length = upstreamConnection.contentLengthLong
+            val mimeType = upstreamConnection.contentType ?: "application/octet-stream"
+            val response = if (length >= 0) {
+                newFixedLengthResponse(status, mimeType, body, length)
+            } else {
+                newChunkedResponse(status, mimeType, body)
+            }
+            response.setRequestMethod(session.method)
+
+            for (header in listOf(
+                "Cache-Control", "ETag", "Last-Modified", "Accept-Ranges", "Content-Range"
+            )) {
+                upstreamConnection.getHeaderField(header)?.let { response.addHeader(header, it) }
+            }
+            upstreamConnection.getHeaderField("Location")?.let {
+                response.addHeader("Location", HlsProxyPolicy.rewriteLocation(it))
+            }
+            response.addHeader("X-Accel-Buffering", "no")
+            response
+        } catch (e: Exception) {
+            connection?.disconnect()
+            Log.w(TAG, "HLS 同源代理不可用: $upstreamUrl", e)
+            newFixedLengthResponse(
+                Response.Status.SERVICE_UNAVAILABLE,
+                MIME_PLAINTEXT,
+                "HLS 服务尚未就绪"
+            ).apply {
+                addHeader("Cache-Control", "no-store")
+                addHeader("Retry-After", "2")
+            }
+        }
+    }
+
+    private class DisconnectingInputStream(
+        delegate: InputStream,
+        private val connection: HttpURLConnection
+    ) : FilterInputStream(delegate) {
+        override fun close() {
+            try {
+                super.close()
+            } finally {
+                connection.disconnect()
+            }
         }
     }
 
@@ -539,7 +639,7 @@ class WebServer(
                 .put("name", "AIUniBOX-E11 Edge Camera")
                 .put("model", android.os.Build.MODEL)
                 .put("deviceId", id)
-                .put("apiVersion", 8)
+                .put("apiVersion", 9)
                 .put("appVersion", BuildConfig.VERSION_NAME)
                 .put("authRequired", security.isEnabled)
                 .toString()

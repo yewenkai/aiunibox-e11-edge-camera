@@ -15,6 +15,7 @@
 
     <application
         android:allowBackup="false"
+        android:usesCleartextTraffic="true"
         android:label="AIUniBOX-E11 Edge Camera"
         android:supportsRtl="true"
         android:icon="@android:drawable/ic_menu_camera"

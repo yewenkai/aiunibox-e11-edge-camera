@@ -1,5 +1,5 @@
 #!/system/bin/sh
-# AIUniBOX-E11 Edge Camera 自启脚本（Magisk service.d，开机后 root 执行）
+# AIUniBOX-E11 Edge Camera 自启脚本（Magisk service.d 或模块 service.sh，开机后 root 执行）
 BIN_DIR=/data/local/tmp/bin
 LOG=/data/local/tmp/e11_camera_service.log
 MEDIAMTX_LOG=/data/local/tmp/e11_camera_mediamtx.log
@@ -30,10 +30,12 @@ stop_mediamtx() {
     done
 }
 
-media_port_ready() {
+media_ports_ready() {
     # 部分定制固件的 nc 不支持 -z，即使端口已监听也会返回失败。
     # ss 来自 Android toybox/iproute2，在本设备上可稳定读取监听表。
-    ss -lnt 2>/dev/null | grep -q ':8554[[:space:]]'
+    LISTENING=$(ss -lnt 2>/dev/null)
+    echo "$LISTENING" | grep -q ':8554[[:space:]]' &&
+        echo "$LISTENING" | grep -q ':8888[[:space:]]'
 }
 
 start_monitor_app() {
@@ -111,7 +113,7 @@ stop_mediamtx
 MEDIAMTX_GUARD_PID=$!
 
 for i in $(seq 1 20); do
-    media_port_ready && { log "MediaMTX RTSP 端口就绪"; break; }
+    media_ports_ready && { log "MediaMTX RTSP/HLS 端口就绪"; break; }
     sleep 1
 done
 
@@ -133,7 +135,7 @@ while true; do
     [ -n "$TOKEN" ] && STATUS_URL="$STATUS_URL?token=$TOKEN"
     STATUS=$(/system/bin/busybox wget -qO- "$STATUS_URL" 2>/dev/null)
     if pidof "$APP_PKG" >/dev/null 2>&1 &&
-        media_port_ready &&
+        media_ports_ready &&
         echo "$STATUS" | grep -q '"streamReady":true' &&
         echo "$STATUS" | grep -q '"rtspPublishing":true'; then
         FAIL_COUNT=0
@@ -141,7 +143,7 @@ while true; do
         FAIL_COUNT=$((FAIL_COUNT + 1))
         log "App 健康检查失败 ($FAIL_COUNT/2)"
         if [ "$FAIL_COUNT" -ge 2 ]; then
-            if ! media_port_ready; then
+            if ! media_ports_ready; then
                 log "MediaMTX 端口异常，触发重启"
                 stop_mediamtx
                 sleep 3

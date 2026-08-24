@@ -15,6 +15,9 @@
 ```
 
 其中 `aiunibox-e11-edge-camera.sh` 使用本目录的 `service.sh`。
+如果设备已经安装旧版 `ptz_rtsp` Magisk 模块，则应更新
+`/data/adb/modules/ptz_rtsp/service.sh`，不要再同时安装一份 `service.d` 脚本，否则会
+出现两个守护进程。两种放置方式只选一种。
 
 示例命令：
 
@@ -35,7 +38,8 @@ adb shell su -c '
 '
 ```
 
-安装 APK、授予摄像头权限和 Magisk root 权限后重启设备。
+安装 APK、授予摄像头权限和 Magisk root 权限后重启设备。已存在 Magisk 模块的设备，
+更新后的模块 `service.sh` 也会在下次启动时生效。
 
 `service.sh` 会：
 
@@ -44,7 +48,7 @@ adb shell su -c '
 3. 清理旧版 PID 文件和孤儿 MediaMTX 进程
 4. 先启动并守护 MediaMTX，再启动应用 Activity
 5. 禁用旧版 `com.unicom.ptzmonitor`，避免定制桌面恢复旧应用并抢占摄像头和 8080
-6. 每 10 秒检查正确的应用进程、MediaMTX 端口、摄像头编码和 RTSP 发布状态
+6. 每 10 秒检查正确的应用进程、MediaMTX RTSP/HLS 端口、摄像头编码和 RTSP 发布状态
 7. 连续失败时重启异常服务
 
 守护状态保存在 `/data/local/tmp/e11-edge-camera/watchdog.state`，内容同时记录本次
@@ -61,4 +65,4 @@ adb shell am start -n com.unicom.ptzmonitor/.MainActivity
 再次启用本项目时，重新执行 `service.sh` 即可；脚本会恢复
 `org.e11camera.edge` 并禁用旧应用。
 
-不同 MediaMTX 版本的配置字段可能变化。若启动失败，请以所下载版本自带的官方配置为准，保留本文件的端口、WebRTC 和 `cam` path hook 即可。
+不同 MediaMTX 版本的配置字段可能变化。若启动失败，请以所下载版本自带的官方配置为准，保留本文件的 RTSP、HLS、WebRTC 端口和 `cam` path hook 即可。远程网页只代理 8080 时的同源 HLS 原理与验收步骤见 [`docs/REMOTE_ACCESS.md`](../../docs/REMOTE_ACCESS.md)。

@@ -25,7 +25,11 @@
     border-radius: 12px; overflow: hidden; aspect-ratio: 16/9;
   }
   .video-box canvas { width: 100%; height: 100%; display: block; }
-  .video-box iframe { width: 100%; height: 100%; border: none; }
+  .video-box iframe, .video-box .stream-fallback {
+    width: 100%; height: 100%; border: none; display: block;
+  }
+  .video-box .stream-fallback { object-fit: contain; background: #000; }
+  .video-box [hidden] { display: none !important; }
   #poseOverlay {
     position: absolute; inset: 0; z-index: 2; pointer-events: none;
     width: 100%; height: 100%; display: block;
@@ -41,8 +45,18 @@
     font-size: 12px; padding: 3px 8px; border-radius: 4px;
     font-family: monospace;
   }
+  .stream-mode-badge {
+    color: #c4b5fd;
+    font-size: 11px; padding: 3px 7px; border-radius: 999px;
+    background: rgba(124,58,237,.12); border: 1px solid rgba(167,139,250,.18);
+    white-space: nowrap;
+  }
+  .stream-mode-badge.fallback {
+    color: #fcd34d; background: rgba(146,64,14,.14); border-color: rgba(251,191,36,.24);
+  }
   .stream-meta {
     min-height: 30px; display: flex; align-items: center; gap: 6px;
+    flex-wrap: wrap;
     padding: 4px 4px 0; color: #6b7280; font-size: 11px;
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   }
@@ -322,6 +336,9 @@
     .calibration-steps { grid-template-columns: 1fr; }
     .health-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   }
+  @media (max-width: 420px) {
+    .frame-health { width: 100%; margin-left: 0; text-align: right; }
+  }
 </style>
 </head>
 <body>
@@ -331,12 +348,14 @@
     <button class="refresh-page" id="refreshPage" type="button">↻ 刷新页面</button>
   </div>
   <div class="video-box">
-    <iframe id="webrtc" src="" allow="autoplay; picture-in-picture"></iframe>
+    <iframe id="streamFrame" src="" title="实时看护画面" scrolling="no" allow="autoplay; picture-in-picture"></iframe>
+    <img class="stream-fallback" id="streamFallback" alt="实时画面低帧率兜底" hidden>
     <canvas id="poseOverlay" aria-hidden="true"></canvas>
   </div>
   <div class="stream-meta">
-    <span class="badge off" id="liveBadge">● 连接中</span>
-    <span class="fps-badge" id="fpsBadge">WebRTC</span>
+    <span class="badge off" id="liveBadge">● 设备连接中</span>
+    <span class="stream-mode-badge" id="streamModeBadge" aria-live="polite">正在选择播放通道</span>
+    <span class="fps-badge" id="fpsBadge">设备帧率 --</span>
     <span class="frame-health stale" id="frameHealth">等待首帧</span>
   </div>
 
@@ -663,17 +682,155 @@ function toast(msg) {
   toastTimer = setTimeout(() => t.classList.remove('show'), 1200);
 }
 
-// ===== 视频流：WebRTC（低延迟）嵌入 mediamtx 播放器 =====
-// mediamtx 内置 WebRTC 播放页在 :8889
-function initWebRTC() {
-  const iframe = $('webrtc');
-  const host = location.hostname;
-  if (location.protocol === 'https:') {
-    $('status').textContent = '实时画面请使用 HTTP 地址打开';
-  }
-  iframe.src = 'http://' + host + ':8889/cam/';
+// ===== 视频流：内网 WebRTC / 远程同源 HLS / 快照兜底 =====
+// 只有“HTTP + 局域网地址 + 8080 直连”才使用 8889 WebRTC；极空间等反向代理
+// 无论外层是 HTTP 还是 HTTPS，都改走当前网页同源的 /media/cam/ HLS。
+let streamMode = 'selecting';
+let fallbackTimer = 0;
+let fallbackObjectUrl = '';
+let fallbackBusy = false;
+
+function isLanHostname(hostname) {
+  const host = String(hostname || '').toLowerCase();
+  if (host === 'localhost' || host === '::1' || host.endsWith('.local') || host.endsWith('.home.arpa')) return true;
+  if (!host.includes('.')) return true;
+  if (/^127\./.test(host) || /^10\./.test(host) || /^192\.168\./.test(host) || /^169\.254\./.test(host)) return true;
+  const match = host.match(/^172\.(\d+)\./);
+  if (match && Number(match[1]) >= 16 && Number(match[1]) <= 31) return true;
+  return /^(fc|fd|fe80:)/.test(host);
 }
-initWebRTC();
+
+function preferredStreamMode() {
+  const directLanHttp = location.protocol === 'http:' &&
+    location.port === '8080' && isLanHostname(location.hostname);
+  return directLanHttp ? 'webrtc' : 'hls';
+}
+
+function webRtcPlayerUrl() {
+  const host = location.hostname.includes(':') ? `[${location.hostname}]` : location.hostname;
+  return `http://${host}:8889/cam/`;
+}
+
+async function canReachWebRtcPlayer() {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 1800);
+  try {
+    // no-cors 只判断 8889 HTTP 端口是否真的可达，不读取跨端口响应内容。
+    await fetch(webRtcPlayerUrl(), {
+      mode: 'no-cors', cache: 'no-store', signal: controller.signal
+    });
+    return true;
+  } catch (_) {
+    return false;
+  } finally {
+    window.clearTimeout(timeout);
+  }
+}
+
+function setStreamMode(mode, label) {
+  streamMode = mode;
+  const badge = $('streamModeBadge');
+  badge.textContent = label;
+  badge.classList.toggle('fallback', mode === 'snapshot');
+}
+
+function stopSnapshotFallback() {
+  if (fallbackTimer) window.clearInterval(fallbackTimer);
+  fallbackTimer = 0;
+  if (fallbackObjectUrl) URL.revokeObjectURL(fallbackObjectUrl);
+  fallbackObjectUrl = '';
+  $('streamFallback').hidden = true;
+}
+
+async function refreshSnapshotFallback() {
+  if (fallbackBusy) return;
+  fallbackBusy = true;
+  try {
+    const response = await fetch(`/snapshot?t=${Date.now()}`, {
+      headers: authHeaders(), cache: 'no-store'
+    });
+    if (response.status === 401) {
+      $('authSection').style.display = 'block';
+      setStreamMode('snapshot', '快照兜底 · 等待 API Token');
+      return;
+    }
+    if (!response.ok) throw new Error(`snapshot ${response.status}`);
+    const nextUrl = URL.createObjectURL(await response.blob());
+    const image = $('streamFallback');
+    const previousUrl = fallbackObjectUrl;
+    fallbackObjectUrl = nextUrl;
+    image.src = nextUrl;
+    if (previousUrl) URL.revokeObjectURL(previousUrl);
+    setStreamMode('snapshot', '快照兜底 · 约 1 fps');
+  } catch (_) {
+    setStreamMode('snapshot', '快照兜底 · 正在重试');
+  } finally {
+    fallbackBusy = false;
+  }
+}
+
+function activateSnapshotFallback(reason) {
+  const iframe = $('streamFrame');
+  iframe.src = 'about:blank';
+  iframe.hidden = true;
+  $('streamFallback').hidden = false;
+  setStreamMode('snapshot', reason || '快照兜底 · 正在连接');
+  refreshSnapshotFallback();
+  if (!fallbackTimer) fallbackTimer = window.setInterval(refreshSnapshotFallback, 1000);
+}
+
+async function probeHlsPlaylist() {
+  for (let attempt = 0; attempt < 3 && streamMode === 'hls'; attempt++) {
+    if (attempt > 0) await new Promise(resolve => setTimeout(resolve, 1500));
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 6000);
+    try {
+      const response = await fetch(`/media/cam/index.m3u8?probe=${Date.now()}`, {
+        cache: 'no-store', signal: controller.signal
+      });
+      const manifest = response.ok ? await response.text() : '';
+      if (manifest.includes('#EXTM3U')) return true;
+    } catch (_) {
+      // MediaMTX 首次建立 HLS muxer 可能需要数秒，交给下一轮重试。
+    } finally {
+      window.clearTimeout(timeout);
+    }
+  }
+  return false;
+}
+
+async function activateHlsMode() {
+  stopSnapshotFallback();
+  const iframe = $('streamFrame');
+  iframe.hidden = false;
+  setStreamMode('hls', 'HLS · 远程兼容连接中');
+  iframe.src = '/media/cam/?controls=true&muted=true&autoplay=true&playsinline=true';
+  if (await probeHlsPlaylist()) {
+    setStreamMode('hls', 'HLS · 远程兼容');
+  } else if (streamMode === 'hls') {
+    activateSnapshotFallback('HLS 不可用 · 快照兜底');
+  }
+}
+
+function activateWebRtcMode() {
+  stopSnapshotFallback();
+  const iframe = $('streamFrame');
+  iframe.hidden = false;
+  setStreamMode('webrtc', 'WebRTC · 内网低延迟');
+  iframe.src = webRtcPlayerUrl();
+}
+
+async function initVideoStream() {
+  const forced = new URLSearchParams(location.search).get('stream');
+  if (forced === 'webrtc') return activateWebRtcMode();
+  if (forced === 'hls') return activateHlsMode();
+  if (forced === 'snapshot') return activateSnapshotFallback('手动快照兜底');
+
+  if (preferredStreamMode() === 'hls') return activateHlsMode();
+  setStreamMode('selecting', '正在探测内网低延迟通道');
+  if (await canReachWebRtcPlayer()) activateWebRtcMode();
+  else activateHlsMode();
+}
 
 // ===== API =====
 const tokenKey = 'e11_api_token';
@@ -695,6 +852,7 @@ async function api(path) {
     return null;
   }
 }
+initVideoStream();
 
 $('saveToken').addEventListener('click', () => {
   apiToken = $('apiToken').value.trim();
@@ -1596,12 +1754,12 @@ async function refreshStatus() {
     lastStatusAt = now;
 
     const live = j.cameraOn && j.streamReady && j.rtspPublishing;
-    $('liveBadge').textContent = live ? '● LIVE' : '● 恢复中';
+    $('liveBadge').textContent = live ? '● 设备 LIVE' : '● 设备恢复中';
     $('liveBadge').classList.toggle('off', !live);
-    $('fpsBadge').textContent = fps > 0 ? `${fps.toFixed(1)} fps` : 'WebRTC';
+    $('fpsBadge').textContent = fps > 0 ? `设备 ${fps.toFixed(1)} fps` : '设备帧率 --';
     const capturedAt = Number(j.frameCapturedAt || 0);
     const stale = capturedAt <= 0 || now - capturedAt > 5000;
-    $('frameHealth').textContent = capturedAt > 0 ? (stale ? '快照可能卡住' : '快照正常') : '等待首帧';
+    $('frameHealth').textContent = capturedAt > 0 ? (stale ? '设备快照可能卡住' : '设备快照正常') : '等待设备首帧';
     $('frameHealth').classList.toggle('stale', stale);
     $('status').textContent =
       `IP: ${j.ip} | 摄像头: ${j.cameraOn ? '开' : '恢复中'} | 运行: ${Math.floor(j.uptimeSeconds / 60)} 分钟`;
@@ -1742,7 +1900,7 @@ async function refreshStatus() {
       : '重点区域仅限定动作检测；正常守护的成人陪护判断仍使用完整画面。事件短片保存在设备端，可逐条删除。';
   } catch (_) {
     drawPoseOverlay({});
-    $('liveBadge').textContent = '● 已断开';
+    $('liveBadge').textContent = '● 设备已断开';
     $('liveBadge').classList.add('off');
     $('status').textContent = '设备连接中断，正在重试…';
   }

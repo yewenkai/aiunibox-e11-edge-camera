@@ -1,6 +1,6 @@
 # AIUniBOX-E11 Edge Camera
 
-把一台闲置的 AIUniBOX-E11 RK3566 Android 带屏设备改造成局域网边缘摄像头：复用内置摄像头、水平云台和指示灯，在浏览器中通过 WebRTC 低延迟观看，并通过 RTSP 接入其他家庭网络设备。
+把一台闲置的 AIUniBOX-E11 RK3566 Android 带屏设备改造成局域网边缘摄像头：复用内置摄像头、水平云台和指示灯，在浏览器中通过 WebRTC 低延迟观看，也可通过同源 HLS 兼容远程网页代理，并通过 RTSP 接入其他家庭网络设备。
 
 > 本项目仅用于个人设备研究、Android/音视频与边缘计算学习。它不是任何设备厂商、运营商或芯片公司的官方项目，也未获得这些主体的背书。请只在你拥有或已获明确授权的设备和场所中使用，并遵守当地隐私、监控和无线网络相关法律。
 
@@ -25,7 +25,7 @@ GitHub Actions 仅验证源码是否可以编译，不上传 APK 或其他构建
 - MediaCodec Surface 硬编码，避免 CPU 侧 YUV 拷贝
 - App 内直接发布 H.264/RTP 到 MediaMTX，不经过 FFmpeg
 - GPU 零拷贝前置合成东八区日期时间，时间戳进入 H.264 画面，可用于全屏、画中画和录像
-- RTSP 与 WebRTC 播放
+- RTSP、内网 WebRTC 与远程同源 HLS 播放
 - 内置局域网控制页，含独立的整页刷新按钮
 - App 前台 4:3 本地回显
 - 水平云台点动与长按连续调整
@@ -65,11 +65,12 @@ GitHub Actions 仅验证源码是否可以编译，不上传 APK 或其他构建
                               │
                               v
                            MediaMTX
-                         ┌────┴────┐
-                         │         │
-                       RTSP      WebRTC
+                         ┌────┴──────────────┐
+                         │                   │
+                       RTSP        WebRTC / HLS
 
 浏览器控制页 ──> NanoHTTPD API ──> 云台 / LED / IR-CUT
+       └──────> /media/cam 同源代理 ──> MediaMTX HLS
 ```
 
 ## 已验证硬件
@@ -130,11 +131,18 @@ NPU、YAMNet 和 MediaMTX 都是可选的本地组件，仓库不提供对应模
 | 控制页 | `http://<device-ip>:8080` |
 | RTSP | `rtsp://<device-ip>:8554/cam` |
 | WebRTC | `http://<device-ip>:8889/cam/` |
+| HLS（设备内网调试） | `http://<device-ip>:8888/cam/` |
+| HLS（控制页同源） | `<控制页地址>/media/cam/` |
+
+控制页在 `HTTP + 局域网地址 + 8080` 直连且 `8889` 探测可达时优先使用 WebRTC；通过极空间一类远程网页
+代理访问时，无论外层是 HTTP 还是 HTTPS，都会自动切换到同源 HLS。设备不需要配置
+自签名 HTTPS，远程入口也不需要单独转发 8888、8889 或 8189。部署与排障见
+[远程网页与同源 HLS](docs/REMOTE_ACCESS.md)。
 
 ### 启用 API Token
 
 应用启动时会读取 `/data/local/tmp/e11-edge-camera/api_token`。文件存在且非空时，
-除首页和 `/api/info` 外的 HTTP 接口都要求 Bearer Token：
+除首页、`/api/info` 和同源 HLS `/media/cam/` 外的 HTTP 接口都要求 Bearer Token：
 
 ```bash
 adb shell "su -c 'mkdir -p /data/local/tmp/e11-edge-camera && chmod 700 /data/local/tmp/e11-edge-camera'"
@@ -184,7 +192,7 @@ JPEG，只把最近姿态、17 个 COCO 关键点的有效率和端到端耗时�
 稳定姿态要求最近 6 次中至少 5 次得到同一标签。该启发式只粗分“疑似仰卧 / 侧卧 /
 俯卧 / 不明确”，不能确认宝宝身份，也不是医学结论。
 
-调试骨架默认关闭，由浏览器在 WebRTC 画面上方的透明 canvas 临时绘制，因此不会修改
+调试骨架默认关闭，由浏览器在 WebRTC/HLS 画面上方的透明 canvas 临时绘制，因此不会修改
 H.264、JPEG、画中画或事件短片。风险候选出现时还可按需加载 RetinaFace mobile320，
 只分析由肩髋方向或可见面部关键点估计出的头部裁剪区域，并输出“面部可见 / 未确认可见”
 附加证据；它不保存裁剪图、不识别人脸，也不持续运行。
