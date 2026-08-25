@@ -26,6 +26,7 @@ class MonitorService : Service() {
         const val PORT = 8080
         const val ACTION_RESTART_CAMERA = "org.e11camera.edge.RESTART_CAMERA"
         private const val POSTURE_ALERT_COOLDOWN_MS = 5L * 60L * 1_000L
+        private const val GUARDIAN_VISION_REFRESH_TIMEOUT_MS = 450L
 
         @Volatile
         var instance: MonitorService? = null
@@ -672,7 +673,9 @@ class MonitorService : Service() {
         kind: String,
         title: String,
         summary: String,
-        cryScore: Float? = null
+        cryScore: Float? = null,
+        visionOverride: AlertVisionSnapshot? = null,
+        decisionContext: String? = null
     ) {
         val operatingMode = guardianOperatingMode()
         if (!GuardianModePolicy.audioEnabled(operatingMode)) return
@@ -680,7 +683,9 @@ class MonitorService : Service() {
 
         val audioOnly = operatingMode == GuardianOperatingMode.AUDIO_ONLY
         val npu = npuDetector
-        val vision = if (audioOnly) null else npu?.refreshForAlert(300L)
+        val vision = if (audioOnly) null else {
+            visionOverride ?: npu?.refreshForAlert(GUARDIAN_VISION_REFRESH_TIMEOUT_MS)
+        }
         val personCount = if (audioOnly) 0 else vision?.personCount ?: npu?.personCount ?: 0
         val adultLikeCount = if (audioOnly) 0 else {
             vision?.adultLikePersonCount ?: npu?.adultLikePersonCount ?: 0
@@ -714,13 +719,17 @@ class MonitorService : Service() {
         val refreshReason = when (refreshStatus) {
             "lens_covered" -> "实体镜头罩关闭，本次未采集或分析画面"
             "refreshed" -> "通知前已补跑一次新画面 NPU"
+            "recent_frame" -> "最近一次 NPU 画面不足 0.5 秒，直接复用同一陪护结果"
             "latest_frame" -> "未在限时内取到新帧，已用最近画面补跑 NPU"
-            "timeout" -> "NPU 补跑等待超过 300ms，本次按最近可用结果判断"
+            "supervision_transition" -> "成人离开后使用刚完成的陪护分析重新决策"
+            "timeout" ->
+                "NPU 补跑等待超过 ${GUARDIAN_VISION_REFRESH_TIMEOUT_MS}ms，本次按最近可用结果判断"
             "no_frame" -> "当前没有可用新画面，本次按最近可用结果判断"
             "unavailable" -> "NPU 当前不可用，不将单次人体结果作为绝对依据"
             else -> "NPU 补跑状态：$refreshStatus"
         }
-        val reason = "$decisionReason；$refreshReason"
+        val reason = listOfNotNull(decisionReason, refreshReason, decisionContext)
+            .joinToString("；")
         val mutation = guardianEventStore?.addOrMergeTriggered(
             kind = kind,
             summary = summary,
@@ -796,7 +805,11 @@ class MonitorService : Service() {
             Log.i(TAG, "姿态风险候选仍在 5 分钟冷却期，仅保留影子统计")
             return
         }
-        val vision = if (poseAdultPresent || currentNpuAdultPresent) null else npu?.refreshForAlert(300L)
+        val vision = if (poseAdultPresent || currentNpuAdultPresent) {
+            null
+        } else {
+            npu?.refreshForAlert(GUARDIAN_VISION_REFRESH_TIMEOUT_MS)
+        }
         val refreshedAdultPresent = (vision?.personCount ?: 0) >= 2 ||
             (vision?.adultLikePersonCount ?: 0) > 0 || vision?.notificationsSuppressed == true
         val adultPresent = poseAdultPresent || currentNpuAdultPresent || refreshedAdultPresent
@@ -839,8 +852,10 @@ class MonitorService : Service() {
         }
         val refreshReason = when (vision?.refreshStatus) {
             "refreshed" -> "通知前已补跑一次新画面人体 NPU"
+            "recent_frame" -> "最近一次人体 NPU 画面不足 0.5 秒，直接复用"
             "latest_frame" -> "未及时取得新帧，已用最近画面补跑人体 NPU"
-            "timeout" -> "人体 NPU 补跑超过 300ms，按最近可用陪护证据判断"
+            "timeout" ->
+                "人体 NPU 补跑超过 ${GUARDIAN_VISION_REFRESH_TIMEOUT_MS}ms，按最近可用陪护证据判断"
             "no_frame" -> "当前没有可用新画面，按最近可用陪护证据判断"
             "unavailable", "failed", "interrupted" -> "人体 NPU 补跑不可用，保留现有陪护证据"
             null -> "已有成人或陪护证据，无需为通知重复补跑人体 NPU"
@@ -911,6 +926,34 @@ class MonitorService : Service() {
                 adultLikePersonCount = observation.adultLikePeople,
                 supervisionState = current.name.lowercase()
             )?.takeIf { !it.created }?.let { eventClipRecorder?.extend(it.event.id) }
+
+            // 哭声和动作检测器只在一个事件的上升沿回调。若事件开始时成人在场，
+            // 持续信号在成人离开后不会自然产生第二个上升沿，因此在陪护缓冲结束时
+            // 用这次刚完成的 NPU 结果重新决策一次，且不在 NPU 单线程中再次排队等待。
+            val now = System.currentTimeMillis()
+            val cry = cryDetector
+            val motion = motionDetector
+            val cryContinues = cry?.hasRecentEvidence(now) == true
+            val motionContinues = motion?.hasRecentEvidence(now) == true
+            if (cryContinues || motionContinues) {
+                val both = cryContinues && motionContinues
+                notifyGuardianEvent(
+                    kind = if (cryContinues) "cry" else "motion",
+                    title = when {
+                        both -> "宝宝守护：持续哭声和动作"
+                        cryContinues -> "宝宝守护：持续疑似哭声"
+                        else -> "宝宝守护：持续动作"
+                    },
+                    summary = when {
+                        both -> "成人离开后，画面动作和疑似哭声仍在持续"
+                        cryContinues -> "成人离开后，本地音频模型仍检测到哭声候选"
+                        else -> "成人离开后，画面仍检测到持续动作"
+                    },
+                    cryScore = cry?.lastCryScore?.takeIf { cryContinues && it > 0f },
+                    visionOverride = npuDetector?.currentDecisionSnapshot("supervision_transition"),
+                    decisionContext = "陪护证据消失并结束 20 秒缓冲后，持续信号已自动重新评估"
+                )
+            }
         }
     }
 

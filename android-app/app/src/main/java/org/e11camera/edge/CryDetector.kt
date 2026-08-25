@@ -29,8 +29,9 @@ data class CryCalibrationStatus(
 /**
  * 宝宝守护：哭声检测（本地 YAMNet 分类，不联网）。
  *
- * 麦克风 16kHz 单声道连续采集，0.975s 窗口。安静时（RMS 低于门限）只算
- * 能量不推理，近零开销；有声才跑 YAMNet。该模型直接输出 0..1 类别分数，
+ * 麦克风 16kHz 单声道连续采集，0.975s 窗口、约 0.49s 步进。安静时
+ * （RMS 低于门限）主要只算能量；每隔数窗仍强制抽查一次，避免远处弱哭声
+ * 被能量门限永久跳过。有声才跑 YAMNet。该模型直接输出 0..1 类别分数，
  * 取哭声相关类别的最高分作为哭声匹配分，不能再做 softmax。
  *
  * 推送策略（用户指定）：任一窗口判定为哭声立即推送，不做防抖——
@@ -49,9 +50,11 @@ class CryDetector(
         private const val TAG = "CryDetector"
         private const val SAMPLE_RATE = 16000
         private const val WINDOW_SAMPLES = 15600 // 0.975s，YAMNet 输入长度
+        private const val HOP_SAMPLES = WINDOW_SAMPLES / 2 // 50% 重叠，约 0.49s 步进
 
         /** 低于该 RMS 视为安静，跳过推理 */
         private const val SILENCE_RMS_GATE = 0.012f
+        private const val SILENT_FORCE_INTERVAL_WINDOWS = 4
 
         // yamnet_class_map.csv: 19=Crying,sobbing 20=Baby cry,infant cry
         // 21=Whimper 22=Wail,moan
@@ -65,13 +68,15 @@ class CryDetector(
 
         private const val MODEL_FILE = "yamnet.tflite"
         private const val HISTORY_LIMIT = 20
-        private const val CALIBRATION_SAMPLES = 15
+        // 50% 重叠后 30 窗仍约等于 15 秒现场底噪。
+        private const val CALIBRATION_SAMPLES = 30
     }
 
     private val events = ArrayDeque<Long>()
     private val calibrationLock = Any()
     private val calibrationRms = mutableListOf<Float>()
     private val calibrationScores = mutableListOf<Float>()
+    private val temporalPolicy = CryTemporalPolicy()
 
     @Volatile private var calibrationState = if (state.cryCalibratedAt > 0L) "complete" else "idle"
     @Volatile private var calibrationStartedAt = 0L
@@ -134,6 +139,7 @@ class CryDetector(
             Log.w(TAG, "未找到 $MODEL_FILE（filesDir），哭声检测停用")
             return
         }
+        temporalPolicy.reset()
         running = true
         thread = Thread { loop(model) }.apply { start() }
     }
@@ -145,11 +151,16 @@ class CryDetector(
         thread = null
         inCryEpisode = false
         lastCryAt = 0L
+        temporalPolicy.reset()
     }
 
     fun lastEventAt(): Long? = synchronized(events) { events.lastOrNull() }
 
     fun recentEvents(): List<Long> = synchronized(events) { events.toList() }
+
+    /** 成人离开时只重评估仍有新哭声证据的事件，避免沿用即将结束的旧 episode。 */
+    fun hasRecentEvidence(now: Long = System.currentTimeMillis(), maxAgeMs: Long = 2_500L): Boolean =
+        inCryEpisode && lastCryAt > 0L && now - lastCryAt in 0..maxAgeMs
 
     fun startAmbientCalibration(): Boolean {
         if (!running) return false
@@ -161,6 +172,7 @@ class CryDetector(
         }
         inCryEpisode = false
         lastCryAt = 0L
+        temporalPolicy.reset()
         Log.i(TAG, "开始环境底噪校准，仅保存统计量")
         return true
     }
@@ -252,6 +264,8 @@ class CryDetector(
         val inputs = arrayOf<Any>(input)
         val output = Array(1) { FloatArray(521) }
         val outputs = mapOf<Int, Any>(0 to output)
+        var retainedSamples = 0
+        var skippedSilentWindows = 0
         try {
             interpreter = Interpreter(model, Interpreter.Options().apply { setNumThreads(1) })
             modelLoaded = true
@@ -268,9 +282,9 @@ class CryDetector(
                 return
             }
             record.startRecording()
-            Log.i(TAG, "哭声检测已启动（YAMNet，16kHz 单声道）")
+            Log.i(TAG, "哭声检测已启动（YAMNet，16kHz 单声道，0.975s 窗口/0.49s 步进）")
             while (running && !Thread.currentThread().isInterrupted) {
-                var off = 0
+                var off = retainedSamples
                 while (off < WINDOW_SAMPLES && running) {
                     val n = record.read(buf, off, WINDOW_SAMPLES - off, AudioRecord.READ_BLOCKING)
                     if (n <= 0) break
@@ -284,40 +298,45 @@ class CryDetector(
                 lastAudioRms = rms
                 lastAnalyzedAt = System.currentTimeMillis()
                 val calibrating = isCalibrating()
-                if (rms < silenceRmsGate && !calibrating) {
+                val threshold = currentThreshold
+                val forceSilentCheck = skippedSilentWindows >= SILENT_FORCE_INTERVAL_WINDOWS - 1
+                if (rms < silenceRmsGate && !calibrating && !forceSilentCheck) {
+                    skippedSilentWindows++
                     lastCryScore = 0f
                     topClassIndex = -1
                     topClassScore = 0f
-                    handleWindow(isCry = false, cry = 0f)
-                    continue
+                    handleWindow(temporalPolicy.push(0f, threshold), cry = 0f)
+                } else {
+                    skippedSilentWindows = 0
+                    input[0] = buf.copyOf()
+                    interpreter.runForMultipleInputsOutputs(inputs, outputs)
+                    // 模型元数据明确说明 scores 已在 0..1 范围；再次 softmax 会把
+                    // 521 类压到约 1/521，导致哭声分数恒定在约 0.01、永远无法触发。
+                    val scores = output[0]
+                    var cry = 0f
+                    for (i in CRY_LABELS) cry = maxOf(cry, scores[i])
+                    var topIdx = 0
+                    for (i in scores.indices) if (scores[i] > scores[topIdx]) topIdx = i
+                    lastCryScore = cry
+                    topClassIndex = topIdx
+                    topClassScore = scores[topIdx]
+                    Log.i(
+                        TAG,
+                        "音频窗口 rms=${"%.3f".format(rms)} cry=${"%.3f".format(cry)} " +
+                            "threshold=${"%.2f".format(threshold)} top=$topIdx(${"%.3f".format(scores[topIdx])})"
+                    )
+
+                    if (calibrating) {
+                        collectCalibration(rms, cry)
+                        temporalPolicy.reset()
+                        handleWindow(isCry = false, cry = 0f)
+                    } else {
+                        handleWindow(temporalPolicy.push(cry, threshold), cry)
+                    }
                 }
 
-                input[0] = buf.copyOf()
-                interpreter.runForMultipleInputsOutputs(inputs, outputs)
-                // 模型元数据明确说明 scores 已在 0..1 范围；再次 softmax 会把
-                // 521 类压到约 1/521，导致哭声分数恒定在约 0.01、永远无法触发。
-                val scores = output[0]
-                var cry = 0f
-                for (i in CRY_LABELS) cry = maxOf(cry, scores[i])
-                // 有声窗口的诊断日志（安静时不打），现场调灵敏度用
-                var topIdx = 0
-                for (i in scores.indices) if (scores[i] > scores[topIdx]) topIdx = i
-                lastCryScore = cry
-                topClassIndex = topIdx
-                topClassScore = scores[topIdx]
-                val threshold = currentThreshold
-                Log.i(
-                    TAG,
-                    "音频窗口 rms=${"%.3f".format(rms)} cry=${"%.3f".format(cry)} " +
-                        "threshold=${"%.2f".format(threshold)} top=$topIdx(${"%.3f".format(scores[topIdx])})"
-                )
-
-                if (calibrating) {
-                    collectCalibration(rms, cry)
-                    handleWindow(isCry = false, cry = 0f)
-                    continue
-                }
-                handleWindow(cry >= threshold, cry)
+                System.arraycopy(buf, HOP_SAMPLES, buf, 0, WINDOW_SAMPLES - HOP_SAMPLES)
+                retainedSamples = WINDOW_SAMPLES - HOP_SAMPLES
             }
         } catch (e: Exception) {
             Log.w(TAG, "哭声检测异常退出: ${e.message}", e)
@@ -353,6 +372,7 @@ class CryDetector(
             }
         } else if (inCryEpisode && now - lastCryAt > EPISODE_GAP_MS) {
             inCryEpisode = false
+            temporalPolicy.reset()
             Log.i(TAG, "哭声事件结束")
         }
     }

@@ -13,7 +13,8 @@ import java.util.concurrent.atomic.AtomicBoolean
  * 不触碰 30fps 零拷贝编码路径。宝宝翻身/醒来是持续数秒的动作，
  * 1 秒采样粒度足够。
  *
- * 判定：滑动窗口内"有动静"的秒数达到阈值即触发；连续安静一段时间后回落。
+ * 判定：同时比较相邻 1 秒帧差和约 5 秒累计帧差。常规动作走 15 秒投票，
+ * 强动作走 3 秒快速通道；连续安静一段时间后回落。
  * 云台转动、切换场景/IR-CUT/补光灯等全局亮度变化通过丢弃参考帧排除。
  */
 class MotionDetector(
@@ -36,6 +37,9 @@ class MotionDetector(
         /** 灵敏度 0/1/2（低/中/高）对应的变化像素占比阈值 */
         private val RATIO_THRESHOLDS = doubleArrayOf(0.12, 0.07, 0.03)
 
+        private const val LAG_MIN_FRAMES = 5
+        private const val LAG_HISTORY_LIMIT = 5
+
         private const val HISTORY_LIMIT = 20
     }
 
@@ -47,11 +51,21 @@ class MotionDetector(
     private var reference: IntArray? = null
 
     private val trigger = TriggerStateMachine()
+    private val fastTrigger = TriggerStateMachine(
+        triggerWindow = 3,
+        triggerMinActive = 2,
+        quietReset = 6
+    )
+    private val lagFrames = ArrayDeque<IntArray>()
     private val events = ArrayDeque<Long>()
 
-    val isActive: Boolean
-        get() = trigger.isActive
+    @Volatile
+    private var lastMotionEvidenceAt = 0L
 
+    val isActive: Boolean
+        get() = trigger.isActive || fastTrigger.isActive
+
+    @Synchronized
     fun start() {
         if (!running.compareAndSet(false, true)) return
         scheduler = Executors.newSingleThreadScheduledExecutor()
@@ -59,50 +73,71 @@ class MotionDetector(
         Log.i(TAG, "动作检测已启动")
     }
 
+    @Synchronized
     fun stop() {
         if (!running.compareAndSet(true, false)) return
         scheduler.shutdownNow()
-        reference = null
-        trigger.reset()
+        resetMotionState()
         Log.i(TAG, "动作检测已停止")
     }
 
     /** 外部场景即将/已经突变（云台、IR-CUT、补光灯等），丢弃参考帧防误报。 */
+    @Synchronized
     fun notifyReferenceInvalid() {
-        reference = null
+        resetMotionState()
     }
 
     fun lastEventAt(): Long? = synchronized(events) { events.lastOrNull() }
 
     fun recentEvents(): List<Long> = synchronized(events) { events.toList() }
 
+    /** 成人离开时只重评估最近数秒仍有帧差证据的动作会话。 */
+    fun hasRecentEvidence(now: Long = System.currentTimeMillis(), maxAgeMs: Long = 6_000L): Boolean =
+        isActive && lastMotionEvidenceAt > 0L && now - lastMotionEvidenceAt in 0..maxAgeMs
+
+    @Synchronized
     private fun tick() {
         try {
             if (motor.isBusy()) {
                 // 云台转动整幅画面都在变：丢弃参考帧并清空窗口，不产生样本。
-                reference = null
-                trigger.reset()
+                resetMotionState()
                 return
             }
             val jpeg = streamer.latestJpeg
             if (jpeg.isEmpty()) {
-                reference = null
+                resetMotionState()
                 return
             }
             val gray = decodeGray(jpeg)
             if (gray == null) {
-                reference = null
+                resetMotionState()
                 return
             }
             val ref = reference
             if (ref == null) {
                 reference = gray
+                lagFrames.addLast(gray)
                 return
             }
-            val ratio = changedRatio(ref, gray, decodeRoi())
+            val roi = decodeRoi()
+            val shortRatio = changedRatio(ref, gray, roi)
+            val lagRatio = if (lagFrames.size >= LAG_MIN_FRAMES) {
+                changedRatio(lagFrames.first(), gray, roi)
+            } else {
+                0.0
+            }
             reference = gray
+            lagFrames.addLast(gray)
+            while (lagFrames.size > LAG_HISTORY_LIMIT) lagFrames.removeFirst()
             val threshold = RATIO_THRESHOLDS[state.babySensitivity.coerceIn(0, 2)]
-            if (trigger.push(ratio >= threshold)) {
+            val signal = MotionSignalPolicy.evaluate(shortRatio, lagRatio, threshold)
+            if (signal.regularActive || signal.strongActive) {
+                lastMotionEvidenceAt = System.currentTimeMillis()
+            }
+            val wasActive = isActive
+            val regularRising = trigger.push(signal.regularActive)
+            val fastRising = fastTrigger.push(signal.strongActive)
+            if (!wasActive && isActive && (regularRising || fastRising)) {
                 val now = System.currentTimeMillis()
                 synchronized(events) {
                     events.addLast(now)
@@ -115,11 +150,23 @@ class MotionDetector(
                 } catch (e: Exception) {
                     Log.w(TAG, "触发回调异常", e)
                 }
-                Log.i(TAG, "检测到持续动作，已触发")
+                Log.i(
+                    TAG,
+                    "检测到动作，已触发 short=${"%.3f".format(shortRatio)} " +
+                        "lag=${"%.3f".format(lagRatio)} fast=$fastRising"
+                )
             }
         } catch (e: Exception) {
             Log.w(TAG, "tick 异常", e)
         }
+    }
+
+    private fun resetMotionState() {
+        reference = null
+        lagFrames.clear()
+        trigger.reset()
+        fastTrigger.reset()
+        lastMotionEvidenceAt = 0L
     }
 
     /** JPEG → 灰度数组。640×480 快照用 inSampleSize=8 直接解码到 80×60。 */

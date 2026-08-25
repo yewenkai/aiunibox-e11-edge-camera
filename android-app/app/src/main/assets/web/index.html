@@ -445,7 +445,7 @@
       <div class="signal-card off" id="motionSignalCard">
         <span class="signal-name"><i class="signal-dot"></i>画面动作</span>
         <strong class="signal-value" id="motionSignalVal">读取中…</strong>
-        <small class="signal-note" id="motionSignalNote">按选定监测区域独立判断</small>
+        <small class="signal-note" id="motionSignalNote">短时强动作与约 5 秒累计变化双通道</small>
       </div>
       <div class="signal-card off" id="crySignalCard">
         <span class="signal-name"><i class="signal-dot"></i>哭声识别</span>
@@ -1630,7 +1630,8 @@ function renderCrySignal(j, unavailableNote) {
     j.babyCryActive ? `哭声事件中 · 当前 ${cryPct}%` : `哭声 ${cryPct}% / 阈值 ${thresholdPct}%`,
     j.babyCryActive ? 'alert' : 'ok'
   );
-  $('crySignalNote').textContent = `音频能量 ${rms} · 当前最高 ${topName}`;
+  $('crySignalNote').textContent =
+    `音频能量 ${rms} · 当前最高 ${topName} · 约 0.49 秒重叠步进`;
 }
 
 const postureNames = {
@@ -1834,11 +1835,11 @@ async function refreshStatus() {
     $('guardianRoiHint').textContent = j.lensCoverClosed
       ? '实体镜头罩关闭：无法判断成人是否在场，仅按哭声模型结果守护，达到阈值时按安全侧通知。'
       : (fullMotionRoi
-        ? 'NPU 不识别年龄。当前画面发现两人或成人体型证据时暂停通知；否则保持武装。'
-        : '重点区域只限定动作检测。成人陪护仍按全画面人数和体型证据判断，不推断宝宝位置。');
+        ? 'NPU 不识别年龄。当前画面发现两人或成人体型证据时暂停通知；成人离开后，持续信号会自动重新评估。'
+        : '重点区域只限定动作检测。陪护仍按全画面判断；成人离开后，持续信号会自动重新评估。');
     $('motionSignalNote').textContent = fullMotionRoi
-      ? '当前按全画面判断持续动作'
-      : '当前只在重点区域内判断持续动作';
+      ? '全画面：短时强动作 + 约 5 秒累计变化'
+      : '重点区域：短时强动作 + 约 5 秒累计变化';
     const chip = $('guardianChip');
     const quickToggle = $('guardianQuickToggle');
     quickToggle.disabled = false;
@@ -1863,8 +1864,8 @@ async function refreshStatus() {
         : '只识别通用人体，不区分宝宝与成人';
       $('motionSignalNote').textContent = j.lensCoverClosed
         ? '镜头罩关闭；开启守护后不检测画面动作'
-        : (fullMotionRoi ? '当前按全画面判断持续动作' : '当前只判断重点区域');
-      $('crySignalNote').textContent = '开启守护后显示实时音频分数';
+        : (fullMotionRoi ? '全画面：短时强动作 + 累计变化' : '重点区域：短时强动作 + 累计变化');
+      $('crySignalNote').textContent = '开启后以约 0.49 秒步进重叠分析音频';
       $('guardianSignalNote').textContent = j.lensCoverClosed
         ? '开启后仅按哭声结果守护，无法判断成人陪护'
         : '开启后按陪护状态决定是否推送';
@@ -1941,11 +1942,11 @@ async function refreshStatus() {
         guardianState = 'ok';
         guardianNote = caregiverNow
           ? '当前成人证据即时抑制通知；动作和哭声仍在本地记录'
-          : '陪护者离开约 20 秒后自动恢复通知';
+          : '陪护者离开约 20 秒后恢复；持续中的哭声或动作会自动重新评估';
       } else {
         guardianText = alerting ? '未检测到成人，需要关注' : '未检测到明确成人，通知已武装';
         guardianState = alerting ? 'alert' : 'warn';
-        guardianNote = 'NPU 不负责确认宝宝身份；未检测到成人时，动作或哭声达到阈值即通知';
+        guardianNote = 'NPU 不确认宝宝身份；未检测到成人时，动作或哭声达到阈值即通知';
       }
       setSignal('guardianSignalCard', 'babyMotionVal', guardianText, guardianState);
       $('guardianSignalNote').textContent = guardianNote;

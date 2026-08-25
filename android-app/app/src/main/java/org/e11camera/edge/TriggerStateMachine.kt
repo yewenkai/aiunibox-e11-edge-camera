@@ -2,8 +2,8 @@ package org.e11camera.edge
 
 /**
  * 宝宝守护共用触发状态机：滑动窗口内"有动静"的采样数达到阈值即触发，
- * 连续安静一段时间后回落。动作检测（1fps 帧差）和哭声检测（~1s 窗口
- * 分类）以各自节奏 push 采样，共用同一套防抖参数。
+ * 连续安静一段时间后回落。当前由动作检测的普通与强动作通道分别使用；
+ * 哭声使用独立的重叠窗口时间投票。
  */
 class TriggerStateMachine(
     private val triggerWindow: Int = TRIGGER_WINDOW,

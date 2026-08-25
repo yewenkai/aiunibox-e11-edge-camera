@@ -12,6 +12,7 @@ import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.exp
 import kotlin.math.max
 import kotlin.math.min
@@ -71,7 +72,9 @@ class NpuDetector(
         private const val TAG = "NpuDetector"
         private const val MODEL_FILE = "yolov8n_rk3566.rknn"
         private const val SAMPLE_INTERVAL_SEC = 2L
-        private const val ALERT_FRESH_FRAME_TIMEOUT_MS = 100L
+        private const val ALERT_FRESH_FRAME_TIMEOUT_MS = 180L
+        private const val DEFAULT_ALERT_TIMEOUT_MS = 450L
+        private const val ALERT_RECENT_SOURCE_REUSE_MS = 500L
         private const val INPUT_SIZE = 640
 
         /** COCO class 0 = person；只关心人 */
@@ -88,6 +91,7 @@ class NpuDetector(
     }
 
     private val running = AtomicBoolean(false)
+    private val pendingAlertRefreshes = AtomicInteger(0)
     private val inferenceLock = Any()
     private val recentDetections = ArrayDeque<Boolean>(ENTER_WINDOW)
     private val supervision = SupervisionStateMachine()
@@ -267,7 +271,8 @@ class NpuDetector(
     }
 
     private fun tick() {
-        if (!running.get()) return
+        // 已有告警等待时，让队列里的常规轮询主动让路，避免 2 秒任务先占满告警预算。
+        if (!running.get() || pendingAlertRefreshes.get() > 0) return
         try {
             val snapshot = streamer.latestJpegSnapshot()
             if (snapshot.bytes.isEmpty()) return
@@ -281,45 +286,54 @@ class NpuDetector(
      * 告警前尝试强制取下一帧并补跑 NPU。调用方最多等待 [timeoutMs]，
      * 超时后按安全侧继续事件流程，已开始的推理可以在后台完成并更新状态。
      */
-    fun refreshForAlert(timeoutMs: Long = 300L): AlertVisionSnapshot {
+    fun refreshForAlert(timeoutMs: Long = DEFAULT_ALERT_TIMEOUT_MS): AlertVisionSnapshot {
         val requestedAt = System.currentTimeMillis()
         val executor = scheduler
         if (!running.get() || !modelLoaded || executor == null) {
             return recordAlertRefresh(currentSnapshot("unavailable"), requestedAt)
         }
+        val sourceAge = requestedAt - lastSourceCapturedAt
+        if (lastAnalyzedAt > 0L && sourceAge in 0..ALERT_RECENT_SOURCE_REUSE_MS) {
+            return recordAlertRefresh(currentSnapshot("recent_frame"), requestedAt)
+        }
+        pendingAlertRefreshes.incrementAndGet()
         return try {
-            val future = executor.submit<AlertVisionSnapshot> {
-                val fresh = streamer.requestFreshJpeg(ALERT_FRESH_FRAME_TIMEOUT_MS)
-                val source = fresh ?: streamer.latestJpegSnapshot()
-                if (source.bytes.isEmpty()) {
-                    currentSnapshot("no_frame")
-                } else {
-                    runInference(source, if (fresh != null) "refreshed" else "latest_frame")
-                }
-            }
             try {
-                recordAlertRefresh(
-                    future.get(timeoutMs.coerceAtLeast(1L), TimeUnit.MILLISECONDS),
-                    requestedAt
-                )
-            } catch (_: TimeoutException) {
-                future.cancel(false)
-                recordAlertRefresh(currentSnapshot("timeout"), requestedAt)
+                val future = executor.submit<AlertVisionSnapshot> {
+                    val fresh = streamer.requestFreshJpeg(ALERT_FRESH_FRAME_TIMEOUT_MS)
+                    val source = fresh ?: streamer.latestJpegSnapshot()
+                    if (source.bytes.isEmpty()) {
+                        currentSnapshot("no_frame")
+                    } else {
+                        runInference(source, if (fresh != null) "refreshed" else "latest_frame")
+                    }
+                }
+                try {
+                    recordAlertRefresh(
+                        future.get(timeoutMs.coerceAtLeast(1L), TimeUnit.MILLISECONDS),
+                        requestedAt
+                    )
+                } catch (_: TimeoutException) {
+                    future.cancel(false)
+                    recordAlertRefresh(currentSnapshot("timeout"), requestedAt)
+                }
+            } catch (_: RejectedExecutionException) {
+                recordAlertRefresh(currentSnapshot("unavailable"), requestedAt)
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                recordAlertRefresh(currentSnapshot("interrupted"), requestedAt)
+            } catch (e: Exception) {
+                Log.w(TAG, "告警前 NPU 补跑失败", e)
+                recordAlertRefresh(currentSnapshot("failed"), requestedAt)
             }
-        } catch (_: RejectedExecutionException) {
-            recordAlertRefresh(currentSnapshot("unavailable"), requestedAt)
-        } catch (e: InterruptedException) {
-            Thread.currentThread().interrupt()
-            recordAlertRefresh(currentSnapshot("interrupted"), requestedAt)
-        } catch (e: Exception) {
-            Log.w(TAG, "告警前 NPU 补跑失败", e)
-            recordAlertRefresh(currentSnapshot("failed"), requestedAt)
+        } finally {
+            pendingAlertRefreshes.decrementAndGet()
         }
     }
 
     /**
      * 守护启动时先完成一次可能较慢的首轮推理，避免第一个真实
-     * 告警把 RKNN/Bitmap 预热时间算进 300ms 等待上限。
+     * 告警把 RKNN/Bitmap 预热时间算进 450ms 等待上限。
      */
     fun warmUpForGuard(timeoutMs: Long = 8_000L): Boolean {
         val executor = scheduler
@@ -411,6 +425,13 @@ class NpuDetector(
         supervisionState = supervisionState,
         notificationsSuppressed = notificationsSuppressed
     )
+
+    /**
+     * 仅复制刚完成的陪护结果，不排队补跑。用于 NPU 状态回调线程内重新决策，
+     * 避免在同一个单线程执行器上等待自己而死锁。
+     */
+    fun currentDecisionSnapshot(refreshStatus: String = "current_state"): AlertVisionSnapshot =
+        currentSnapshot(refreshStatus)
 
     private fun recordAlertRefresh(
         snapshot: AlertVisionSnapshot,
@@ -533,8 +554,11 @@ class NpuDetector(
         personBoxes = immutableBoxes
         personCount = immutableBoxes.size
         adultLikePersonCount = immutableBoxes.count {
-            val area = it[2] * it[3]
-            it[3] >= deviceState.adultLikeMinHeight && area >= deviceState.adultLikeMinArea
+            AdultEvidencePolicy.isAdultLike(
+                box = it,
+                minHeight = deviceState.adultLikeMinHeight,
+                minArea = deviceState.adultLikeMinArea
+            )
         }
         collectAdultCalibration(immutableBoxes)
 

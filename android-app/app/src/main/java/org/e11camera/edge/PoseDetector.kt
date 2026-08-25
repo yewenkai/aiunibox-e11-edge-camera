@@ -44,6 +44,7 @@ class PoseDetector(
         private const val PERSON_THRESHOLD = 0.35f
         private const val NMS_IOU = 0.45f
         private const val FACE_THRESHOLD = 0.50f
+        private const val TARGET_MISS_LIMIT = 3
     }
 
     private data class PoseCandidate(
@@ -86,6 +87,8 @@ class PoseDetector(
     private var faceHandle = 0L
     private var faceInputW = DEFAULT_FACE_INPUT
     private var faceInputH = DEFAULT_FACE_INPUT
+    private var lastTargetBox = FloatArray(0)
+    private var targetMisses = 0
 
     @Volatile var modelLoaded: Boolean = false
         private set
@@ -122,6 +125,7 @@ class PoseDetector(
         synchronized(inferenceLock) {
             destroyModelsLocked()
             stateMachine.reset()
+            resetTargetTracking()
             latest = latest.copy(
                 rawPosture = PostureLabel.UNKNOWN,
                 stablePosture = PostureLabel.UNKNOWN,
@@ -192,6 +196,7 @@ class PoseDetector(
             synchronized(inferenceLock) {
                 destroyModelsLocked()
                 stateMachine.reset()
+                resetTargetTracking()
             }
         }
         return result
@@ -514,17 +519,28 @@ class PoseDetector(
     }
 
     private fun selectTarget(persons: List<PosePerson>): PosePerson? {
-        if (persons.isEmpty()) return null
-        if (persons.size == 1) return persons.single()
-        // 有多人时只用于影子展示；优先选择非成人体型且面积较小的候选作为宝宝近似目标。
-        val nonAdult = persons.filterNot(::isAdultLike)
-        return (nonAdult.ifEmpty { persons }).minByOrNull { it.box[2] * it.box[3] }
+        val selected = PoseTargetPolicy.select(persons, lastTargetBox, ::isAdultLike)
+        if (selected != null) {
+            lastTargetBox = selected.box.copyOf(4)
+            targetMisses = 0
+        } else {
+            targetMisses++
+            if (targetMisses >= TARGET_MISS_LIMIT) resetTargetTracking()
+        }
+        return selected
     }
 
     private fun isAdultLike(person: PosePerson): Boolean {
-        val box = person.box
-        return box[3] >= deviceState.adultLikeMinHeight &&
-            box[2] * box[3] >= deviceState.adultLikeMinArea
+        return AdultEvidencePolicy.isAdultLike(
+            box = person.box,
+            minHeight = deviceState.adultLikeMinHeight,
+            minArea = deviceState.adultLikeMinArea
+        )
+    }
+
+    private fun resetTargetTracking() {
+        lastTargetBox = FloatArray(0)
+        targetMisses = 0
     }
 
     private fun analyzeFaceOnDemand(bitmap: Bitmap, person: PosePerson): FacePass {
