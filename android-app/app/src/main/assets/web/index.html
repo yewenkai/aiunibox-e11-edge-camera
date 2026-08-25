@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <link rel="icon" href="data:,">
 <title>AIUniBOX-E11 Edge Camera</title>
 <style>
@@ -20,9 +20,20 @@
   .page-title { font-size: 15px; font-weight: 650; color: #dbeafe; }
 
   /* 视频 */
+  .video-stage {
+    position: relative; width: 100%; aspect-ratio: 16/9;
+  }
   .video-box {
-    position: relative; width: 100%; background: #000;
+    position: absolute; inset: 0; width: 100%; background: #000;
     border-radius: 12px; overflow: hidden; aspect-ratio: 16/9;
+    transform: translateZ(0);
+  }
+  .video-box.is-floating {
+    position: fixed; top: max(10px, env(safe-area-inset-top));
+    right: max(10px, env(safe-area-inset-right)); bottom: auto; left: auto;
+    width: min(340px, 42vw); z-index: 80;
+    border: 1px solid rgba(147,197,253,.45); border-radius: 10px;
+    box-shadow: 0 14px 42px rgba(0,0,0,.58), 0 0 0 1px rgba(15,23,42,.5);
   }
   .video-box canvas { width: 100%; height: 100%; display: block; }
   .video-box iframe, .video-box .stream-fallback {
@@ -256,6 +267,16 @@
   .pan-btn:active { background: #3d6dd6; }
   .pan-hint { color: #8f9bad; font-size: 12px; margin-top: 8px; text-align: center; }
 
+  .pan-section {
+    margin-top: 8px; padding: 11px 12px 10px;
+    background: linear-gradient(145deg, #182130 0%, #171c25 100%);
+    border: 1px solid #2a3850;
+  }
+  .pan-section .section-title { margin-bottom: 8px; color: #cbd5e1; font-size: 12px; }
+  .pan-section .pan-btn { height: 48px; border: 1px solid #3b465d; font-size: 16px; }
+  .pan-section .params { margin-top: 9px; }
+  .pan-section .pan-hint { margin-top: 6px; font-size: 10px; }
+
   .params {
     display: flex; gap: 14px; margin-top: 14px; justify-content: center; flex-wrap: wrap;
     font-size: 13px;
@@ -327,6 +348,11 @@
   }
   .toast.show { opacity: 1; }
   @media (max-width: 600px) {
+    .video-box.is-floating {
+      top: max(8px, env(safe-area-inset-top));
+      right: max(8px, env(safe-area-inset-right));
+      width: min(220px, 56vw); border-radius: 8px;
+    }
     .guardian-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .signal-card { min-height: 104px; }
     .event-head { align-items: flex-start; }
@@ -347,16 +373,50 @@
     <div class="page-title">AIUniBOX-E11 看护画面</div>
     <button class="refresh-page" id="refreshPage" type="button">↻ 刷新页面</button>
   </div>
-  <div class="video-box">
-    <iframe id="streamFrame" src="" title="实时看护画面" scrolling="no" allow="autoplay; picture-in-picture"></iframe>
-    <img class="stream-fallback" id="streamFallback" alt="实时画面低帧率兜底" hidden>
-    <canvas id="poseOverlay" aria-hidden="true"></canvas>
+  <div class="video-stage" id="videoStage">
+    <div class="video-box" id="videoBox">
+      <iframe id="streamFrame" src="" title="实时看护画面" scrolling="no" allow="autoplay; picture-in-picture"></iframe>
+      <img class="stream-fallback" id="streamFallback" alt="实时画面低帧率兜底" hidden>
+      <canvas id="poseOverlay" aria-hidden="true"></canvas>
+    </div>
   </div>
   <div class="stream-meta">
     <span class="badge off" id="liveBadge">● 设备连接中</span>
     <span class="stream-mode-badge" id="streamModeBadge" aria-live="polite">正在选择播放通道</span>
     <span class="fps-badge" id="fpsBadge">设备帧率 --</span>
     <span class="frame-health stale" id="frameHealth">等待首帧</span>
+  </div>
+
+  <!-- 云台：紧邻画面，调整方向时无需离开直播区域。 -->
+  <div class="section pan-section" id="panControls">
+    <div class="section-title">画面方向（云台）</div>
+    <div class="pan-grid">
+      <button class="pan-btn" id="btnLeft">◀ 画面向左</button>
+      <button class="pan-btn" id="btnRight">画面向右 ▶</button>
+    </div>
+    <div class="params">
+      <label>角度:
+        <select id="steps">
+          <option value="25">~3°</option>
+          <option value="41">~5°</option>
+          <option value="83" selected>~10°</option>
+          <option value="124">~15°</option>
+          <option value="249">~30°</option>
+          <option value="498">~60°</option>
+          <option value="747">~90°</option>
+          <option value="1493">~180°</option>
+        </select>
+      </label>
+      <label>速度:
+        <select id="speed">
+          <option value="200">慢</option>
+          <option value="400" selected>中</option>
+          <option value="600">快</option>
+          <option value="854">极速</option>
+        </select>
+      </label>
+    </div>
+    <div class="pan-hint">轻触点动，按住连续调整；方向按画面移动结果标注</div>
   </div>
 
   <div class="guardian-overview" id="guardianOverview">
@@ -444,38 +504,6 @@
       <input type="password" id="apiToken" placeholder="请输入部署时生成的 API Token">
       <button class="toggle-btn" id="saveToken">连接</button>
     </div>
-  </div>
-
-  <!-- 云台 -->
-  <div class="section">
-    <div class="section-title">云台控制（按画面移动方向）</div>
-    <div class="pan-grid">
-      <button class="pan-btn" id="btnLeft">◀ 画面向左</button>
-      <button class="pan-btn" id="btnRight">画面向右 ▶</button>
-    </div>
-    <div class="params">
-      <label>角度:
-        <select id="steps">
-          <option value="25">~3°</option>
-          <option value="41">~5°</option>
-          <option value="83" selected>~10°</option>
-          <option value="124">~15°</option>
-          <option value="249">~30°</option>
-          <option value="498">~60°</option>
-          <option value="747">~90°</option>
-          <option value="1493">~180°</option>
-        </select>
-      </label>
-      <label>速度:
-        <select id="speed">
-          <option value="200">慢</option>
-          <option value="400" selected>中</option>
-          <option value="600">快</option>
-          <option value="854">极速</option>
-        </select>
-      </label>
-    </div>
-    <div class="pan-hint">轻触点动，按住连续调整；已禁用会锁住电机的硬件复位</div>
   </div>
 
   <!-- 灯光 -->
@@ -1739,7 +1767,34 @@ function drawPoseOverlay(j) {
   }
 }
 
-window.addEventListener('resize', () => drawPoseOverlay(latestGuardianStatus || {}));
+// 页面向下浏览时复用当前播放器节点做轻量悬浮窗，不重载 iframe 或重新拉流。
+let floatingVideoFrame = 0;
+let videoIsFloating = false;
+
+function updateFloatingVideo() {
+  floatingVideoFrame = 0;
+  const stage = $('videoStage');
+  const video = $('videoBox');
+  const rect = stage.getBoundingClientRect();
+  const shouldFloat = window.scrollY > 0 && rect.top < 0 && rect.bottom <= 8;
+  if (shouldFloat === videoIsFloating) return;
+  videoIsFloating = shouldFloat;
+  video.classList.toggle('is-floating', shouldFloat);
+  window.requestAnimationFrame(() => drawPoseOverlay(latestGuardianStatus || {}));
+}
+
+function scheduleFloatingVideoUpdate() {
+  if (floatingVideoFrame) return;
+  floatingVideoFrame = window.requestAnimationFrame(updateFloatingVideo);
+}
+
+window.addEventListener('scroll', scheduleFloatingVideoUpdate, { passive: true });
+window.addEventListener('resize', () => {
+  scheduleFloatingVideoUpdate();
+  drawPoseOverlay(latestGuardianStatus || {});
+});
+window.addEventListener('pageshow', scheduleFloatingVideoUpdate);
+scheduleFloatingVideoUpdate();
 
 async function refreshStatus() {
   try {

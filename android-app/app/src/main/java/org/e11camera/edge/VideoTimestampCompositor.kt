@@ -45,8 +45,11 @@ class VideoTimestampCompositor(
         private val FULL_QUAD = floatArrayOf(
             -1f, -1f, 1f, -1f, -1f, 1f, 1f, 1f
         )
+        // 样机送入 SurfaceTexture 的编码画面相对 ImageReader/NPU 自然坐标为镜像。
+        // 这里只翻转摄像头纹理，让远程直播和事件短片恢复自然视角；随后单独绘制
+        // 的时间戳不会被翻转。本机 SurfaceView 仍保持适合面对设备操作的镜像效果。
         private val CAMERA_UV = floatArrayOf(
-            0f, 0f, 1f, 0f, 0f, 1f, 1f, 1f
+            1f, 0f, 0f, 0f, 1f, 1f, 0f, 1f
         )
         // Android Bitmap 的原点在左上，上传到 GLES 后需要翻转 V 轴。
         private val BITMAP_UV = floatArrayOf(
