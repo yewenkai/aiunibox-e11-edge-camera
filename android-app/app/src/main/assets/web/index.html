@@ -80,6 +80,37 @@
   }
   .refresh-page:active { background: #2563eb; }
 
+  /* 双向语音：紧邻画面但不覆盖视频，便于一边看一边对讲。 */
+  .intercom-bar {
+    margin-top: 8px; padding: 10px 11px; border-radius: 11px;
+    background: linear-gradient(145deg, #182130 0%, #151b24 100%);
+    border: 1px solid #2a3850;
+  }
+  .intercom-main {
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  }
+  .intercom-state { min-width: 0; }
+  .intercom-title { display: flex; align-items: center; gap: 7px; color: #e2e8f0; font-size: 12px; font-weight: 680; }
+  .intercom-dot { width: 7px; height: 7px; flex: none; border-radius: 50%; background: #64748b; }
+  .intercom-dot.on { background: #4ade80; box-shadow: 0 0 0 3px rgba(74,222,128,.12); }
+  .intercom-dot.talking { background: #f87171; box-shadow: 0 0 0 3px rgba(248,113,113,.14); }
+  .intercom-status { display: block; margin-top: 3px; color: #718096; font-size: 10px; line-height: 1.35; }
+  .intercom-actions { display: flex; align-items: stretch; gap: 7px; flex: none; }
+  .intercom-button {
+    min-height: 40px; padding: 7px 12px; border: 1px solid #40506a; border-radius: 9px;
+    color: #cbd5e1; background: #263248; font: inherit; font-size: 11px; font-weight: 650;
+    cursor: pointer; touch-action: manipulation;
+  }
+  .intercom-button.is-on { color: #dcfce7; background: #166534; border-color: rgba(74,222,128,.38); }
+  .intercom-button.ptt {
+    min-width: 112px; color: #fee2e2; background: #4c1d1d; border-color: rgba(248,113,113,.35);
+    touch-action: none; -webkit-touch-callout: none;
+  }
+  .intercom-button.ptt.is-pressed { color: #fff; background: #dc2626; transform: scale(.98); }
+  .intercom-button.ptt.is-unavailable { color: #94a3b8; background: #202938; border-color: #334155; }
+  .intercom-hint { margin-top: 7px; color: #64748b; font-size: 9px; line-height: 1.45; }
+  .intercom-hint.warn { color: #fbbf24; }
+
   /* 宝宝守护总览：先给结论，再展开设置。NPU 只作为上下文，不做硬门控。 */
   .guardian-overview {
     margin-top: 12px; padding: 14px; border-radius: 14px;
@@ -361,6 +392,9 @@
     .event-list { max-height: 52vh; }
     .calibration-steps { grid-template-columns: 1fr; }
     .health-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .intercom-main { align-items: flex-start; }
+    .intercom-actions { flex-direction: column; min-width: 128px; }
+    .intercom-button { min-height: 38px; }
   }
   @media (max-width: 420px) {
     .frame-health { width: 100%; margin-left: 0; text-align: right; }
@@ -385,6 +419,20 @@
     <span class="stream-mode-badge" id="streamModeBadge" aria-live="polite">正在选择播放通道</span>
     <span class="fps-badge" id="fpsBadge">设备帧率 --</span>
     <span class="frame-health stale" id="frameHealth">等待首帧</span>
+  </div>
+
+  <div class="intercom-bar" id="intercomBar">
+    <div class="intercom-main">
+      <div class="intercom-state">
+        <div class="intercom-title"><i class="intercom-dot" id="intercomDot"></i>双向语音</div>
+        <span class="intercom-status" id="intercomStatus">尚未连接语音通道</span>
+      </div>
+      <div class="intercom-actions">
+        <button class="intercom-button" id="listenDevice" type="button">监听设备</button>
+        <button class="intercom-button ptt" id="pushToTalk" type="button">按住说话</button>
+      </div>
+    </div>
+    <div class="intercom-hint" id="intercomHint">默认半双工：按住说话时自动暂停设备麦克风回传，防止扬声器啸叫。</div>
   </div>
 
   <!-- 云台：紧邻画面，调整方向时无需离开直播区域。 -->
@@ -886,6 +934,7 @@ $('saveToken').addEventListener('click', () => {
   apiToken = $('apiToken').value.trim();
   sessionStorage.setItem(tokenKey, apiToken);
   $('authSection').style.display = 'none';
+  resetIntercomSocket();
   refreshStatus();
 });
 
@@ -893,6 +942,433 @@ $('refreshPage').addEventListener('click', () => {
   $('refreshPage').textContent = '刷新中…';
   window.location.reload();
 });
+
+// ===== 双向语音：同源 WebSocket + 16kHz PCM16LE =====
+// 默认半双工：浏览器说话时，设备端暂停麦克风下行和哭声分析。
+const INTERCOM_SAMPLE_RATE = 16000;
+const INTERCOM_FRAME_SAMPLES = 320;
+let intercomSocket = null;
+let intercomSocketPromise = null;
+let intercomReconnectTimer = 0;
+let intercomHeartbeatTimer = 0;
+let shouldListenToDevice = false;
+let serverSaysListening = false;
+let talkPressed = false;
+let talkGranted = false;
+let latestIntercomStatus = {};
+
+let downlinkContext = null;
+let downlinkGain = null;
+let nextDownlinkAt = 0;
+
+let uplinkStream = null;
+let uplinkContext = null;
+let uplinkSource = null;
+let uplinkProcessor = null;
+let uplinkMute = null;
+let uplinkSamples = [];
+
+function browserMicrophoneAvailable() {
+  return window.isSecureContext === true && !!navigator.mediaDevices?.getUserMedia;
+}
+
+function intercomWebSocketUrl() {
+  const url = new URL('/intercom', location.href);
+  url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  if (apiToken) url.searchParams.set('token', apiToken);
+  return url.toString();
+}
+
+function sendIntercomControl(type, active) {
+  if (intercomSocket?.readyState !== WebSocket.OPEN) return false;
+  intercomSocket.send(JSON.stringify({ type, active }));
+  return true;
+}
+
+function startIntercomHeartbeat(socket) {
+  if (intercomHeartbeatTimer) window.clearInterval(intercomHeartbeatTimer);
+  intercomHeartbeatTimer = window.setInterval(() => {
+    if (intercomSocket === socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: 'ping' }));
+    }
+  }, 3000);
+}
+
+function stopIntercomHeartbeat() {
+  if (intercomHeartbeatTimer) window.clearInterval(intercomHeartbeatTimer);
+  intercomHeartbeatTimer = 0;
+}
+
+function ensureIntercomSocket() {
+  if (intercomSocket?.readyState === WebSocket.OPEN) return Promise.resolve(intercomSocket);
+  if (intercomSocketPromise) return intercomSocketPromise;
+
+  intercomSocketPromise = new Promise((resolve, reject) => {
+    const socket = new WebSocket(intercomWebSocketUrl());
+    let settled = false;
+    intercomSocket = socket;
+    socket.binaryType = 'arraybuffer';
+
+    socket.addEventListener('open', () => {
+      if (intercomSocket !== socket) {
+        settled = true;
+        socket.close(1000, 'superseded');
+        reject(new Error('intercom_socket_superseded'));
+        return;
+      }
+      settled = true;
+      intercomSocketPromise = null;
+      startIntercomHeartbeat(socket);
+      renderIntercomUi();
+      resolve(socket);
+    });
+    socket.addEventListener('message', handleIntercomMessage);
+    socket.addEventListener('error', () => {
+      if (!settled) {
+        settled = true;
+        if (intercomSocket === socket) intercomSocketPromise = null;
+        reject(new Error('intercom_socket_failed'));
+      }
+    });
+    socket.addEventListener('close', event => {
+      const wasCurrent = intercomSocket === socket;
+      if (!wasCurrent) {
+        if (!settled) {
+          settled = true;
+          reject(new Error(`intercom_closed_${event.code}`));
+        }
+        return;
+      }
+      intercomSocket = null;
+      stopIntercomHeartbeat();
+      intercomSocketPromise = null;
+      serverSaysListening = false;
+      if (talkPressed) stopPushToTalk(false);
+      latestIntercomStatus = { ...latestIntercomStatus, socketCloseCode: event.code };
+      if (event.code === 1008) {
+        shouldListenToDevice = false;
+        if (event.reason === 'unauthorized') {
+          $('authSection').style.display = 'block';
+          toast('请输入 API Token 后重试语音');
+        } else {
+          toast('语音连接被设备拒绝');
+        }
+      }
+      renderIntercomUi();
+      if (shouldListenToDevice) scheduleIntercomReconnect();
+      if (!settled) {
+        settled = true;
+        reject(new Error(`intercom_closed_${event.code}`));
+      }
+    });
+  });
+  return intercomSocketPromise;
+}
+
+function scheduleIntercomReconnect() {
+  if (intercomReconnectTimer || !shouldListenToDevice) return;
+  intercomReconnectTimer = window.setTimeout(async () => {
+    intercomReconnectTimer = 0;
+    if (!shouldListenToDevice) return;
+    try {
+      const socket = await ensureIntercomSocket();
+      socket.send(JSON.stringify({ type: 'listen', active: true }));
+    } catch (_) {
+      scheduleIntercomReconnect();
+    }
+  }, 1400);
+}
+
+function resetIntercomSocket() {
+  if (talkPressed) stopPushToTalk(false);
+  const socket = intercomSocket;
+  intercomSocket = null;
+  intercomSocketPromise = null;
+  stopIntercomHeartbeat();
+  if (socket && socket.readyState < WebSocket.CLOSING) socket.close(1000, 'reset');
+  if (shouldListenToDevice) scheduleIntercomReconnect();
+  renderIntercomUi();
+}
+
+function handleIntercomMessage(event) {
+  if (typeof event.data !== 'string') {
+    playDeviceAudio(event.data);
+    return;
+  }
+  let message;
+  try { message = JSON.parse(event.data); } catch (_) { return; }
+  if (message.type === 'status') {
+    latestIntercomStatus = { ...latestIntercomStatus, ...message };
+    serverSaysListening = message.listening === true;
+    talkGranted = talkPressed && message.talkOwner === true;
+    renderIntercomUi();
+    return;
+  }
+  if (message.type === 'talk-granted') {
+    talkGranted = talkPressed;
+    renderIntercomUi();
+    return;
+  }
+  if (message.type === 'error') {
+    if (message.code === 'talk_busy' || message.code === 'speaker_unavailable' ||
+        message.code === 'speaker_playback_failed') {
+      stopPushToTalk(false);
+    }
+    if (message.code === 'privacy_mode' || message.code === 'microphone_unavailable') {
+      shouldListenToDevice = false;
+      serverSaysListening = false;
+    }
+    toast(message.message || '语音通道异常');
+    renderIntercomUi();
+  }
+}
+
+async function ensureDownlinkAudio() {
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContextClass) throw new Error('audio_context_unavailable');
+  if (!downlinkContext || downlinkContext.state === 'closed') {
+    downlinkContext = new AudioContextClass({ latencyHint: 'interactive' });
+    downlinkGain = downlinkContext.createGain();
+    downlinkGain.gain.value = talkPressed ? 0 : 1;
+    downlinkGain.connect(downlinkContext.destination);
+    nextDownlinkAt = 0;
+  }
+  if (downlinkContext.state === 'suspended') await downlinkContext.resume();
+}
+
+function playDeviceAudio(arrayBuffer) {
+  if (!shouldListenToDevice || !downlinkContext || talkPressed) return;
+  const bytes = arrayBuffer instanceof ArrayBuffer ? arrayBuffer : null;
+  if (!bytes || bytes.byteLength < 2 || bytes.byteLength % 2 !== 0) return;
+  const view = new DataView(bytes);
+  const sampleCount = bytes.byteLength / 2;
+  const audioBuffer = downlinkContext.createBuffer(1, sampleCount, INTERCOM_SAMPLE_RATE);
+  const channel = audioBuffer.getChannelData(0);
+  for (let index = 0; index < sampleCount; index++) {
+    channel[index] = view.getInt16(index * 2, true) / 32768;
+  }
+  const source = downlinkContext.createBufferSource();
+  source.buffer = audioBuffer;
+  source.connect(downlinkGain);
+  const earliest = downlinkContext.currentTime + 0.045;
+  if (nextDownlinkAt < downlinkContext.currentTime || nextDownlinkAt - earliest > 0.45) {
+    nextDownlinkAt = earliest;
+  }
+  source.start(Math.max(earliest, nextDownlinkAt));
+  nextDownlinkAt = Math.max(earliest, nextDownlinkAt) + audioBuffer.duration;
+}
+
+function resampleForIntercom(input, sourceRate) {
+  if (sourceRate === INTERCOM_SAMPLE_RATE) return Float32Array.from(input);
+  const outputLength = Math.max(1, Math.round(input.length * INTERCOM_SAMPLE_RATE / sourceRate));
+  const output = new Float32Array(outputLength);
+  const ratio = sourceRate / INTERCOM_SAMPLE_RATE;
+  for (let index = 0; index < outputLength; index++) {
+    const position = Math.min(input.length - 1, index * ratio);
+    const left = Math.floor(position);
+    const right = Math.min(input.length - 1, left + 1);
+    const mix = position - left;
+    output[index] = input[left] * (1 - mix) + input[right] * mix;
+  }
+  return output;
+}
+
+function queueBrowserAudio(input, sourceRate) {
+  if (!talkPressed || !talkGranted || intercomSocket?.readyState !== WebSocket.OPEN) return;
+  const resampled = resampleForIntercom(input, sourceRate);
+  for (const sample of resampled) {
+    const limited = Math.max(-1, Math.min(1, sample));
+    uplinkSamples.push(limited < 0 ? Math.round(limited * 32768) : Math.round(limited * 32767));
+  }
+  while (uplinkSamples.length >= INTERCOM_FRAME_SAMPLES) {
+    const packet = new Int16Array(INTERCOM_FRAME_SAMPLES);
+    packet.set(uplinkSamples.splice(0, INTERCOM_FRAME_SAMPLES));
+    if (intercomSocket.bufferedAmount < 64 * 1024) intercomSocket.send(packet.buffer);
+  }
+}
+
+async function startBrowserCapture() {
+  if (uplinkStream) return;
+  if (!browserMicrophoneAvailable()) throw new Error('secure_context_required');
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: false,
+    audio: {
+      channelCount: 1,
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true
+    }
+  });
+  if (!talkPressed) {
+    stream.getTracks().forEach(track => track.stop());
+    return;
+  }
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContextClass) {
+    stream.getTracks().forEach(track => track.stop());
+    throw new Error('audio_context_unavailable');
+  }
+  uplinkStream = stream;
+  uplinkContext = new AudioContextClass({ latencyHint: 'interactive' });
+  await uplinkContext.resume();
+  uplinkSource = uplinkContext.createMediaStreamSource(stream);
+  // ScriptProcessor 虽已进入兼容维护阶段，但它仍是 iOS 主屏幕 Web App 最稳定的无外部文件方案。
+  uplinkProcessor = uplinkContext.createScriptProcessor(2048, 1, 1);
+  uplinkMute = uplinkContext.createGain();
+  uplinkMute.gain.value = 0;
+  uplinkProcessor.onaudioprocess = event => {
+    queueBrowserAudio(event.inputBuffer.getChannelData(0), uplinkContext.sampleRate);
+  };
+  uplinkSource.connect(uplinkProcessor);
+  uplinkProcessor.connect(uplinkMute);
+  uplinkMute.connect(uplinkContext.destination);
+}
+
+function stopBrowserCapture() {
+  uplinkSamples = [];
+  if (uplinkProcessor) {
+    uplinkProcessor.onaudioprocess = null;
+    try { uplinkProcessor.disconnect(); } catch (_) {}
+  }
+  try { uplinkSource?.disconnect(); } catch (_) {}
+  try { uplinkMute?.disconnect(); } catch (_) {}
+  uplinkStream?.getTracks().forEach(track => track.stop());
+  if (uplinkContext && uplinkContext.state !== 'closed') uplinkContext.close().catch(() => {});
+  uplinkStream = null;
+  uplinkContext = null;
+  uplinkSource = null;
+  uplinkProcessor = null;
+  uplinkMute = null;
+}
+
+async function beginPushToTalk(event) {
+  event?.preventDefault();
+  if (talkPressed) return;
+  if (!browserMicrophoneAvailable()) {
+    toast('浏览器麦克风需要 HTTPS 可信页面');
+    renderIntercomUi();
+    return;
+  }
+  talkPressed = true;
+  talkGranted = false;
+  if (downlinkGain) downlinkGain.gain.value = 0;
+  if (event?.pointerId !== undefined) {
+    try { $('pushToTalk').setPointerCapture(event.pointerId); } catch (_) {}
+  }
+  renderIntercomUi();
+  try {
+    // 先在用户按下的手势中申请权限，再等待网络，避免 iOS 丢失手势授权。
+    const capturePromise = startBrowserCapture();
+    const socketPromise = ensureIntercomSocket();
+    const [, socket] = await Promise.all([capturePromise, socketPromise]);
+    if (!talkPressed) return stopBrowserCapture();
+    socket.send(JSON.stringify({ type: 'talk', active: true }));
+  } catch (error) {
+    talkPressed = false;
+    talkGranted = false;
+    stopBrowserCapture();
+    if (downlinkGain) downlinkGain.gain.value = 1;
+    toast(error?.name === 'NotAllowedError' ? '未授权浏览器麦克风' : '语音通道连接失败');
+    renderIntercomUi();
+  }
+}
+
+function stopPushToTalk(notifyServer = true) {
+  if (!talkPressed && !uplinkStream) return;
+  talkPressed = false;
+  talkGranted = false;
+  if (notifyServer) sendIntercomControl('talk', false);
+  stopBrowserCapture();
+  if (downlinkGain) downlinkGain.gain.value = 1;
+  nextDownlinkAt = downlinkContext ? downlinkContext.currentTime + 0.06 : 0;
+  renderIntercomUi();
+}
+
+function renderIntercomUi() {
+  const socketOpen = intercomSocket?.readyState === WebSocket.OPEN;
+  const blocked = latestIntercomStatus.microphoneBlockedByPrivacy === true;
+  const microphoneMissing = latestIntercomStatus.microphoneAvailable === false;
+  const otherTalking = latestIntercomStatus.talkActive === true && !talkGranted;
+  const dot = $('intercomDot');
+  const status = $('intercomStatus');
+  const listen = $('listenDevice');
+  const ptt = $('pushToTalk');
+  const hint = $('intercomHint');
+
+  dot.classList.toggle('talking', talkPressed || otherTalking);
+  dot.classList.toggle('on', !talkPressed && !otherTalking && (serverSaysListening || socketOpen));
+  if (talkPressed) status.textContent = talkGranted ? '正在向设备扬声器说话' : '正在申请说话通道…';
+  else if (otherTalking) status.textContent = '另一个页面正在向设备说话';
+  else if (serverSaysListening) status.textContent = '正在监听设备麦克风';
+  else if (shouldListenToDevice) status.textContent = '正在连接设备麦克风…';
+  else if (socketOpen) status.textContent = '语音通道已就绪';
+  else status.textContent = '尚未连接语音通道';
+
+  listen.textContent = shouldListenToDevice ? '停止监听' : '监听设备';
+  listen.classList.toggle('is-on', shouldListenToDevice);
+  listen.disabled = blocked || microphoneMissing;
+  ptt.textContent = talkPressed ? (talkGranted ? '松开结束' : '连接中…') : '按住说话';
+  ptt.classList.toggle('is-pressed', talkPressed);
+  ptt.classList.toggle('is-unavailable', !browserMicrophoneAvailable());
+  ptt.setAttribute('aria-pressed', String(talkPressed));
+
+  hint.classList.remove('warn');
+  if (blocked) {
+    hint.textContent = '隐私模式禁止设备麦克风回传；仍可从网页向设备扬声器说话。';
+  } else if (microphoneMissing) {
+    hint.textContent = '设备端未授予 RECORD_AUDIO 权限：哭声检测和“监听设备”不可用，向设备扬声器说话不受影响。';
+    hint.classList.add('warn');
+  } else if (!browserMicrophoneAvailable()) {
+    hint.textContent = '当前是非可信 HTTP 页面：可监听设备，但浏览器会禁止“按住说话”；需从 HTTPS 反向代理入口打开。';
+    hint.classList.add('warn');
+  } else {
+    hint.textContent = '默认半双工：按住说话时自动暂停设备麦克风回传，防止扬声器啸叫。';
+  }
+}
+
+$('listenDevice').addEventListener('click', async () => {
+  if (shouldListenToDevice) {
+    shouldListenToDevice = false;
+    serverSaysListening = false;
+    sendIntercomControl('listen', false);
+    renderIntercomUi();
+    return;
+  }
+  try {
+    await ensureDownlinkAudio();
+    shouldListenToDevice = true;
+    renderIntercomUi();
+    const socket = await ensureIntercomSocket();
+    socket.send(JSON.stringify({ type: 'listen', active: true }));
+  } catch (_) {
+    shouldListenToDevice = false;
+    toast('无法启动设备监听');
+    renderIntercomUi();
+  }
+});
+
+const pushToTalkButton = $('pushToTalk');
+pushToTalkButton.addEventListener('pointerdown', beginPushToTalk);
+pushToTalkButton.addEventListener('pointerup', () => stopPushToTalk());
+pushToTalkButton.addEventListener('pointercancel', () => stopPushToTalk());
+pushToTalkButton.addEventListener('lostpointercapture', () => stopPushToTalk());
+pushToTalkButton.addEventListener('contextmenu', event => event.preventDefault());
+pushToTalkButton.addEventListener('keydown', event => {
+  if (!event.repeat && (event.key === ' ' || event.key === 'Enter')) beginPushToTalk(event);
+});
+pushToTalkButton.addEventListener('keyup', event => {
+  if (event.key === ' ' || event.key === 'Enter') stopPushToTalk();
+});
+window.addEventListener('blur', () => stopPushToTalk());
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) stopPushToTalk();
+});
+window.addEventListener('beforeunload', () => {
+  shouldListenToDevice = false;
+  stopPushToTalk();
+  if (intercomSocket?.readyState === WebSocket.OPEN) intercomSocket.close(1000, 'page_unload');
+});
+renderIntercomUi();
 
 // ===== 可解释事件时间线（日期和时间固定按东八区显示） =====
 const shanghaiDateTime = new Intl.DateTimeFormat('zh-CN', {
@@ -1802,6 +2278,8 @@ async function refreshStatus() {
     const j = await api('/api/status');
     if (!j) return;
     latestGuardianStatus = j;
+    latestIntercomStatus = { ...latestIntercomStatus, ...(j.intercom || {}) };
+    renderIntercomUi();
     renderCalibration(j.sceneCalibration || {});
     const now = Date.now();
     const elapsed = Math.max((now - lastStatusAt) / 1000, 0.1);

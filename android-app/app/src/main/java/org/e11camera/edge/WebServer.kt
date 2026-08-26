@@ -3,18 +3,21 @@ package org.e11camera.edge
 import android.content.Context
 import android.util.Log
 import fi.iki.elonen.NanoHTTPD
+import fi.iki.elonen.NanoWSD
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayInputStream
 import java.io.FileInputStream
 import java.io.FilterInputStream
+import java.io.IOException
 import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.UUID
 
 /**
- * 内嵌 HTTP 服务器（NanoHTTPD）。
- * 提供控制网页 + MJPEG 视频流 + REST API。
+ * 内嵌 HTTP/WebSocket 服务器（NanoHTTPD/NanoWSD）。
+ * 提供控制网页、视频流、REST API 与局域网双向语音。
  *
  * 路由：
  *  GET /                 控制网页
@@ -34,6 +37,7 @@ import java.net.URL
  *  GET /api/health       滚动 24 小时摄像头、NPU、音频与存储健康统计
  *  GET /event-clip       ?id=EVENT_ID，支持 HTTP Range
  *  GET /api/status       状态 JSON
+ *  WS  /intercom         16kHz PCM16LE 双向语音（默认半双工）
  */
 class WebServer(
     private val context: Context,
@@ -41,16 +45,76 @@ class WebServer(
     private val motor: MotorController,
     private val state: DeviceStateStore,
     private val security: ApiSecurity,
+    private val intercom: IntercomController,
     port: Int = 8080
-) : NanoHTTPD(port) {
+) : NanoWSD(port) {
 
     companion object {
         private const val TAG = "WebServer"
         private const val BOUNDARY = "e11frame"
     }
 
+    override fun openWebSocket(handshake: IHTTPSession): WebSocket = IntercomSocket(handshake)
+
+    private inner class IntercomSocket(
+        handshake: IHTTPSession
+    ) : WebSocket(handshake), IntercomController.Peer {
+        override val id: String = UUID.randomUUID().toString()
+        private var registered = false
+
+        override fun onOpen() {
+            val handshake = handshakeRequest
+            if (handshake.uri != "/intercom") {
+                close(WebSocketFrame.CloseCode.PolicyViolation, "unsupported_endpoint", false)
+                return
+            }
+            if (!security.isAuthorized(handshake)) {
+                close(WebSocketFrame.CloseCode.PolicyViolation, "unauthorized", false)
+                return
+            }
+            registered = true
+            intercom.register(this)
+            Log.i(TAG, "双向语音客户端已连接")
+        }
+
+        override fun onMessage(message: WebSocketFrame) {
+            if (!registered) return
+            when (message.opCode) {
+                WebSocketFrame.OpCode.Text -> intercom.handleText(id, message.textPayload)
+                WebSocketFrame.OpCode.Binary -> intercom.handleAudio(id, message.binaryPayload)
+                else -> close(WebSocketFrame.CloseCode.UnsupportedData, "text_or_binary_required", false)
+            }
+        }
+
+        override fun onClose(
+            code: WebSocketFrame.CloseCode,
+            reason: String,
+            initiatedByRemote: Boolean
+        ) {
+            if (registered) intercom.unregister(id)
+            registered = false
+            Log.i(TAG, "双向语音客户端已断开 code=${code.value}")
+        }
+
+        override fun onPong(pong: WebSocketFrame) = Unit
+
+        override fun onException(exception: IOException) {
+            if (registered) intercom.unregister(id)
+            registered = false
+            Log.w(TAG, "双向语音 WebSocket 异常: ${exception.message}")
+        }
+
+        override fun sendText(payload: String) {
+            send(payload)
+        }
+
+        override fun sendAudio(payload: ByteArray) {
+            send(payload)
+        }
+    }
+
     @Throws(Exception::class)
-    override fun serve(session: IHTTPSession): Response {
+    override fun serveHttp(session: IHTTPSession): Response {
         val uri = session.uri
         val params = session.parms
         if (uri.startsWith(HlsProxyPolicy.PUBLIC_CAMERA_PREFIX)) {
@@ -639,7 +703,7 @@ class WebServer(
                 .put("name", "AIUniBOX-E11 Edge Camera")
                 .put("model", android.os.Build.MODEL)
                 .put("deviceId", id)
-                .put("apiVersion", 9)
+                .put("apiVersion", 10)
                 .put("appVersion", BuildConfig.VERSION_NAME)
                 .put("authRequired", security.isEnabled)
                 .toString()
@@ -668,6 +732,7 @@ class WebServer(
         val poseTargetBox = JSONArray(poseSnapshot.targetBox.toList())
         val poseDiagnostics = service?.poseDiagnosticsSummary()
         val clipStorage = service?.guardianClipStorageInfo()
+        val intercomStatus = service?.intercomStatus() ?: IntercomStatus()
         return json(JSONObject()
             .put("ok", true)
             .put("ip", ip)
@@ -763,6 +828,22 @@ class WebServer(
             .put("guardianEventCount", service?.guardianEvents(200)?.size ?: 0)
             .put("guardianClipCount", clipStorage?.clipCount ?: 0)
             .put("guardianClipBytes", clipStorage?.totalBytes ?: 0L)
+            .put(
+                "intercom",
+                JSONObject()
+                    .put("connectedClients", intercomStatus.connectedClients)
+                    .put("listeners", intercomStatus.listeners)
+                    .put("talkActive", intercomStatus.talkActive)
+                    .put("microphoneAvailable", intercomStatus.microphoneAvailable)
+                    .put("microphoneRunning", intercomStatus.microphoneRunning)
+                    .put("microphoneBlockedByPrivacy", intercomStatus.microphoneBlockedByPrivacy)
+                    .put("crySuppressedByPlayback", intercomStatus.crySuppressedByPlayback)
+                    .put("lastDeviceAudioAt", intercomStatus.lastDeviceAudioAt)
+                    .put("lastBrowserAudioAt", intercomStatus.lastBrowserAudioAt)
+                    .put("droppedUplinkFrames", intercomStatus.droppedUplinkFrames)
+                    .put("droppedDownlinkFrames", intercomStatus.droppedDownlinkFrames)
+                    .put("lastError", intercomStatus.lastError)
+            )
             .apply { service?.let { put("sceneCalibration", calibrationJson(it)) } }
             .toString()
         )

@@ -37,6 +37,7 @@ import kotlinx.coroutines.delay
 class MainActivity : ComponentActivity() {
 
     private var permissionGranted = mutableStateOf(false)
+    private var microphonePermissionGranted = mutableStateOf(false)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -54,6 +55,7 @@ class MainActivity : ComponentActivity() {
                     AppScreen(
                         ip = NetworkUtil.getIpAddress(this),
                         permissionGranted = permissionGranted.value,
+                        microphonePermissionGranted = microphonePermissionGranted.value,
                         onRequestPermission = { requestPermission() },
                         onStartService = { startMonitorService() },
                         onStopService = { stopMonitorService() }
@@ -67,11 +69,17 @@ class MainActivity : ComponentActivity() {
         permissionGranted.value = ContextCompat.checkSelfPermission(
             this, Manifest.permission.CAMERA
         ) == PackageManager.PERMISSION_GRANTED
+        microphonePermissionGranted.value = ContextCompat.checkSelfPermission(
+            this, Manifest.permission.RECORD_AUDIO
+        ) == PackageManager.PERMISSION_GRANTED
     }
 
     private fun requestPermission() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            requestPermissions(arrayOf(Manifest.permission.CAMERA), 1)
+            requestPermissions(
+                arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO),
+                1
+            )
         }
     }
 
@@ -101,6 +109,7 @@ class MainActivity : ComponentActivity() {
 private fun AppScreen(
     ip: String,
     permissionGranted: Boolean,
+    microphonePermissionGranted: Boolean,
     onRequestPermission: () -> Unit,
     onStartService: () -> Unit,
     onStopService: () -> Unit
@@ -161,13 +170,24 @@ private fun AppScreen(
         // 权限提示
         if (!permissionGranted) {
             Text(
-                "需要摄像头权限",
+                "需要摄像头权限；双向语音还需要麦克风权限",
                 color = MaterialTheme.colorScheme.error,
                 fontSize = 14.sp
             )
             Spacer(Modifier.height(8.dp))
             Button(onClick = onRequestPermission) {
                 Text("授予权限")
+            }
+            Spacer(Modifier.height(24.dp))
+        } else if (!microphonePermissionGranted) {
+            Text(
+                "麦克风未授权：哭声检测和网页监听不可用",
+                color = MaterialTheme.colorScheme.error,
+                fontSize = 14.sp
+            )
+            Spacer(Modifier.height(8.dp))
+            Button(onClick = onRequestPermission) {
+                Text("授予麦克风权限")
             }
             Spacer(Modifier.height(24.dp))
         }

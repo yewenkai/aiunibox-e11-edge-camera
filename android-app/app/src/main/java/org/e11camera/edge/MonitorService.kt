@@ -40,6 +40,8 @@ class MonitorService : Service() {
     private var deviceState: DeviceStateStore? = null
     private var motionDetector: MotionDetector? = null
     private var cryDetector: CryDetector? = null
+    private var microphoneAudioSource: MicrophoneAudioSource? = null
+    private var intercomController: IntercomController? = null
     private var npuDetector: NpuDetector? = null
     private var poseDetector: PoseDetector? = null
     private var poseDiagnostics: PoseDiagnosticsStore? = null
@@ -84,6 +86,10 @@ class MonitorService : Service() {
             val clipRecorder = EventClipRecorder(eventStore)
             val diagnostics = HealthDiagnostics(this)
             val poseStats = PoseDiagnosticsStore(this)
+            val microphone = MicrophoneAudioSource(this)
+            val intercom = IntercomController(microphone) { state.privacyMode }
+            microphoneAudioSource = microphone
+            intercomController = intercom
             val motion = MotionDetector(s, state, m) {
                 notifyGuardianEvent(
                     kind = "motion",
@@ -91,7 +97,12 @@ class MonitorService : Service() {
                     summary = "画面检测到持续动作"
                 )
             }
-            val cry = CryDetector(this, state) { score ->
+            val cry = CryDetector(
+                context = this,
+                state = state,
+                microphone = microphone,
+                isLocalPlaybackActive = { intercom.isCrySuppressedByPlayback() }
+            ) { score ->
                 notifyGuardianEvent(
                     kind = "cry",
                     title = "宝宝守护：检测到疑似哭声",
@@ -107,7 +118,7 @@ class MonitorService : Service() {
             }
 
             // 局域网 HTTP 控制服务。
-            val srv = WebServer(this, s, m, state, ApiSecurity(), PORT)
+            val srv = WebServer(this, s, m, state, ApiSecurity(), intercom, PORT)
             srv.start(NanoHTTPD.SOCKET_READ_TIMEOUT, false)
             Log.i(TAG, "HTTP 服务已启动，端口 $PORT")
 
@@ -183,23 +194,23 @@ class MonitorService : Service() {
     }
 
     private fun cleanupResources() {
-        try {
-            rtspPublisher?.stop()
-            eventClipRecorder?.release()
-            motionDetector?.stop()
-            cryDetector?.stop()
-            npuDetector?.stop()
-            poseDetector?.stop()
-            viewerWatcher?.stop()
-            server?.stop()
-            streamer?.stop()
-            motor?.shutdown()
-        } catch (e: Exception) {
-            Log.w(TAG, "停止异常", e)
-        }
+        cleanupSafely("HTTP 服务") { server?.stop() }
+        cleanupSafely("RTSP 推流") { rtspPublisher?.stop() }
+        cleanupSafely("事件短片") { eventClipRecorder?.release() }
+        cleanupSafely("动作检测") { motionDetector?.stop() }
+        cleanupSafely("NPU 人体检测") { npuDetector?.stop() }
+        cleanupSafely("NPU 姿态检测") { poseDetector?.stop() }
+        cleanupSafely("观看状态") { viewerWatcher?.stop() }
+        cleanupSafely("网页对讲") { intercomController?.shutdown() }
+        cleanupSafely("哭声检测") { cryDetector?.stop() }
+        cleanupSafely("共享麦克风") { microphoneAudioSource?.shutdown() }
+        cleanupSafely("摄像头编码") { streamer?.stop() }
+        cleanupSafely("云台电机") { motor?.shutdown() }
         rtspPublisher = null
         motionDetector = null
         cryDetector = null
+        intercomController = null
+        microphoneAudioSource = null
         npuDetector = null
         poseDetector = null
         poseDiagnostics = null
@@ -211,6 +222,14 @@ class MonitorService : Service() {
         streamer = null
         motor = null
         deviceState = null
+    }
+
+    private inline fun cleanupSafely(name: String, action: () -> Unit) {
+        try {
+            action()
+        } catch (e: Exception) {
+            Log.w(TAG, "$name 停止异常", e)
+        }
     }
 
     /** 获取采集器（供 MainActivity 设置预览 Surface） */
@@ -261,7 +280,10 @@ class MonitorService : Service() {
     fun setPrivacyMode(enabled: Boolean): Boolean {
         val s = streamer ?: return false
         val state = deviceState ?: return false
-        if (state.privacyMode == enabled) return true
+        if (state.privacyMode == enabled) {
+            intercomController?.onPrivacyChanged()
+            return true
+        }
 
         state.privacyMode = enabled
         if (enabled) {
@@ -276,6 +298,7 @@ class MonitorService : Service() {
                 startConfiguredGuardianMonitoring(s)
             }
         }
+        intercomController?.onPrivacyChanged()
         return true
     }
 
@@ -464,6 +487,8 @@ class MonitorService : Service() {
     fun cryTopClassScore(): Float = cryDetector?.topClassScore ?: 0f
 
     fun cryAnalyzedAt(): Long = cryDetector?.lastAnalyzedAt ?: 0L
+
+    fun intercomStatus(): IntercomStatus = intercomController?.status() ?: IntercomStatus()
 
     fun isNpuModelLoaded(): Boolean = npuDetector?.modelLoaded == true
 

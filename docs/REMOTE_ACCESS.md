@@ -39,6 +39,18 @@ HLS 使用普通 fMP4 分片，优先兼容多层 HTTP 代理；通常会比内�
 网页把“设备编码状态”和“浏览器播放通道”分开显示，设备 30fps 不再被误解为浏览器
 已经成功播放。
 
+## 双向语音的远程入口
+
+双向语音不经过 MediaMTX，使用控制页同源的 `/intercom` WebSocket。极空间一类
+远程代理需同时满足：
+
+- 能够把 `/intercom` 的 `Connection: Upgrade` 和 `Upgrade: websocket` 透传到设备 `8080`。
+- 外层页面是浏览器信任的 HTTPS，这样 iOS/Chrome 才会授予网页麦克风。
+
+如果代理不支持 WebSocket Upgrade，视频 HLS 仍可以正常播放，只有双向语音显示
+“通道连接失败”。如果直接用普通局域网 HTTP 打开，设备麦克风到浏览器的监听可用，
+但浏览器麦克风上行会被安全上下文规则拒绝。应用不会因此在设备内启动自签名 HTTPS。
+
 ## 部署与检查
 
 需要同时更新 APK、`mediamtx.yml` 和 `service.sh`。若设备沿用旧版 `ptz_rtsp` Magisk

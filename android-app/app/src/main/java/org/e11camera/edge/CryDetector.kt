@@ -1,19 +1,14 @@
 package org.e11camera.edge
 
-import android.Manifest
-import android.annotation.SuppressLint
 import android.content.Context
-import android.content.pm.PackageManager
-import android.media.AudioFormat
-import android.media.AudioRecord
-import android.media.MediaRecorder
 import android.util.Log
-import androidx.core.content.ContextCompat
 import org.tensorflow.lite.Interpreter
 import java.io.File
 import java.io.RandomAccessFile
 import java.nio.MappedByteBuffer
 import java.nio.channels.FileChannel
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.TimeUnit
 import kotlin.math.sqrt
 
 data class CryCalibrationStatus(
@@ -44,11 +39,12 @@ data class CryCalibrationStatus(
 class CryDetector(
     private val context: Context,
     private val state: DeviceStateStore,
+    private val microphone: MicrophoneAudioSource,
+    private val isLocalPlaybackActive: () -> Boolean,
     private val onTriggered: (Float) -> Unit
 ) {
     companion object {
         private const val TAG = "CryDetector"
-        private const val SAMPLE_RATE = 16000
         private const val WINDOW_SAMPLES = 15600 // 0.975s，YAMNet 输入长度
         private const val HOP_SAMPLES = WINDOW_SAMPLES / 2 // 50% 重叠，约 0.49s 步进
 
@@ -84,6 +80,8 @@ class CryDetector(
     @Volatile
     private var running = false
     private var thread: Thread? = null
+    private val audioQueue = ArrayBlockingQueue<ShortArray>(100)
+    @Volatile private var microphoneSubscription: MicrophoneAudioSource.Subscription? = null
 
     @Volatile
     private var inCryEpisode = false
@@ -129,9 +127,7 @@ class CryDetector(
 
     fun start() {
         if (running) return
-        if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO)
-            != PackageManager.PERMISSION_GRANTED
-        ) {
+        if (!microphone.hasPermission) {
             Log.w(TAG, "缺少 RECORD_AUDIO 权限，哭声检测停用")
             return
         }
@@ -140,6 +136,7 @@ class CryDetector(
             return
         }
         temporalPolicy.reset()
+        audioQueue.clear()
         running = true
         thread = Thread { loop(model) }.apply { start() }
     }
@@ -147,6 +144,9 @@ class CryDetector(
     fun stop() {
         running = false
         cancelCalibration()
+        microphoneSubscription?.close()
+        microphoneSubscription = null
+        audioQueue.clear()
         thread?.interrupt()
         thread = null
         inCryEpisode = false
@@ -255,101 +255,117 @@ class CryDetector(
         }
     }
 
-    @SuppressLint("MissingPermission")
     private fun loop(model: MappedByteBuffer) {
         var interpreter: Interpreter? = null
-        var record: AudioRecord? = null
-        val buf = FloatArray(WINDOW_SAMPLES)
+        val assembler = PcmWindowAssembler(WINDOW_SAMPLES, HOP_SAMPLES)
         val input = Array(1) { FloatArray(WINDOW_SAMPLES) }
         val inputs = arrayOf<Any>(input)
         val output = Array(1) { FloatArray(521) }
         val outputs = mapOf<Int, Any>(0 to output)
-        var retainedSamples = 0
         var skippedSilentWindows = 0
         try {
             interpreter = Interpreter(model, Interpreter.Options().apply { setNumThreads(1) })
             modelLoaded = true
-            val minBuf = AudioRecord.getMinBufferSize(
-                SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_FLOAT
-            )
-            record = AudioRecord(
-                MediaRecorder.AudioSource.VOICE_RECOGNITION, SAMPLE_RATE,
-                AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_FLOAT,
-                maxOf(minBuf, WINDOW_SAMPLES * 4)
-            )
-            if (record.state != AudioRecord.STATE_INITIALIZED) {
-                Log.w(TAG, "AudioRecord 初始化失败，哭声检测停用")
+            microphoneSubscription = microphone.subscribe("cry-detector") { samples ->
+                if (!running) return@subscribe
+                if (!audioQueue.offer(samples)) {
+                    audioQueue.poll()
+                    audioQueue.offer(samples)
+                }
+            }
+            if (microphoneSubscription == null) {
+                Log.w(TAG, "共享麦克风初始化失败，哭声检测停用")
                 return
             }
-            record.startRecording()
-            Log.i(TAG, "哭声检测已启动（YAMNet，16kHz 单声道，0.975s 窗口/0.49s 步进）")
+            Log.i(TAG, "哭声检测已启动（复用共享麦克风，0.975s 窗口/0.49s 步进）")
             while (running && !Thread.currentThread().isInterrupted) {
-                var off = retainedSamples
-                while (off < WINDOW_SAMPLES && running) {
-                    val n = record.read(buf, off, WINDOW_SAMPLES - off, AudioRecord.READ_BLOCKING)
-                    if (n <= 0) break
-                    off += n
-                }
-                if (off < WINDOW_SAMPLES) break
-
-                var sum = 0.0
-                for (v in buf) sum += v.toDouble() * v
-                val rms = sqrt(sum / WINDOW_SAMPLES).toFloat()
-                lastAudioRms = rms
-                lastAnalyzedAt = System.currentTimeMillis()
-                val calibrating = isCalibrating()
-                val threshold = currentThreshold
-                val forceSilentCheck = skippedSilentWindows >= SILENT_FORCE_INTERVAL_WINDOWS - 1
-                if (rms < silenceRmsGate && !calibrating && !forceSilentCheck) {
-                    skippedSilentWindows++
+                val samples = audioQueue.poll(1, TimeUnit.SECONDS) ?: continue
+                if (isLocalPlaybackActive()) {
+                    assembler.reset()
+                    skippedSilentWindows = 0
                     lastCryScore = 0f
                     topClassIndex = -1
                     topClassScore = 0f
-                    handleWindow(temporalPolicy.push(0f, threshold), cry = 0f)
-                } else {
-                    skippedSilentWindows = 0
-                    input[0] = buf.copyOf()
-                    interpreter.runForMultipleInputsOutputs(inputs, outputs)
-                    // 模型元数据明确说明 scores 已在 0..1 范围；再次 softmax 会把
-                    // 521 类压到约 1/521，导致哭声分数恒定在约 0.01、永远无法触发。
-                    val scores = output[0]
-                    var cry = 0f
-                    for (i in CRY_LABELS) cry = maxOf(cry, scores[i])
-                    var topIdx = 0
-                    for (i in scores.indices) if (scores[i] > scores[topIdx]) topIdx = i
-                    lastCryScore = cry
-                    topClassIndex = topIdx
-                    topClassScore = scores[topIdx]
-                    Log.i(
-                        TAG,
-                        "音频窗口 rms=${"%.3f".format(rms)} cry=${"%.3f".format(cry)} " +
-                            "threshold=${"%.2f".format(threshold)} top=$topIdx(${"%.3f".format(scores[topIdx])})"
-                    )
-
-                    if (calibrating) {
-                        collectCalibration(rms, cry)
-                        temporalPolicy.reset()
-                        handleWindow(isCry = false, cry = 0f)
-                    } else {
-                        handleWindow(temporalPolicy.push(cry, threshold), cry)
-                    }
+                    lastAnalyzedAt = System.currentTimeMillis()
+                    temporalPolicy.reset()
+                    handleWindow(isCry = false, cry = 0f)
+                    continue
                 }
-
-                System.arraycopy(buf, HOP_SAMPLES, buf, 0, WINDOW_SAMPLES - HOP_SAMPLES)
-                retainedSamples = WINDOW_SAMPLES - HOP_SAMPLES
+                assembler.push(samples) { window ->
+                    skippedSilentWindows = analyzeWindow(
+                        window = window,
+                        interpreter = interpreter,
+                        input = input,
+                        inputs = inputs,
+                        output = output,
+                        outputs = outputs,
+                        skippedSilentWindows = skippedSilentWindows
+                    )
+                }
             }
         } catch (e: Exception) {
             Log.w(TAG, "哭声检测异常退出: ${e.message}", e)
         } finally {
             modelLoaded = false
-            try {
-                record?.stop()
-            } catch (_: Exception) {
-            }
-            record?.release()
+            microphoneSubscription?.close()
+            microphoneSubscription = null
+            audioQueue.clear()
             interpreter?.close()
             Log.i(TAG, "哭声检测已停止")
         }
+    }
+
+    private fun analyzeWindow(
+        window: FloatArray,
+        interpreter: Interpreter,
+        input: Array<FloatArray>,
+        inputs: Array<Any>,
+        output: Array<FloatArray>,
+        outputs: Map<Int, Any>,
+        skippedSilentWindows: Int
+    ): Int {
+        var sum = 0.0
+        for (value in window) sum += value.toDouble() * value
+        val rms = sqrt(sum / WINDOW_SAMPLES).toFloat()
+        lastAudioRms = rms
+        lastAnalyzedAt = System.currentTimeMillis()
+        val calibrating = isCalibrating()
+        val threshold = currentThreshold
+        val forceSilentCheck = skippedSilentWindows >= SILENT_FORCE_INTERVAL_WINDOWS - 1
+        if (rms < silenceRmsGate && !calibrating && !forceSilentCheck) {
+            lastCryScore = 0f
+            topClassIndex = -1
+            topClassScore = 0f
+            handleWindow(temporalPolicy.push(0f, threshold), cry = 0f)
+            return skippedSilentWindows + 1
+        }
+
+        System.arraycopy(window, 0, input[0], 0, window.size)
+        interpreter.runForMultipleInputsOutputs(inputs, outputs)
+        // 模型元数据明确说明 scores 已在 0..1 范围；再次 softmax 会把
+        // 521 类压到约 1/521，导致哭声分数恒定在约 0.01。
+        val scores = output[0]
+        var cry = 0f
+        for (index in CRY_LABELS) cry = maxOf(cry, scores[index])
+        var topIndex = 0
+        for (index in scores.indices) if (scores[index] > scores[topIndex]) topIndex = index
+        lastCryScore = cry
+        topClassIndex = topIndex
+        topClassScore = scores[topIndex]
+        Log.i(
+            TAG,
+            "音频窗口 rms=${"%.3f".format(rms)} cry=${"%.3f".format(cry)} " +
+                "threshold=${"%.2f".format(threshold)} top=$topIndex(${"%.3f".format(scores[topIndex])})"
+        )
+
+        if (calibrating) {
+            collectCalibration(rms, cry)
+            temporalPolicy.reset()
+            handleWindow(isCry = false, cry = 0f)
+        } else {
+            handleWindow(temporalPolicy.push(cry, threshold), cry)
+        }
+        return 0
     }
 
     /** 事件逻辑：哭声窗口立即触发推送；安静超过 EPISODE_GAP 后事件结束。 */

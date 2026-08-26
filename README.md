@@ -27,6 +27,8 @@ GitHub Actions 仅验证源码是否可以编译，不上传 APK 或其他构建
 - GPU 零拷贝前置合成东八区日期时间，时间戳进入 H.264 画面，可用于全屏、画中画和录像
 - 设备本机前置预览保持镜像；编码时只翻转摄像头纹理，网页、RTSP 和事件短片恢复自然视角，时间戳保持正向
 - RTSP、内网 WebRTC 与远程同源 HLS 播放
+- 网页双向语音：可监听设备麦克风，也可按住说话由设备扬声器播放；默认半双工避免啸叫
+- 哭声检测与网页监听共用唯一麦克风采集链路，设备播放对讲声时自动抑制哭声误报
 - 内置局域网控制页，含独立的整页刷新按钮；云台按钮紧邻画面，向下浏览时直播自动缩为右上角悬浮窗
 - App 前台 4:3 本地回显
 - 水平云台点动与长按连续调整
@@ -72,6 +74,10 @@ GitHub Actions 仅验证源码是否可以编译，不上传 APK 或其他构建
 
 浏览器控制页 ──> NanoHTTPD API ──> 云台 / LED / IR-CUT
        └──────> /media/cam 同源代理 ──> MediaMTX HLS
+
+设备麦克风 ──> 共享 PCM16 采集 ─┬─> YAMNet 哭声分析
+                                   └─> WebSocket 网页监听
+浏览器麦克风 ──> WebSocket PCM16 ──> AudioTrack 设备扬声器
 ```
 
 ## 已验证硬件
@@ -115,6 +121,7 @@ cd android-app
 ./gradlew assembleDebug
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 adb shell pm grant org.e11camera.edge android.permission.CAMERA
+adb shell pm grant org.e11camera.edge android.permission.RECORD_AUDIO
 ```
 
 首次执行硬件控制时，需要在 Magisk 中授予应用 root 权限。若设备中已有其他进程独占摄像头，应先通过设备自身设置安全地停止该进程；本仓库不提供针对特定商业应用的修改或破解文件。
@@ -139,6 +146,11 @@ NPU、YAMNet 和 MediaMTX 都是可选的本地组件，仓库不提供对应模
 代理访问时，无论外层是 HTTP 还是 HTTPS，都会自动切换到同源 HLS。设备不需要配置
 自签名 HTTPS，远程入口也不需要单独转发 8888、8889 或 8189。部署与排障见
 [远程网页与同源 HLS](docs/REMOTE_ACCESS.md)。
+
+双向语音使用控制页同源的 `/intercom` WebSocket。纯 HTTP 局域网页可以监听设备，
+但 iOS/Chrome 会拒绝向非可信页面授予浏览器麦克风；“按住说话”需通过可信 HTTPS
+反向代理入口使用，且代理需支持 WebSocket Upgrade。应用不强制开启自签名 HTTPS。
+协议与验收项见[局域网双向语音](docs/INTERCOM.md)。
 
 ### 启用 API Token
 
