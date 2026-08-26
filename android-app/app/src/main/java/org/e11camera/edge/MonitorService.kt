@@ -11,7 +11,9 @@ import android.os.IBinder
 import android.util.Log
 import fi.iki.elonen.NanoHTTPD
 import java.util.concurrent.Executors
+import java.util.concurrent.Future
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * 监控前台服务：持有摄像头采集器 + Web 服务器生命周期。
@@ -51,6 +53,9 @@ class MonitorService : Service() {
     private var healthDiagnostics: HealthDiagnostics? = null
     private var startedAtMs: Long = 0
     private val healthScheduler = Executors.newSingleThreadScheduledExecutor()
+    private val guardianStartupExecutor = Executors.newSingleThreadExecutor()
+    private val guardianStartupGeneration = AtomicLong(0)
+    @Volatile private var guardianStartupFuture: Future<*>? = null
     @Volatile private var lastSuppressedAlertAt: Long = 0
     @Volatile private var lastPostureAlertAt: Long = 0
     @Volatile private var lastPostureSuppressedAt: Long = 0
@@ -189,11 +194,13 @@ class MonitorService : Service() {
         Log.i(TAG, "MonitorService onDestroy")
         healthScheduler.shutdownNow()
         cleanupResources()
+        guardianStartupExecutor.shutdownNow()
         instance = null
         super.onDestroy()
     }
 
     private fun cleanupResources() {
+        cancelGuardianStartup()
         cleanupSafely("HTTP 服务") { server?.stop() }
         cleanupSafely("RTSP 推流") { rtspPublisher?.stop() }
         cleanupSafely("事件短片") { eventClipRecorder?.release() }
@@ -355,6 +362,7 @@ class MonitorService : Service() {
         }
     }
 
+    @Synchronized
     private fun startGuardianMonitoring(
         currentStreamer: CameraStreamer,
         clipRecorder: EventClipRecorder? = eventClipRecorder,
@@ -363,17 +371,41 @@ class MonitorService : Service() {
         npu: NpuDetector? = npuDetector,
         pose: PoseDetector? = poseDetector
     ) {
+        val generation = beginGuardianStartup()
         clipRecorder?.start(currentStreamer.h264Encoder)
-        npu?.start()
-        if (npu?.warmUpForGuard() != true) {
-            Log.w(TAG, "NPU 未完成启动预热，动作与哭声仍按安全侧继续")
-        }
-        pose?.applyConfiguration(visualGuardianRunning = true)
-        // 视觉预热完成后再启动事件源，避免首个告警撞上首轮慢推理。
+        // 动作先进入安全侧守护；音频、NPU 和 Pose 模型加载绝不阻塞主线程。
         motion?.start()
-        cry?.start()
+        guardianStartupFuture = guardianStartupExecutor.submit {
+            try {
+                if (!isGuardianStartupCurrent(generation)) return@submit
+                cry?.start()
+                if (!isGuardianStartupCurrent(generation)) {
+                    if (guardianOperatingMode() != GuardianOperatingMode.AUDIO_ONLY) cry?.stop()
+                    return@submit
+                }
+                npu?.start()
+                if (!isGuardianStartupCurrent(generation)) {
+                    npu?.stop()
+                    return@submit
+                }
+                if (npu?.warmUpForGuard() != true) {
+                    Log.w(TAG, "NPU 未完成后台预热，动作与哭声仍按安全侧继续")
+                }
+                if (!isGuardianStartupCurrent(generation)) {
+                    npu?.stop()
+                    return@submit
+                }
+                pose?.applyConfiguration(visualGuardianRunning = true)
+                if (!isGuardianStartupCurrent(generation)) pose?.stop()
+            } catch (e: Exception) {
+                if (isGuardianStartupCurrent(generation)) {
+                    Log.w(TAG, "视觉守护后台启动异常，动作与哭声仍继续", e)
+                }
+            }
+        }
     }
 
+    @Synchronized
     private fun startAudioOnlyGuardianMonitoring(
         clipRecorder: EventClipRecorder? = eventClipRecorder,
         motion: MotionDetector? = motionDetector,
@@ -381,21 +413,53 @@ class MonitorService : Service() {
         npu: NpuDetector? = npuDetector,
         pose: PoseDetector? = poseDetector
     ) {
+        val generation = beginGuardianStartup()
         clipRecorder?.stop()
         motion?.stop()
         npu?.stop()
         pose?.stop()
-        cry?.start()
-        Log.i(TAG, "实体镜头罩关闭：仅音频守护已启动")
+        guardianStartupFuture = guardianStartupExecutor.submit {
+            if (guardianStartupGeneration.get() != generation ||
+                guardianOperatingMode() != GuardianOperatingMode.AUDIO_ONLY
+            ) {
+                return@submit
+            }
+            cry?.start()
+            if (guardianStartupGeneration.get() != generation ||
+                guardianOperatingMode() != GuardianOperatingMode.AUDIO_ONLY
+            ) {
+                cry?.stop()
+                return@submit
+            }
+            Log.i(TAG, "实体镜头罩关闭：仅音频守护已启动")
+        }
     }
 
+    @Synchronized
     private fun stopGuardianMonitoring() {
+        cancelGuardianStartup()
         eventClipRecorder?.stop()
         motionDetector?.stop()
         cryDetector?.stop()
         npuDetector?.stop()
         poseDetector?.stop()
     }
+
+    private fun beginGuardianStartup(): Long {
+        cancelGuardianStartup()
+        return guardianStartupGeneration.get()
+    }
+
+    private fun cancelGuardianStartup() {
+        guardianStartupGeneration.incrementAndGet()
+        guardianStartupFuture?.cancel(true)
+        guardianStartupFuture = null
+    }
+
+    private fun isGuardianStartupCurrent(generation: Long): Boolean =
+        guardianStartupGeneration.get() == generation &&
+            !Thread.currentThread().isInterrupted &&
+            guardianOperatingMode() == GuardianOperatingMode.NORMAL
 
     fun setBabySensitivity(level: Int) {
         deviceState?.babySensitivity = level

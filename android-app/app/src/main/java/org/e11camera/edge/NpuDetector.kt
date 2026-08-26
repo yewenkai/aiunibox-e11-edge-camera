@@ -3,6 +3,7 @@ package org.e11camera.edge
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
+import android.os.Looper
 import android.util.Log
 import java.io.File
 import java.util.ArrayDeque
@@ -336,6 +337,10 @@ class NpuDetector(
      * 告警把 RKNN/Bitmap 预热时间算进 450ms 等待上限。
      */
     fun warmUpForGuard(timeoutMs: Long = 8_000L): Boolean {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            Log.e(TAG, "拒绝在主线程等待 NPU 预热")
+            return false
+        }
         val executor = scheduler
         if (!running.get() || !modelLoaded || executor == null) return false
         return try {
@@ -367,6 +372,10 @@ class NpuDetector(
                 future.get(timeoutMs.coerceAtLeast(1L), TimeUnit.MILLISECONDS)
             } catch (_: TimeoutException) {
                 future.cancel(false)
+                false
+            } catch (_: InterruptedException) {
+                future.cancel(false)
+                Thread.currentThread().interrupt()
                 false
             }
         } catch (e: Exception) {

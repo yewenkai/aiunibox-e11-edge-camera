@@ -1386,6 +1386,9 @@ const decisionNames = {
 const eventKindNames = { incident: '◈ 事件会话', motion: '⚠ 画面动作', cry: '◉ 哭声', posture: '◆ 姿态候选', state: '● 状态变化', test: '▣ 手动测试' };
 let eventRenderSignature = '';
 let latestGuardianStorage = {};
+let healthRequestInFlight = false;
+let eventsRequestInFlight = false;
+let statusRequestInFlight = false;
 
 function formatBytes(value) {
   const n = Number(value || 0);
@@ -1408,8 +1411,11 @@ function formatSignedCapacity(value) {
 function hasMetric(value) { return value !== null && value !== undefined && Number.isFinite(Number(value)); }
 
 async function loadHealth() {
-  const j = await api('/api/health');
-  if (!j?.ok) return;
+  if (healthRequestInFlight) return;
+  healthRequestInFlight = true;
+  try {
+    const j = await api('/api/health');
+    if (!j?.ok) return;
   const issues = j.currentIssues || [];
   const chip = $('healthChip');
   chip.classList.toggle('warn', issues.length > 0);
@@ -1444,9 +1450,12 @@ async function loadHealth() {
   $('healthRuntimeNote').textContent =
     `24 小时启动 ${j.serviceStartCount || 0} 次 · 额外重启 ${j.additionalRestartCount || 0} · ` +
     `空间 ${formatSignedCapacity(j.freeStorageDeltaBytes)} · 短片 ${formatSignedCapacity(j.clipStorageDeltaBytes)}`;
-  $('healthThermalNote').textContent = issues.length
-    ? `当前：${issues.join('；')}。${j.thermalNote || ''}`
-    : (j.thermalNote || 'Thermal HAL 不可用，不依赖温度数据。');
+    $('healthThermalNote').textContent = issues.length
+      ? `当前：${issues.join('；')}。${j.thermalNote || ''}`
+      : (j.thermalNote || 'Thermal HAL 不可用，不依赖温度数据。');
+  } finally {
+    healthRequestInFlight = false;
+  }
 }
 
 function appendText(parent, className, text, tag = 'div') {
@@ -1458,8 +1467,14 @@ function appendText(parent, className, text, tag = 'div') {
 }
 
 async function loadGuardianEvents(force = false) {
-  const j = await api('/api/events?limit=40');
-  if (!j || !j.ok) return;
+  if (eventsRequestInFlight) {
+    if (force) eventRenderSignature = '';
+    return;
+  }
+  eventsRequestInFlight = true;
+  try {
+    const j = await api('/api/events?limit=40');
+    if (!j || !j.ok) return;
   const storage = j.storage || {};
   latestGuardianStorage = storage;
   const storedClipCount = Number(storage.clipCount || 0);
@@ -1592,6 +1607,9 @@ async function loadGuardianEvents(force = false) {
       card.appendChild(actions);
     }
     list.appendChild(card);
+  }
+  } finally {
+    eventsRequestInFlight = false;
   }
 }
 
@@ -2274,6 +2292,8 @@ window.addEventListener('pageshow', scheduleFloatingVideoUpdate);
 scheduleFloatingVideoUpdate();
 
 async function refreshStatus() {
+  if (statusRequestInFlight) return;
+  statusRequestInFlight = true;
   try {
     const j = await api('/api/status');
     if (!j) return;
@@ -2437,14 +2457,22 @@ async function refreshStatus() {
     $('liveBadge').textContent = '● 设备已断开';
     $('liveBadge').classList.add('off');
     $('status').textContent = '设备连接中断，正在重试…';
+  } finally {
+    statusRequestInFlight = false;
   }
 }
 refreshStatus();
-setInterval(refreshStatus, 1000);
+setInterval(() => { if (!document.hidden) refreshStatus(); }, 2000);
 loadGuardianEvents();
-setInterval(loadGuardianEvents, 3000);
+setInterval(() => { if (!document.hidden) loadGuardianEvents(); }, 5000);
 loadHealth();
-setInterval(loadHealth, 10_000);
+setInterval(() => { if (!document.hidden) loadHealth(); }, 30_000);
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) return;
+  refreshStatus();
+  loadGuardianEvents();
+  loadHealth();
+});
 </script>
 </body>
 </html>
