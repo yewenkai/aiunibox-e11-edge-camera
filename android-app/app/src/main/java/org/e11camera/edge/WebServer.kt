@@ -21,6 +21,7 @@ import java.util.UUID
  *
  * 路由：
  *  GET /                 控制网页
+ *  GET /local-ca.crt     下载本设备 HTTPS 的公开根证书
  *  GET /media/cam/...    同源代理 MediaMTX HLS 播放页、清单与分片
  *  GET /stream           MJPEG 视频流
  *  GET /api/motor        ?dir=left|right|reset [&steps=&speed=]
@@ -126,6 +127,7 @@ class WebServer(
             when {
                 uri == "/" || uri == "/index.html" -> serveIndex()
                 uri == "/api/info" -> apiInfo()
+                uri == "/local-ca.crt" -> serveLocalCaCertificate()
                 uri == HlsProxyPolicy.PUBLIC_CAMERA_PREFIX ||
                     uri.startsWith("${HlsProxyPolicy.PUBLIC_CAMERA_PREFIX}/") ->
                     serveHlsProxy(session)
@@ -229,6 +231,27 @@ class WebServer(
         val html = context.assets.open("web/index.html").bufferedReader().use { it.readText() }
         return newFixedLengthResponse(Response.Status.OK, "text/html; charset=utf-8", html).apply {
             addHeader("Cache-Control", "no-store, no-cache, must-revalidate")
+        }
+    }
+
+    /** 根证书是公开材料；私钥只保留在部署端，不进入 APK 或该下载接口。 */
+    private fun serveLocalCaCertificate(): Response {
+        val certificate = LocalHttpsConfig.caCertificateFile(context)
+        if (!certificate.isFile) {
+            return newFixedLengthResponse(
+                Response.Status.NOT_FOUND,
+                MIME_PLAINTEXT,
+                "HTTPS 根证书尚未部署"
+            )
+        }
+        return newFixedLengthResponse(
+            Response.Status.OK,
+            "application/x-x509-ca-cert",
+            FileInputStream(certificate),
+            certificate.length()
+        ).apply {
+            addHeader("Content-Disposition", "attachment; filename=aiunibox-e11-local-ca.crt")
+            addHeader("Cache-Control", "no-store")
         }
     }
 
@@ -697,15 +720,22 @@ class WebServer(
             context.contentResolver,
             android.provider.Settings.Secure.ANDROID_ID
         ) ?: "unknown"
+        val https = MonitorService.instance?.httpsStatus() ?: LocalHttpsStatus()
         return json(
             JSONObject()
                 .put("ok", true)
                 .put("name", "AIUniBOX-E11 Edge Camera")
                 .put("model", android.os.Build.MODEL)
                 .put("deviceId", id)
-                .put("apiVersion", 10)
+                .put("apiVersion", 11)
                 .put("appVersion", BuildConfig.VERSION_NAME)
                 .put("authRequired", security.isEnabled)
+                .put("httpsConfigured", https.configured)
+                .put("httpsRunning", https.running)
+                .put("httpsPort", https.port)
+                .put("httpsCertificateSha256", https.certificateSha256)
+                .put("httpsCertificateExpiresAt", https.certificateExpiresAt)
+                .put("httpsError", https.lastError)
                 .toString()
         )
     }
@@ -733,6 +763,7 @@ class WebServer(
         val poseDiagnostics = service?.poseDiagnosticsSummary()
         val clipStorage = service?.guardianClipStorageInfo()
         val intercomStatus = service?.intercomStatus() ?: IntercomStatus()
+        val httpsStatus = service?.httpsStatus() ?: LocalHttpsStatus()
         return json(JSONObject()
             .put("ok", true)
             .put("ip", ip)
@@ -828,6 +859,11 @@ class WebServer(
             .put("guardianEventCount", service?.guardianEvents(200)?.size ?: 0)
             .put("guardianClipCount", clipStorage?.clipCount ?: 0)
             .put("guardianClipBytes", clipStorage?.totalBytes ?: 0L)
+            .put("httpsConfigured", httpsStatus.configured)
+            .put("httpsRunning", httpsStatus.running)
+            .put("httpsPort", httpsStatus.port)
+            .put("httpsCertificateExpiresAt", httpsStatus.certificateExpiresAt)
+            .put("httpsError", httpsStatus.lastError)
             .put(
                 "intercom",
                 JSONObject()

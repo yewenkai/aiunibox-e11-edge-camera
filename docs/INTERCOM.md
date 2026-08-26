@@ -35,13 +35,15 @@
 
 ## HTTP 与 iOS 限制
 
-设备本身仍然可以纯 HTTP 运行，没有内置自签名 HTTPS：
+设备保留纯 HTTP，同时可选启用设备专用的 `8443 HTTPS/WSS`：
 
 - 设备麦克风到浏览器的“监听设备”不依赖 `getUserMedia`，纯 HTTP 页面可用。
 - 浏览器到设备的“按住说话”需要 `getUserMedia`。iOS 和 Chrome 只在可信上下文中授予网页麦克风，普通局域网 HTTP 页面会被浏览器拒绝。
-- 从极空间等可信 HTTPS 远程入口打开时，反向代理还必须支持 `/intercom` 的 WebSocket Upgrade。不需要给 Android 应用自己加 HTTPS。
+- 从极空间等可信 HTTPS 远程入口打开时，反向代理必须支持 `/intercom` 的 WebSocket Upgrade。
+- 在 iPhone 安装并完全信任项目生成的本地根 CA 后，也可直接打开 `https://设备IP:8443/`，无需经过极空间。
 
 页面会先检查可信上下文；不满足时仍保留监听按钮，并明确说明为什么无法按住说话。
+证书生成、安装和 IP 变化处理见 [HTTPS.md](HTTPS.md)。
 
 ## 隐私模式和镜头罩
 

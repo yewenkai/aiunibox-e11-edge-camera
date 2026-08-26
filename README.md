@@ -124,6 +124,11 @@ adb shell pm grant org.e11camera.edge android.permission.CAMERA
 adb shell pm grant org.e11camera.edge android.permission.RECORD_AUDIO
 ```
 
+如需让 iOS/Chrome 在局域网控制页使用麦克风，可在 APK 安装后运行
+`scripts/setup_local_https.sh`，生成设备专用证书并启用并行的 `8443 HTTPS/WSS`。
+根 CA 私钥与生成物只保存在被 Git 忽略的 `device-data/https/`，详见
+[局域网自建 HTTPS](docs/HTTPS.md)。
+
 首次执行硬件控制时，需要在 Magisk 中授予应用 root 权限。若设备中已有其他进程独占摄像头，应先通过设备自身设置安全地停止该进程；本仓库不提供针对特定商业应用的修改或破解文件。
 
 NPU、YAMNet 和 MediaMTX 都是可选的本地组件，仓库不提供对应模型或二进制。完整的源码自建边界、Codex 提示词和提交前审计见 [docs/SELF_BUILD_WITH_CODEX.md](docs/SELF_BUILD_WITH_CODEX.md)。
@@ -137,19 +142,21 @@ NPU、YAMNet 和 MediaMTX 都是可选的本地组件，仓库不提供对应模
 | 功能 | 地址 |
 | --- | --- |
 | 控制页 | `http://<device-ip>:8080` |
+| 控制页（可选 HTTPS） | `https://<device-ip>:8443` |
 | RTSP | `rtsp://<device-ip>:8554/cam` |
 | WebRTC | `http://<device-ip>:8889/cam/` |
 | HLS（设备内网调试） | `http://<device-ip>:8888/cam/` |
 | HLS（控制页同源） | `<控制页地址>/media/cam/` |
 
 控制页在 `HTTP + 局域网地址 + 8080` 直连且 `8889` 探测可达时优先使用 WebRTC；通过极空间一类远程网页
-代理访问时，无论外层是 HTTP 还是 HTTPS，都会自动切换到同源 HLS。设备不需要配置
-自签名 HTTPS，远程入口也不需要单独转发 8888、8889 或 8189。部署与排障见
+代理访问时，无论外层是 HTTP 还是 HTTPS，都会自动切换到同源 HLS。远程入口不需要
+单独转发 8888、8889 或 8189；设备端可按需启用自建 HTTPS。部署与排障见
 [远程网页与同源 HLS](docs/REMOTE_ACCESS.md)。
 
 双向语音使用控制页同源的 `/intercom` WebSocket。纯 HTTP 局域网页可以监听设备，
-但 iOS/Chrome 会拒绝向非可信页面授予浏览器麦克风；“按住说话”需通过可信 HTTPS
-反向代理入口使用，且代理需支持 WebSocket Upgrade。应用不强制开启自签名 HTTPS。
+但 iOS/Chrome 会拒绝向非可信页面授予浏览器麦克风；“按住说话”可使用可信 HTTPS
+反向代理入口，或安装项目生成的本地根 CA 后直连设备 `8443`。应用不会强制跳转 HTTPS，
+原有 `8080` 始终保留。
 协议与验收项见[局域网双向语音](docs/INTERCOM.md)。
 
 ### 启用 API Token
@@ -239,6 +246,7 @@ H.264、JPEG、画中画或事件短片。风险候选出现时还可按需加�
 ├── brand/                 HACS 展示图标
 ├── deploy/magisk/         MediaMTX 最小配置与开机守护示例
 ├── docs/                  移植、NPU、事件短片与源码自建说明
+├── scripts/               构建辅助与设备专用 HTTPS 证书部署脚本
 ├── LICENSE                本项目 MIT License
 ├── SECURITY.md            安全与隐私边界
 └── THIRD_PARTY_NOTICES.md 第三方依赖与未分发组件说明

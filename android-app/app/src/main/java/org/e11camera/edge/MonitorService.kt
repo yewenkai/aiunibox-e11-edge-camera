@@ -26,6 +26,7 @@ class MonitorService : Service() {
         private const val CHANNEL_ID = "e11_edge_camera"
         private const val NOTIFICATION_ID = 1
         const val PORT = 8080
+        const val HTTPS_PORT = LocalHttpsConfig.PORT
         const val ACTION_RESTART_CAMERA = "org.e11camera.edge.RESTART_CAMERA"
         private const val POSTURE_ALERT_COOLDOWN_MS = 5L * 60L * 1_000L
         private const val GUARDIAN_VISION_REFRESH_TIMEOUT_MS = 450L
@@ -37,6 +38,7 @@ class MonitorService : Service() {
     private var streamer: CameraStreamer? = null
     private var motor: MotorController? = null
     private var server: WebServer? = null
+    private var httpsServer: WebServer? = null
     private var viewerWatcher: ViewerWatcher? = null
     private var rtspPublisher: RtspPublisher? = null
     private var deviceState: DeviceStateStore? = null
@@ -56,6 +58,7 @@ class MonitorService : Service() {
     private val guardianStartupExecutor = Executors.newSingleThreadExecutor()
     private val guardianStartupGeneration = AtomicLong(0)
     @Volatile private var guardianStartupFuture: Future<*>? = null
+    @Volatile private var localHttpsStatus = LocalHttpsStatus()
     @Volatile private var lastSuppressedAlertAt: Long = 0
     @Volatile private var lastPostureAlertAt: Long = 0
     @Volatile private var lastPostureSuppressedAt: Long = 0
@@ -123,14 +126,17 @@ class MonitorService : Service() {
             }
 
             // 局域网 HTTP 控制服务。
-            val srv = WebServer(this, s, m, state, ApiSecurity(), intercom, PORT)
+            val security = ApiSecurity()
+            val srv = WebServer(this, s, m, state, security, intercom, PORT)
             srv.start(NanoHTTPD.SOCKET_READ_TIMEOUT, false)
             Log.i(TAG, "HTTP 服务已启动，端口 $PORT")
+            val secureServer = startLocalHttpsServer(s, m, state, security, intercom)
 
             streamer = s
             motor = m
             deviceState = state
             server = srv
+            httpsServer = secureServer
             motionDetector = motion
             cryDetector = cry
             npuDetector = npu
@@ -201,6 +207,7 @@ class MonitorService : Service() {
 
     private fun cleanupResources() {
         cancelGuardianStartup()
+        cleanupSafely("HTTPS 服务") { httpsServer?.stop() }
         cleanupSafely("HTTP 服务") { server?.stop() }
         cleanupSafely("RTSP 推流") { rtspPublisher?.stop() }
         cleanupSafely("事件短片") { eventClipRecorder?.release() }
@@ -225,10 +232,63 @@ class MonitorService : Service() {
         guardianEventStore = null
         healthDiagnostics = null
         viewerWatcher = null
+        httpsServer = null
         server = null
         streamer = null
         motor = null
         deviceState = null
+        localHttpsStatus = localHttpsStatus.copy(running = false)
+    }
+
+    private fun startLocalHttpsServer(
+        currentStreamer: CameraStreamer,
+        currentMotor: MotorController,
+        state: DeviceStateStore,
+        security: ApiSecurity,
+        intercom: IntercomController
+    ): WebServer? {
+        if (!LocalHttpsConfig.isConfigured(this)) {
+            localHttpsStatus = LocalHttpsStatus(lastError = "not_configured")
+            Log.i(TAG, "HTTPS 证书尚未部署，仅启动 HTTP $PORT")
+            return null
+        }
+
+        var secureServer: WebServer? = null
+        return try {
+            val material = LocalHttpsConfig.load(this)
+            val socketFactory = NanoHTTPD.makeSSLSocketFactory(
+                material.keyStore,
+                material.keyManagerFactory
+            )
+            secureServer = WebServer(
+                this,
+                currentStreamer,
+                currentMotor,
+                state,
+                security,
+                intercom,
+                HTTPS_PORT
+            )
+            secureServer.makeSecure(socketFactory, arrayOf("TLSv1.2", "TLSv1.3"))
+            secureServer.start(NanoHTTPD.SOCKET_READ_TIMEOUT, false)
+            localHttpsStatus = LocalHttpsStatus(
+                configured = true,
+                running = true,
+                certificateSha256 = material.certificateSha256,
+                certificateExpiresAt = material.certificateExpiresAt
+            )
+            Log.i(TAG, "HTTPS/WSS 服务已启动，端口 $HTTPS_PORT")
+            secureServer
+        } catch (e: Exception) {
+            secureServer?.stop()
+            localHttpsStatus = LocalHttpsStatus(
+                configured = true,
+                running = false,
+                lastError = e.message ?: e.javaClass.simpleName
+            )
+            Log.w(TAG, "HTTPS 启动失败，HTTP 服务继续可用", e)
+            null
+        }
     }
 
     private inline fun cleanupSafely(name: String, action: () -> Unit) {
@@ -553,6 +613,8 @@ class MonitorService : Service() {
     fun cryAnalyzedAt(): Long = cryDetector?.lastAnalyzedAt ?: 0L
 
     fun intercomStatus(): IntercomStatus = intercomController?.status() ?: IntercomStatus()
+
+    fun httpsStatus(): LocalHttpsStatus = localHttpsStatus
 
     fun isNpuModelLoaded(): Boolean = npuDetector?.modelLoaded == true
 
