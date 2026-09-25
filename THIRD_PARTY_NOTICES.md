@@ -10,6 +10,8 @@
 | NanoHTTPD | App 内嵌 HTTP 服务 | BSD 3-Clause | Gradle / Maven Central |
 | Gradle Wrapper | Android 构建引导 | Apache License 2.0 | 仓库中的标准 wrapper |
 | TensorFlow Lite | 可选的本地音频分类运行时 | Apache License 2.0 | Gradle / Maven Central |
+| WebRTC SDK Android | 电视端原生 WebRTC 接收与解码 | 包装工程 MIT；WebRTC 及内含依赖遵循各自许可 | io.github.webrtc-sdk / Maven Central |
+| AndroidX Media3 | 电视端手动 RTSP 备用播放器 | Apache License 2.0 | Gradle / Google Maven |
 
 ## 运行期外部组件
 

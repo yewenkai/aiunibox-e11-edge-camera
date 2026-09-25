@@ -43,6 +43,12 @@ class DeviceStateStore(context: Context) {
 
     private val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
     private val position = AtomicInteger(prefs.getInt(KEY_POSITION, 0))
+    private val bootCount = android.provider.Settings.Global.getInt(context.contentResolver, android.provider.Settings.Global.BOOT_COUNT, -1)
+
+    /** 同一次开机内保留手动暂停；设备重启默认恢复，隐私开关另行保留。 */
+    var captureEnabled: Boolean
+        get() = prefs.getInt("capture_boot", -2) != bootCount || prefs.getBoolean("capture_enabled", true)
+        set(value) { prefs.edit().putInt("capture_boot", bootCount).putBoolean("capture_enabled", value).apply() }
 
     fun positionSteps(): Int = position.get()
 

@@ -134,10 +134,17 @@ while true; do
     STATUS_URL=http://127.0.0.1:8080/api/status
     [ -n "$TOKEN" ] && STATUS_URL="$STATUS_URL?token=$TOKEN"
     STATUS=$(/system/bin/busybox wget -qO- "$STATUS_URL" 2>/dev/null)
+    CAPTURE_HEALTHY=0
+    if echo "$STATUS" | grep -q '"captureEnabled":false' ||
+        echo "$STATUS" | grep -q '"privacy":true'; then
+        CAPTURE_HEALTHY=1
+    elif echo "$STATUS" | grep -q '"streamReady":true' &&
+        echo "$STATUS" | grep -q '"rtspPublishing":true'; then
+        CAPTURE_HEALTHY=1
+    fi
     if pidof "$APP_PKG" >/dev/null 2>&1 &&
         media_ports_ready &&
-        echo "$STATUS" | grep -q '"streamReady":true' &&
-        echo "$STATUS" | grep -q '"rtspPublishing":true'; then
+        [ "$CAPTURE_HEALTHY" -eq 1 ]; then
         FAIL_COUNT=0
     else
         FAIL_COUNT=$((FAIL_COUNT + 1))

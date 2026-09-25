@@ -1,5 +1,7 @@
 # AIUniBOX-E11 Edge Camera
 
+> 1.9.0 更新：仅保留 HTTP，已移除网页语音对讲，旧版 HTTPS/对讲说明不再适用。新增手动暂停采集和启动后返回主页，见 [节能运行说明](docs/POWER_SAVING.md)。
+
 把一台闲置的 AIUniBOX-E11 RK3566 Android 带屏设备改造成局域网边缘摄像头：复用内置摄像头、水平云台和指示灯，在浏览器中通过 WebRTC 低延迟观看，也可通过同源 HLS 兼容远程网页代理，并通过 RTSP 接入其他家庭网络设备。
 
 > 本项目仅用于个人设备研究、Android/音视频与边缘计算学习。它不是任何设备厂商、运营商或芯片公司的官方项目，也未获得这些主体的背书。请只在你拥有或已获明确授权的设备和场所中使用，并遵守当地隐私、监控和无线网络相关法律。
@@ -124,10 +126,7 @@ adb shell pm grant org.e11camera.edge android.permission.CAMERA
 adb shell pm grant org.e11camera.edge android.permission.RECORD_AUDIO
 ```
 
-如需让 iOS/Chrome 在局域网控制页使用麦克风，可在 APK 安装后运行
-`scripts/setup_local_https.sh`，生成设备专用证书并启用并行的 `8443 HTTPS/WSS`。
-根 CA 私钥与生成物只保存在被 Git 忽略的 `device-data/https/`，详见
-[局域网自建 HTTPS](docs/HTTPS.md)。
+当前版本仅使用 HTTP 8080，不提供网页语音对讲或设备端 HTTPS。
 
 首次执行硬件控制时，需要在 Magisk 中授予应用 root 权限。若设备中已有其他进程独占摄像头，应先通过设备自身设置安全地停止该进程；本仓库不提供针对特定商业应用的修改或破解文件。
 
@@ -142,7 +141,6 @@ NPU、YAMNet 和 MediaMTX 都是可选的本地组件，仓库不提供对应模
 | 功能 | 地址 |
 | --- | --- |
 | 控制页 | `http://<device-ip>:8080` |
-| 控制页（可选 HTTPS） | `https://<device-ip>:8443` |
 | RTSP | `rtsp://<device-ip>:8554/cam` |
 | WebRTC | `http://<device-ip>:8889/cam/` |
 | HLS（设备内网调试） | `http://<device-ip>:8888/cam/` |
@@ -150,14 +148,10 @@ NPU、YAMNet 和 MediaMTX 都是可选的本地组件，仓库不提供对应模
 
 控制页在 `HTTP + 局域网地址 + 8080` 直连且 `8889` 探测可达时优先使用 WebRTC；通过极空间一类远程网页
 代理访问时，无论外层是 HTTP 还是 HTTPS，都会自动切换到同源 HLS。远程入口不需要
-单独转发 8888、8889 或 8189；设备端可按需启用自建 HTTPS。部署与排障见
+单独转发 8888、8889 或 8189。部署与排障见
 [远程网页与同源 HLS](docs/REMOTE_ACCESS.md)。
 
-双向语音使用控制页同源的 `/intercom` WebSocket。纯 HTTP 局域网页可以监听设备，
-但 iOS/Chrome 会拒绝向非可信页面授予浏览器麦克风；“按住说话”可使用可信 HTTPS
-反向代理入口，或安装项目生成的本地根 CA 后直连设备 `8443`。应用不会强制跳转 HTTPS，
-原有 `8080` 始终保留。
-协议与验收项见[局域网双向语音](docs/INTERCOM.md)。
+网页仅提供视频、云台、宝宝守护和事件管理；哭声检测在设备本地运行，不需要 HTTPS。
 
 ### 启用 API Token
 
@@ -246,7 +240,7 @@ H.264、JPEG、画中画或事件短片。风险候选出现时还可按需加�
 ├── brand/                 HACS 展示图标
 ├── deploy/magisk/         MediaMTX 最小配置与开机守护示例
 ├── docs/                  移植、NPU、事件短片与源码自建说明
-├── scripts/               构建辅助与设备专用 HTTPS 证书部署脚本
+├── scripts/               构建辅助脚本
 ├── LICENSE                本项目 MIT License
 ├── SECURITY.md            安全与隐私边界
 └── THIRD_PARTY_NOTICES.md 第三方依赖与未分发组件说明

@@ -226,6 +226,7 @@ class CameraStreamer(private val context: Context) {
                             return
                         }
                         session = s
+                        LedController.restoreCameraLight()
                         try {
                             val req = c.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
                             if (encodedTarget != null) req.addTarget(encodedTarget)

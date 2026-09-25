@@ -3,7 +3,6 @@ package org.e11camera.edge
 import android.content.Context
 import android.util.Log
 import fi.iki.elonen.NanoHTTPD
-import fi.iki.elonen.NanoWSD
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayInputStream
@@ -13,15 +12,13 @@ import java.io.IOException
 import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
-import java.util.UUID
 
 /**
- * 内嵌 HTTP/WebSocket 服务器（NanoHTTPD/NanoWSD）。
- * 提供控制网页、视频流、REST API 与局域网双向语音。
+ * 内嵌 HTTP 服务器。
+ * 提供控制网页、视频流和 REST API。
  *
  * 路由：
  *  GET /                 控制网页
- *  GET /local-ca.crt     下载本设备 HTTPS 的公开根证书
  *  GET /media/cam/...    同源代理 MediaMTX HLS 播放页、清单与分片
  *  GET /stream           MJPEG 视频流
  *  GET /api/motor        ?dir=left|right|reset [&steps=&speed=]
@@ -38,7 +35,6 @@ import java.util.UUID
  *  GET /api/health       滚动 24 小时摄像头、NPU、音频与存储健康统计
  *  GET /event-clip       ?id=EVENT_ID，支持 HTTP Range
  *  GET /api/status       状态 JSON
- *  WS  /intercom         16kHz PCM16LE 双向语音（默认半双工）
  */
 class WebServer(
     private val context: Context,
@@ -46,76 +42,16 @@ class WebServer(
     private val motor: MotorController,
     private val state: DeviceStateStore,
     private val security: ApiSecurity,
-    private val intercom: IntercomController,
     port: Int = 8080
-) : NanoWSD(port) {
+) : NanoHTTPD(port) {
 
     companion object {
         private const val TAG = "WebServer"
         private const val BOUNDARY = "e11frame"
     }
 
-    override fun openWebSocket(handshake: IHTTPSession): WebSocket = IntercomSocket(handshake)
-
-    private inner class IntercomSocket(
-        handshake: IHTTPSession
-    ) : WebSocket(handshake), IntercomController.Peer {
-        override val id: String = UUID.randomUUID().toString()
-        private var registered = false
-
-        override fun onOpen() {
-            val handshake = handshakeRequest
-            if (handshake.uri != "/intercom") {
-                close(WebSocketFrame.CloseCode.PolicyViolation, "unsupported_endpoint", false)
-                return
-            }
-            if (!security.isAuthorized(handshake)) {
-                close(WebSocketFrame.CloseCode.PolicyViolation, "unauthorized", false)
-                return
-            }
-            registered = true
-            intercom.register(this)
-            Log.i(TAG, "双向语音客户端已连接")
-        }
-
-        override fun onMessage(message: WebSocketFrame) {
-            if (!registered) return
-            when (message.opCode) {
-                WebSocketFrame.OpCode.Text -> intercom.handleText(id, message.textPayload)
-                WebSocketFrame.OpCode.Binary -> intercom.handleAudio(id, message.binaryPayload)
-                else -> close(WebSocketFrame.CloseCode.UnsupportedData, "text_or_binary_required", false)
-            }
-        }
-
-        override fun onClose(
-            code: WebSocketFrame.CloseCode,
-            reason: String,
-            initiatedByRemote: Boolean
-        ) {
-            if (registered) intercom.unregister(id)
-            registered = false
-            Log.i(TAG, "双向语音客户端已断开 code=${code.value}")
-        }
-
-        override fun onPong(pong: WebSocketFrame) = Unit
-
-        override fun onException(exception: IOException) {
-            if (registered) intercom.unregister(id)
-            registered = false
-            Log.w(TAG, "双向语音 WebSocket 异常: ${exception.message}")
-        }
-
-        override fun sendText(payload: String) {
-            send(payload)
-        }
-
-        override fun sendAudio(payload: ByteArray) {
-            send(payload)
-        }
-    }
-
     @Throws(Exception::class)
-    override fun serveHttp(session: IHTTPSession): Response {
+    override fun serve(session: IHTTPSession): Response {
         val uri = session.uri
         val params = session.parms
         if (uri.startsWith(HlsProxyPolicy.PUBLIC_CAMERA_PREFIX)) {
@@ -127,7 +63,6 @@ class WebServer(
             when {
                 uri == "/" || uri == "/index.html" -> serveIndex()
                 uri == "/api/info" -> apiInfo()
-                uri == "/local-ca.crt" -> serveLocalCaCertificate()
                 uri == HlsProxyPolicy.PUBLIC_CAMERA_PREFIX ||
                     uri.startsWith("${HlsProxyPolicy.PUBLIC_CAMERA_PREFIX}/") ->
                     serveHlsProxy(session)
@@ -145,6 +80,12 @@ class WebServer(
                 uri.startsWith("/api/filllight") -> apiFillLight(params)
                 uri.startsWith("/api/ircut") -> apiIrcut(params)
                 uri.startsWith("/api/scene") -> apiScene(params)
+                uri == "/api/capture" -> {
+                    val enabled = params["on"]?.toBooleanStrictOrNull()
+                    if (enabled == null) json("""{"ok":false,"error":"on_required"}""")
+                    else json(JSONObject().put("ok", MonitorService.instance?.setCaptureEnabled(enabled) == true)
+                        .put("captureEnabled", state.captureEnabled).toString())
+                }
                 uri.startsWith("/api/privacy") -> apiPrivacy(params)
                 uri.startsWith("/api/baby") -> apiBaby(params)
                 uri.startsWith("/api/pose-feedback") -> apiPoseFeedback(params)
@@ -234,26 +175,6 @@ class WebServer(
         }
     }
 
-    /** 根证书是公开材料；私钥只保留在部署端，不进入 APK 或该下载接口。 */
-    private fun serveLocalCaCertificate(): Response {
-        val certificate = LocalHttpsConfig.caCertificateFile(context)
-        if (!certificate.isFile) {
-            return newFixedLengthResponse(
-                Response.Status.NOT_FOUND,
-                MIME_PLAINTEXT,
-                "HTTPS 根证书尚未部署"
-            )
-        }
-        return newFixedLengthResponse(
-            Response.Status.OK,
-            "application/x-x509-ca-cert",
-            FileInputStream(certificate),
-            certificate.length()
-        ).apply {
-            addHeader("Content-Disposition", "attachment; filename=aiunibox-e11-local-ca.crt")
-            addHeader("Cache-Control", "no-store")
-        }
-    }
 
     /**
      * 把浏览器同源的 HLS 请求流式转发到设备本机 MediaMTX。
@@ -517,6 +438,7 @@ class WebServer(
     private fun apiAllOff(): Response {
         invalidateMotionReference()
         LedController.allOff()
+        state.fillLightLevel = 0
         invalidateMotionReference()
         return json("""{"ok":true,"action":"all_off"}""")
     }
@@ -720,7 +642,6 @@ class WebServer(
             context.contentResolver,
             android.provider.Settings.Secure.ANDROID_ID
         ) ?: "unknown"
-        val https = MonitorService.instance?.httpsStatus() ?: LocalHttpsStatus()
         return json(
             JSONObject()
                 .put("ok", true)
@@ -730,12 +651,6 @@ class WebServer(
                 .put("apiVersion", 11)
                 .put("appVersion", BuildConfig.VERSION_NAME)
                 .put("authRequired", security.isEnabled)
-                .put("httpsConfigured", https.configured)
-                .put("httpsRunning", https.running)
-                .put("httpsPort", https.port)
-                .put("httpsCertificateSha256", https.certificateSha256)
-                .put("httpsCertificateExpiresAt", https.certificateExpiresAt)
-                .put("httpsError", https.lastError)
                 .toString()
         )
     }
@@ -762,8 +677,6 @@ class WebServer(
         val poseTargetBox = JSONArray(poseSnapshot.targetBox.toList())
         val poseDiagnostics = service?.poseDiagnosticsSummary()
         val clipStorage = service?.guardianClipStorageInfo()
-        val intercomStatus = service?.intercomStatus() ?: IntercomStatus()
-        val httpsStatus = service?.httpsStatus() ?: LocalHttpsStatus()
         return json(JSONObject()
             .put("ok", true)
             .put("ip", ip)
@@ -776,6 +689,7 @@ class WebServer(
             .put("uptimeSeconds", service?.uptimeSeconds() ?: 0)
             .put("watching", service?.isWatching() == true)
             .put("privacy", state.privacyMode)
+            .put("captureEnabled", state.captureEnabled)
             .put("lensCoverClosed", state.lensCoverClosed)
             .put("guardianMode", service?.guardianOperatingMode()?.apiValue ?: GuardianOperatingMode.OFF.apiValue)
             .put(
@@ -859,27 +773,6 @@ class WebServer(
             .put("guardianEventCount", service?.guardianEvents(200)?.size ?: 0)
             .put("guardianClipCount", clipStorage?.clipCount ?: 0)
             .put("guardianClipBytes", clipStorage?.totalBytes ?: 0L)
-            .put("httpsConfigured", httpsStatus.configured)
-            .put("httpsRunning", httpsStatus.running)
-            .put("httpsPort", httpsStatus.port)
-            .put("httpsCertificateExpiresAt", httpsStatus.certificateExpiresAt)
-            .put("httpsError", httpsStatus.lastError)
-            .put(
-                "intercom",
-                JSONObject()
-                    .put("connectedClients", intercomStatus.connectedClients)
-                    .put("listeners", intercomStatus.listeners)
-                    .put("talkActive", intercomStatus.talkActive)
-                    .put("microphoneAvailable", intercomStatus.microphoneAvailable)
-                    .put("microphoneRunning", intercomStatus.microphoneRunning)
-                    .put("microphoneBlockedByPrivacy", intercomStatus.microphoneBlockedByPrivacy)
-                    .put("crySuppressedByPlayback", intercomStatus.crySuppressedByPlayback)
-                    .put("lastDeviceAudioAt", intercomStatus.lastDeviceAudioAt)
-                    .put("lastBrowserAudioAt", intercomStatus.lastBrowserAudioAt)
-                    .put("droppedUplinkFrames", intercomStatus.droppedUplinkFrames)
-                    .put("droppedDownlinkFrames", intercomStatus.droppedDownlinkFrames)
-                    .put("lastError", intercomStatus.lastError)
-            )
             .apply { service?.let { put("sceneCalibration", calibrationJson(it)) } }
             .toString()
         )

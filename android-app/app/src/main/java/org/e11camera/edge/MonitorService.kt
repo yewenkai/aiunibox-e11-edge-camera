@@ -26,7 +26,6 @@ class MonitorService : Service() {
         private const val CHANNEL_ID = "e11_edge_camera"
         private const val NOTIFICATION_ID = 1
         const val PORT = 8080
-        const val HTTPS_PORT = LocalHttpsConfig.PORT
         const val ACTION_RESTART_CAMERA = "org.e11camera.edge.RESTART_CAMERA"
         private const val POSTURE_ALERT_COOLDOWN_MS = 5L * 60L * 1_000L
         private const val GUARDIAN_VISION_REFRESH_TIMEOUT_MS = 450L
@@ -38,14 +37,12 @@ class MonitorService : Service() {
     private var streamer: CameraStreamer? = null
     private var motor: MotorController? = null
     private var server: WebServer? = null
-    private var httpsServer: WebServer? = null
     private var viewerWatcher: ViewerWatcher? = null
     private var rtspPublisher: RtspPublisher? = null
     private var deviceState: DeviceStateStore? = null
     private var motionDetector: MotionDetector? = null
     private var cryDetector: CryDetector? = null
     private var microphoneAudioSource: MicrophoneAudioSource? = null
-    private var intercomController: IntercomController? = null
     private var npuDetector: NpuDetector? = null
     private var poseDetector: PoseDetector? = null
     private var poseDiagnostics: PoseDiagnosticsStore? = null
@@ -58,7 +55,6 @@ class MonitorService : Service() {
     private val guardianStartupExecutor = Executors.newSingleThreadExecutor()
     private val guardianStartupGeneration = AtomicLong(0)
     @Volatile private var guardianStartupFuture: Future<*>? = null
-    @Volatile private var localHttpsStatus = LocalHttpsStatus()
     @Volatile private var lastSuppressedAlertAt: Long = 0
     @Volatile private var lastPostureAlertAt: Long = 0
     @Volatile private var lastPostureSuppressedAt: Long = 0
@@ -77,7 +73,7 @@ class MonitorService : Service() {
         startForeground(NOTIFICATION_ID, buildNotification())
 
         if (intent?.action == ACTION_RESTART_CAMERA) {
-            streamer?.restartCapture()
+            restartCamera()
             return START_STICKY
         }
         if (streamer != null || initializing) {
@@ -88,6 +84,10 @@ class MonitorService : Service() {
         try {
             val s = CameraStreamer(this)
             val state = DeviceStateStore(this)
+            Thread {
+                LedController.allOff()
+                state.fillLightLevel = 0
+            }.start()
             val m = MotorController(state)
             val bark = BarkNotifier(state)
             val eventStore = GuardianEventStore(this)
@@ -95,9 +95,7 @@ class MonitorService : Service() {
             val diagnostics = HealthDiagnostics(this)
             val poseStats = PoseDiagnosticsStore(this)
             val microphone = MicrophoneAudioSource(this)
-            val intercom = IntercomController(microphone) { state.privacyMode }
             microphoneAudioSource = microphone
-            intercomController = intercom
             val motion = MotionDetector(s, state, m) {
                 notifyGuardianEvent(
                     kind = "motion",
@@ -109,7 +107,7 @@ class MonitorService : Service() {
                 context = this,
                 state = state,
                 microphone = microphone,
-                isLocalPlaybackActive = { intercom.isCrySuppressedByPlayback() }
+                isLocalPlaybackActive = { false }
             ) { score ->
                 notifyGuardianEvent(
                     kind = "cry",
@@ -127,16 +125,13 @@ class MonitorService : Service() {
 
             // 局域网 HTTP 控制服务。
             val security = ApiSecurity()
-            val srv = WebServer(this, s, m, state, security, intercom, PORT)
+            val srv = WebServer(this, s, m, state, security, PORT)
             srv.start(NanoHTTPD.SOCKET_READ_TIMEOUT, false)
             Log.i(TAG, "HTTP 服务已启动，端口 $PORT")
-            val secureServer = startLocalHttpsServer(s, m, state, security, intercom)
-
             streamer = s
             motor = m
             deviceState = state
             server = srv
-            httpsServer = secureServer
             motionDetector = motion
             cryDetector = cry
             npuDetector = npu
@@ -149,23 +144,20 @@ class MonitorService : Service() {
             startedAtMs = System.currentTimeMillis()
             diagnostics.recordServiceStart(startedAtMs)
 
-            if (!state.privacyMode) {
+            if (!state.privacyMode && state.captureEnabled) {
                 s.start()
                 startRtspPublisher(s)
             } else {
                 Log.i(TAG, "设备处于隐私模式，暂不启动摄像头")
             }
 
-            // 启动拉流感知（有人看时亮灯）
+            // 仅统计观看状态，不自动改变用户灯光设置。
             val watcher = ViewerWatcher()
             watcher.start()
             viewerWatcher = watcher
 
-            // 宝宝守护：开机若已启用则按实体镜头罩状态恢复，并压制所有 LED
-            // （补光灯硬件默认常亮 255，必须主动熄灭）。
+            // 宝宝守护：开机若已启用则按实体镜头罩状态恢复。
             if (state.babyMonitorEnabled) {
-                watcher.setLedSuppressed(true)
-                Thread { LedController.allOff() }.start()
                 if (!state.privacyMode) {
                     startConfiguredGuardianMonitoring(s, clipRecorder, motion, cry, npu, pose)
                 }
@@ -173,7 +165,7 @@ class MonitorService : Service() {
 
             healthScheduler.scheduleAtFixedRate({
                 val current = streamer ?: return@scheduleAtFixedRate
-                if (deviceState?.privacyMode == true) return@scheduleAtFixedRate
+                if (deviceState?.privacyMode == true || deviceState?.captureEnabled == false) return@scheduleAtFixedRate
                 val encoderHealthy = current.h264Encoder?.isOutputHealthy(10_000) == true
                 if (!current.isRunning || !encoderHealthy) {
                     Log.w(
@@ -207,7 +199,6 @@ class MonitorService : Service() {
 
     private fun cleanupResources() {
         cancelGuardianStartup()
-        cleanupSafely("HTTPS 服务") { httpsServer?.stop() }
         cleanupSafely("HTTP 服务") { server?.stop() }
         cleanupSafely("RTSP 推流") { rtspPublisher?.stop() }
         cleanupSafely("事件短片") { eventClipRecorder?.release() }
@@ -215,7 +206,6 @@ class MonitorService : Service() {
         cleanupSafely("NPU 人体检测") { npuDetector?.stop() }
         cleanupSafely("NPU 姿态检测") { poseDetector?.stop() }
         cleanupSafely("观看状态") { viewerWatcher?.stop() }
-        cleanupSafely("网页对讲") { intercomController?.shutdown() }
         cleanupSafely("哭声检测") { cryDetector?.stop() }
         cleanupSafely("共享麦克风") { microphoneAudioSource?.shutdown() }
         cleanupSafely("摄像头编码") { streamer?.stop() }
@@ -223,7 +213,6 @@ class MonitorService : Service() {
         rtspPublisher = null
         motionDetector = null
         cryDetector = null
-        intercomController = null
         microphoneAudioSource = null
         npuDetector = null
         poseDetector = null
@@ -232,63 +221,10 @@ class MonitorService : Service() {
         guardianEventStore = null
         healthDiagnostics = null
         viewerWatcher = null
-        httpsServer = null
         server = null
         streamer = null
         motor = null
         deviceState = null
-        localHttpsStatus = localHttpsStatus.copy(running = false)
-    }
-
-    private fun startLocalHttpsServer(
-        currentStreamer: CameraStreamer,
-        currentMotor: MotorController,
-        state: DeviceStateStore,
-        security: ApiSecurity,
-        intercom: IntercomController
-    ): WebServer? {
-        if (!LocalHttpsConfig.isConfigured(this)) {
-            localHttpsStatus = LocalHttpsStatus(lastError = "not_configured")
-            Log.i(TAG, "HTTPS 证书尚未部署，仅启动 HTTP $PORT")
-            return null
-        }
-
-        var secureServer: WebServer? = null
-        return try {
-            val material = LocalHttpsConfig.load(this)
-            val socketFactory = NanoHTTPD.makeSSLSocketFactory(
-                material.keyStore,
-                material.keyManagerFactory
-            )
-            secureServer = WebServer(
-                this,
-                currentStreamer,
-                currentMotor,
-                state,
-                security,
-                intercom,
-                HTTPS_PORT
-            )
-            secureServer.makeSecure(socketFactory, arrayOf("TLSv1.2", "TLSv1.3"))
-            secureServer.start(NanoHTTPD.SOCKET_READ_TIMEOUT, false)
-            localHttpsStatus = LocalHttpsStatus(
-                configured = true,
-                running = true,
-                certificateSha256 = material.certificateSha256,
-                certificateExpiresAt = material.certificateExpiresAt
-            )
-            Log.i(TAG, "HTTPS/WSS 服务已启动，端口 $HTTPS_PORT")
-            secureServer
-        } catch (e: Exception) {
-            secureServer?.stop()
-            localHttpsStatus = LocalHttpsStatus(
-                configured = true,
-                running = false,
-                lastError = e.message ?: e.javaClass.simpleName
-            )
-            Log.w(TAG, "HTTPS 启动失败，HTTP 服务继续可用", e)
-            null
-        }
     }
 
     private inline fun cleanupSafely(name: String, action: () -> Unit) {
@@ -304,6 +240,7 @@ class MonitorService : Service() {
 
     /** 重启摄像头（预览 Surface 变化时调用，重新绑定 capture session） */
     fun restartCamera() {
+        if (deviceState?.privacyMode == true || deviceState?.captureEnabled == false) return
         val s = streamer ?: return
         try {
             s.restartCapture()
@@ -348,7 +285,6 @@ class MonitorService : Service() {
         val s = streamer ?: return false
         val state = deviceState ?: return false
         if (state.privacyMode == enabled) {
-            intercomController?.onPrivacyChanged()
             return true
         }
 
@@ -359,30 +295,47 @@ class MonitorService : Service() {
             rtspPublisher = null
             s.pause()
         } else {
-            s.resume()
-            startRtspPublisher(s)
+            if (state.captureEnabled) {
+                s.resume()
+                startRtspPublisher(s)
+            }
             if (state.babyMonitorEnabled) {
                 startConfiguredGuardianMonitoring(s)
             }
         }
-        intercomController?.onPrivacyChanged()
         return true
     }
 
-    /** 宝宝守护开关：持久化 + 启停动作/哭声检测 + LED 抑制。 */
+    /** 手动采集开关，保留 HTTP 与按需音频守护。 */
+    @Synchronized
+    fun setCaptureEnabled(enabled: Boolean): Boolean {
+        val s = streamer ?: return false
+        val state = deviceState ?: return false
+        if (state.captureEnabled == enabled) return true
+        state.captureEnabled = enabled
+        stopGuardianMonitoring()
+        if (!enabled) {
+            rtspPublisher?.stop()
+            rtspPublisher = null
+            s.pause()
+        } else if (!state.privacyMode) {
+            s.resume()
+            startRtspPublisher(s)
+        }
+        if (state.babyMonitorEnabled && !state.privacyMode) startConfiguredGuardianMonitoring(s)
+        return true
+    }
+
     @Synchronized
     fun setBabyMode(enabled: Boolean): Boolean {
         val state = deviceState ?: return false
         state.babyMonitorEnabled = enabled
         if (enabled) {
-            viewerWatcher?.setLedSuppressed(true)
-            Thread { LedController.allOff() }.start()
             if (!state.privacyMode) {
                 streamer?.let { startConfiguredGuardianMonitoring(it) }
             }
         } else {
             stopGuardianMonitoring()
-            viewerWatcher?.setLedSuppressed(false)
         }
         return true
     }
@@ -612,9 +565,6 @@ class MonitorService : Service() {
 
     fun cryAnalyzedAt(): Long = cryDetector?.lastAnalyzedAt ?: 0L
 
-    fun intercomStatus(): IntercomStatus = intercomController?.status() ?: IntercomStatus()
-
-    fun httpsStatus(): LocalHttpsStatus = localHttpsStatus
 
     fun isNpuModelLoaded(): Boolean = npuDetector?.modelLoaded == true
 
@@ -716,7 +666,7 @@ class MonitorService : Service() {
         return GuardianModePolicy.resolve(
             guardianEnabled = state.babyMonitorEnabled,
             privacyMode = state.privacyMode,
-            lensCoverClosed = state.lensCoverClosed
+            lensCoverClosed = state.lensCoverClosed || !state.captureEnabled
         )
     }
 
@@ -766,7 +716,7 @@ class MonitorService : Service() {
             val state = deviceState ?: return
             val currentStreamer = streamer ?: return
             val encoder = currentStreamer.h264Encoder
-            val cameraExpected = !state.privacyMode
+            val cameraExpected = !state.privacyMode && state.captureEnabled
             val guardianMode = GuardianModePolicy.resolve(
                 guardianEnabled = state.babyMonitorEnabled,
                 privacyMode = state.privacyMode,

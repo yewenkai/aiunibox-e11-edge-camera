@@ -16,12 +16,19 @@ object LedController {
     /** sysfs 控制的所有 LED 名 */
     val allLeds = listOf("blue", "green", "red", "ir", "camera", "work")
     private val knownLevels = java.util.concurrent.ConcurrentHashMap<String, Int>()
+    private var requestedCameraLevel = 0
+
+    /** 相机 HAL 打开时可能恢复默认补光亮度，重新应用用户选择（初始为关闭）。 */
+    @Synchronized
+    fun restoreCameraLight() { setLed("camera", requestedCameraLevel) }
 
     /** 设置 LED 亮度（sysfs 路径），level 0~255
      *  对 work 灯：先解绑 heartbeat trigger，再写亮度 */
+    @Synchronized
     fun setLed(name: String, level: Int): Boolean {
         if (name !in allLeds) return false
         val l = level.coerceIn(0, 255)
+        if (name == "camera") requestedCameraLevel = l
         // work 灯默认绑了 heartbeat 触发器，必须先解绑
         if (name == "work") {
             ShellUtil.execSu("echo none > /sys/class/leds/work/trigger")
@@ -43,6 +50,7 @@ object LedController {
 
     /** 关闭所有灯（RGB + IR + 补光 + 心跳） */
     fun allOff() {
+        setFillLight(0)
         for (led in allLeds) {
             setLed(led, 0)
         }
@@ -54,9 +62,12 @@ object LedController {
     }
 
     /** 补光灯亮度 0~255（通过 ipcamera_test） */
+    @Synchronized
     fun setFillLight(level: Int) {
         val l = level.coerceIn(0, 255)
         ShellUtil.execSu("/vendor/bin/hw/ipcamera_test -l $l")
+        requestedCameraLevel = l
+        knownLevels["camera"] = l
     }
 
     /** 场景模式：0=日间, 1=夜间, 2=自动 */

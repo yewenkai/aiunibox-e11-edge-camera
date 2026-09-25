@@ -45,6 +45,9 @@ class MainActivity : ComponentActivity() {
         // 有权限则自动启动监控服务（适配无触摸屏的带屏设备）
         if (permissionGranted.value) {
             startMonitorService()
+            startActivity(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            finish()
+            return
         }
         setContent {
             MaterialTheme {
