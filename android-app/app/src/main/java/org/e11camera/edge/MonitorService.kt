@@ -129,6 +129,7 @@ class MonitorService : Service() {
             srv.start(NanoHTTPD.SOCKET_READ_TIMEOUT, false)
             Log.i(TAG, "HTTP 服务已启动，端口 $PORT")
             streamer = s
+            s.onEncoderReady = { encoder -> startEncoderConsumers(s, encoder) }
             motor = m
             deviceState = state
             server = srv
@@ -146,7 +147,6 @@ class MonitorService : Service() {
 
             if (!state.privacyMode && state.captureEnabled) {
                 s.start()
-                startRtspPublisher(s)
             } else {
                 Log.i(TAG, "设备处于隐私模式，暂不启动摄像头")
             }
@@ -297,7 +297,6 @@ class MonitorService : Service() {
         } else {
             if (state.captureEnabled) {
                 s.resume()
-                startRtspPublisher(s)
             }
             if (state.babyMonitorEnabled) {
                 startConfiguredGuardianMonitoring(s)
@@ -320,7 +319,6 @@ class MonitorService : Service() {
             s.pause()
         } else if (!state.privacyMode) {
             s.resume()
-            startRtspPublisher(s)
         }
         if (state.babyMonitorEnabled && !state.privacyMode) startConfiguredGuardianMonitoring(s)
         return true
@@ -607,7 +605,7 @@ class MonitorService : Service() {
     fun recordPoseFeedback(value: String): Boolean = poseDetector?.recordFeedback(value) == true
 
     fun runPoseSelfTest(): PoseAnalysisSnapshot? {
-        if (deviceState?.privacyMode == true) return null
+        if (deviceState?.privacyMode == true || deviceState?.captureEnabled == false) return null
         return poseDetector?.selfTest()
     }
 
@@ -726,7 +724,7 @@ class MonitorService : Service() {
                 DeviceHealthInput(
                     cameraExpected = cameraExpected,
                     cameraOn = currentStreamer.isRunning,
-                    frameCapturedAt = currentStreamer.latestJpegCapturedAtMs,
+                    frameCapturedAt = currentStreamer.latestFrameCapturedAtMs,
                     streamReady = encoder?.isOutputHealthy() == true,
                     encodedFrameCount = encoder?.outputFrameCount ?: 0L,
                     npuExpected = GuardianModePolicy.visualEnabled(guardianMode),
@@ -1058,13 +1056,20 @@ class MonitorService : Service() {
         }
     }
 
-    private fun startRtspPublisher(s: CameraStreamer) {
+    @Synchronized
+    private fun startEncoderConsumers(s: CameraStreamer, encoder: H264Encoder) {
         // 内置 RTSP 直推：使用 MediaCodec 原始 PTS，避免裸流经过
         // HTTP/ffmpeg 后时间戳成批、浏览器出现周期性停顿。
-        s.h264Encoder?.let { enc ->
-            val pub = RtspPublisher(enc, path = "cam")
-            pub.start()
-            rtspPublisher = pub
+        if (streamer !== s || s.h264Encoder !== encoder ||
+            deviceState?.captureEnabled != true || deviceState?.privacyMode != false) return
+        rtspPublisher?.stop()
+        val pub = RtspPublisher(encoder, path = "cam")
+        pub.start()
+        rtspPublisher = pub
+        if (GuardianModePolicy.clipEnabled(guardianOperatingMode())) {
+            // 快速暂停/恢复时，旧编码器可能尚未关闭；短片缓存须换绑到新实例。
+            eventClipRecorder?.stop()
+            eventClipRecorder?.start(encoder)
         }
     }
 }

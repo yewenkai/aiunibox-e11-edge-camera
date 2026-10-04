@@ -2,7 +2,7 @@ package org.e11camera.edge
 
 /**
  * LED / IR-CUT / 补光灯 控制器。
- * - RGB LED + IR 红外灯 + 补光灯(camera) + 心跳灯(work)：写 sysfs
+ * - RGB LED、IR 红外灯、补光灯、心跳灯与存储活动灯：写 sysfs
  * - IR-CUT 滤光片 + 场景模式：通过 ipcamera_test
  *
  * 设备上的 LED 列表：
@@ -10,35 +10,46 @@ package org.e11camera.edge
  *   ir                  — 红外夜视灯
  *   camera              — 补光灯（默认常亮 255）
  *   work                — 心跳指示灯（默认绑 heartbeat trigger）
+ *   mmc2::              — 存储活动 LED 节点（默认绑 mmc2 trigger）
  */
 object LedController {
 
     /** sysfs 控制的所有 LED 名 */
-    val allLeds = listOf("blue", "green", "red", "ir", "camera", "work")
+    val allLeds = listOf("blue", "green", "red", "ir", "camera", "work", "mmc2::")
     private val knownLevels = java.util.concurrent.ConcurrentHashMap<String, Int>()
     private var requestedCameraLevel = 0
 
     /** 相机 HAL 打开时可能恢复默认补光亮度，重新应用用户选择（初始为关闭）。 */
     @Synchronized
-    fun restoreCameraLight() { setLed("camera", requestedCameraLevel) }
+    fun restoreRequestedLights() {
+        val levels = allLeds.associateWith { name ->
+            if (name == "camera") requestedCameraLevel else knownLevels[name] ?: 0
+        }
+        // HAL 重新打开后恢复用户选择；一次 root 调用覆盖所有节点与触发器。
+        val commands = levels.map { (name, level) -> ledWriteCommand(name, level) }
+        ShellUtil.execSu(commands.joinToString("; "))
+        knownLevels.putAll(levels)
+    }
+
+    private fun ledWriteCommand(name: String, level: Int): String {
+        val base = "/sys/class/leds/$name"
+        return "if [ -f $base/trigger ]; then echo none > $base/trigger; fi; echo $level > $base/brightness"
+    }
 
     /** 设置 LED 亮度（sysfs 路径），level 0~255
-     *  对 work 灯：先解绑 heartbeat trigger，再写亮度 */
+     *  先解绑自动触发器，再写亮度，避免心跳或存储活动重新点亮。 */
     @Synchronized
     fun setLed(name: String, level: Int): Boolean {
         if (name !in allLeds) return false
         val l = level.coerceIn(0, 255)
         if (name == "camera") requestedCameraLevel = l
-        // work 灯默认绑了 heartbeat 触发器，必须先解绑
-        if (name == "work") {
-            ShellUtil.execSu("echo none > /sys/class/leds/work/trigger")
-        }
-        ShellUtil.execSu("echo $l > /sys/class/leds/$name/brightness")
+        ShellUtil.execSu(ledWriteCommand(name, l))
         knownLevels[name] = l
         return true
     }
 
-    /** 读取 LED 当前亮度 */
+    /** 读取 LED 当前亮度；与用户写入共享锁，防止旧读取覆盖关灯选择。 */
+    @Synchronized
     fun getLed(name: String): Int {
         if (name !in allLeds) return 0
         knownLevels[name]?.let { return it }
@@ -48,7 +59,8 @@ object LedController {
         return value
     }
 
-    /** 关闭所有灯（RGB + IR + 补光 + 心跳） */
+    /** 关闭全部可控灯，同时取消心跳、存储活动等自动触发器。 */
+    @Synchronized
     fun allOff() {
         setFillLight(0)
         for (led in allLeds) {

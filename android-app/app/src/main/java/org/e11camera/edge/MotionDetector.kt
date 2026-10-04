@@ -9,7 +9,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 /**
  * 宝宝守护：基于帧差的动作检测。
  *
- * 复用 CameraStreamer 每秒产出的 JPEG 快照（latestJpeg）做降采样帧差，
+ * 每秒按需获取 CameraStreamer 的 JPEG 快照做降采样帧差，
  * 不触碰 30fps 零拷贝编码路径。宝宝翻身/醒来是持续数秒的动作，
  * 1 秒采样粒度足够。
  *
@@ -95,19 +95,32 @@ class MotionDetector(
     fun hasRecentEvidence(now: Long = System.currentTimeMillis(), maxAgeMs: Long = 6_000L): Boolean =
         isActive && lastMotionEvidenceAt > 0L && now - lastMotionEvidenceAt in 0..maxAgeMs
 
-    @Synchronized
     private fun tick() {
+        if (!running.get()) return
+        // 等待相机的单帧请求放在状态锁外，停止守护不必等待取帧超时。
+        val source = try {
+            if (motor.isBusy()) null else streamer.requestJpegSnapshot()
+        } catch (e: Exception) {
+            Log.w(TAG, "请求动作检测快照异常", e)
+            return
+        }
+        processSnapshot(source)
+    }
+
+    @Synchronized
+    private fun processSnapshot(source: CameraStreamer.JpegSnapshot?) {
+        if (!running.get()) return
         try {
             if (motor.isBusy()) {
                 // 云台转动整幅画面都在变：丢弃参考帧并清空窗口，不产生样本。
                 resetMotionState()
                 return
             }
-            val jpeg = streamer.latestJpeg
-            if (jpeg.isEmpty()) {
+            if (source == null || source.bytes.isEmpty()) {
                 resetMotionState()
                 return
             }
+            val jpeg = source.bytes
             val gray = decodeGray(jpeg)
             if (gray == null) {
                 resetMotionState()

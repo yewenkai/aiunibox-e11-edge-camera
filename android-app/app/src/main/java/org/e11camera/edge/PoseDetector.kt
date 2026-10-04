@@ -80,6 +80,7 @@ class PoseDetector(
     private val inferenceLock = Any()
     private val stateMachine = PostureStateMachine()
     private var scheduler: ScheduledExecutorService? = null
+    private var stopGeneration = 0L // Protected by this object's monitor.
 
     private var poseHandle = 0L
     private var poseInputW = DEFAULT_POSE_INPUT
@@ -119,6 +120,7 @@ class PoseDetector(
 
     @Synchronized
     fun stop() {
+        stopGeneration++
         if (!running.getAndSet(false) && poseHandle == 0L && faceHandle == 0L) return
         scheduler?.shutdownNow()
         scheduler = null
@@ -152,61 +154,75 @@ class PoseDetector(
     fun diagnosticsSummary(): PoseDiagnosticsSummary = diagnostics.summary()
 
     /** 单次模型冒烟，不启动动作/哭声、不调用姿态通知回调，也不计入 24 小时影子样本。 */
-    @Synchronized
     fun selfTest(): PoseAnalysisSnapshot? {
+        val generation = synchronized(this) {
+            if (!deviceState.captureEnabled || deviceState.privacyMode) return null
+            stopGeneration
+        }
+        // 取帧可能等待 Camera HAL 就绪；期间 stop 可以立即取消本次自测。
+        val source = streamer.requestJpegSnapshot(timeoutMs = 5_000L) ?: return null
+        if (source.bytes.isEmpty()) return null
+        return synchronized(this) {
+            if (generation != stopGeneration || !deviceState.captureEnabled || deviceState.privacyMode) {
+                return@synchronized null
+            }
+            runSelfTestLocked(source)
+        }
+    }
+
+    /** 调用方持有对象锁；模型加载、分析和临时模型释放与 start/stop 串行。 */
+    private fun runSelfTestLocked(source: CameraStreamer.JpegSnapshot): PoseAnalysisSnapshot? {
         val wasRunning = running.get()
         if (!modelLoaded && !loadNativeAndPoseModel()) return null
-        val source = streamer.latestJpegSnapshot()
-        if (source.bytes.isEmpty()) {
-            if (!wasRunning) synchronized(inferenceLock) { destroyModelsLocked() }
-            return null
-        }
-        var result = analyze(source, recordDiagnostics = false).snapshot
-        // 冒烟时额外用画面中心裁剪检查 RetinaFace 的加载与输出契约；结果不作业务判断。
-        if (faceModelAvailable) {
-            val bitmap = BitmapFactory.decodeByteArray(source.bytes, 0, source.bytes.size)
-            if (bitmap != null) {
-                try {
-                    val keypoints = FloatArray(TOTAL_KEYPOINTS * 3).apply {
-                        this[0] = 0.5f
-                        this[1] = 0.5f
-                        this[2] = 1f
-                    }
-                    val face = synchronized(inferenceLock) {
-                        analyzeFaceOnDemand(
-                            bitmap,
-                            PosePerson(
-                                box = floatArrayOf(0.25f, 0.25f, 0.5f, 0.5f, 1f),
-                                keypoints = keypoints
+        try {
+            var result = analyze(source, recordDiagnostics = false).snapshot
+            // 冒烟时额外用画面中心裁剪检查 RetinaFace 的加载与输出契约；结果不作业务判断。
+            if (faceModelAvailable) {
+                val bitmap = BitmapFactory.decodeByteArray(source.bytes, 0, source.bytes.size)
+                if (bitmap != null) {
+                    try {
+                        val keypoints = FloatArray(TOTAL_KEYPOINTS * 3).apply {
+                            this[0] = 0.5f
+                            this[1] = 0.5f
+                            this[2] = 1f
+                        }
+                        val face = synchronized(inferenceLock) {
+                            analyzeFaceOnDemand(
+                                bitmap,
+                                PosePerson(
+                                    box = floatArrayOf(0.25f, 0.25f, 0.5f, 0.5f, 1f),
+                                    keypoints = keypoints
+                                )
                             )
+                        }
+                        result = result.copy(
+                            faceStatus = face.status,
+                            faceScore = face.score,
+                            faceInferenceMs = face.inferenceMs
                         )
+                        latest = result
+                    } finally {
+                        bitmap.recycle()
                     }
-                    result = result.copy(
-                        faceStatus = face.status,
-                        faceScore = face.score,
-                        faceInferenceMs = face.inferenceMs
-                    )
-                    latest = result
-                } finally {
-                    bitmap.recycle()
+                }
+            }
+            return result
+        } finally {
+            if (!wasRunning) {
+                synchronized(inferenceLock) {
+                    destroyModelsLocked()
+                    stateMachine.reset()
+                    resetTargetTracking()
                 }
             }
         }
-        if (!wasRunning) {
-            synchronized(inferenceLock) {
-                destroyModelsLocked()
-                stateMachine.reset()
-                resetTargetTracking()
-            }
-        }
-        return result
     }
 
     private fun tick() {
         if (!running.get() || !deviceState.poseAnalysisEnabled) return
         try {
-            val source = streamer.latestJpegSnapshot()
-            if (source.bytes.isEmpty()) return
+            val source = streamer.requestJpegSnapshot() ?: return
+            if (!running.get() || !deviceState.poseAnalysisEnabled || source.bytes.isEmpty()) return
             val result = analyze(source, recordDiagnostics = true)
             val callbackTransition = result.transition ?: result.snapshot.stablePosture
                 .takeIf {

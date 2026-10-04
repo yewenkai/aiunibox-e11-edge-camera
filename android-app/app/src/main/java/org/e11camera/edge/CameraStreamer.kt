@@ -7,284 +7,416 @@ import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
+import android.hardware.camera2.CaptureFailure
 import android.hardware.camera2.CaptureRequest
 import android.media.Image
 import android.media.ImageReader
-import android.util.Log
-import android.view.Surface
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.Looper
+import android.os.SystemClock
+import android.util.Log
+import android.view.Surface
 import java.io.ByteArrayOutputStream
-import java.nio.ByteBuffer
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
-/**
- * Camera2 摄像头采集器：打开 GC2083，持续取 YUV_420_888 帧 → 转 JPEG → 存最新帧。
- * 外部通过 [latestJpeg] 读取用于 MJPEG 推流。
- *
- * 当前采集分辨率 640×480、目标 30fps（优先兼容设备 Camera HAL）。
- */
+/** Camera2 视频持续送硬件编码器；YUV/JPEG 仅在快照或分析需要新帧时采集。 */
 class CameraStreamer(private val context: Context) {
     companion object {
         private const val TAG = "CameraStreamer"
         private const val WIDTH = 640
         private const val HEIGHT = 480
+        private const val CAPTURE_TIMEOUT_MS = 1_500L
     }
 
-    data class JpegSnapshot(
-        val bytes: ByteArray,
-        val capturedAtMs: Long
-    )
+    data class JpegSnapshot(val bytes: ByteArray, val capturedAtMs: Long)
 
-    /** 本地预览 Surface（App 前台回显用），为 null 时不回显 */
-    @Volatile
-    var previewSurface: android.view.Surface? = null
-
+    @Volatile var previewSurface: Surface? = null
     private val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
-    private val executor = Executors.newSingleThreadExecutor()
     private val callbackThread = HandlerThread("camera-cb").apply { start() }
     private val handler = Handler(callbackThread.looper)
+    private val jpegExecutor = Executors.newSingleThreadExecutor { task -> Thread(task, "jpeg-worker") }
     private val desiredRunning = AtomicBoolean(false)
-    private val opening = AtomicBoolean(false)
+    private val stopped = AtomicBoolean(false)
     private val jpegMonitor = Object()
+    private val demand = SnapshotDemandQueue()
+    private var demandEpoch = 0L // Protected by jpegMonitor.
 
-    @Volatile
-    private var requestedJpegSequence = 0L
-
-    @Volatile
-    private var completedJpegSequence = 0L
-
-    @Volatile
-    @get:Synchronized
-    var latestJpeg: ByteArray = ByteArray(0)
+    @Volatile @get:Synchronized var latestJpeg: ByteArray = ByteArray(0)
+        private set
+    @Volatile var latestJpegCapturedAtMs: Long = 0L
+        private set
+    @Volatile var yuvFrameCount: Long = 0L
+        private set
+    @Volatile var jpegFrameCount: Long = 0L
         private set
 
-    /** 最新 JPEG 快照完成转换的系统时间，用于页面判断采集链路是否卡住。 */
-    @Volatile
-    var latestJpegCapturedAtMs: Long = 0L
-        private set
+    /** 视频活性不依赖按需 JPEG；状态查询本身不会触发新快照。 */
+    val latestFrameCapturedAtMs: Long
+        get() = maxOf(h264Encoder?.lastOutputAtMs ?: 0L, latestJpegCapturedAtMs)
 
-    /** 同时读取 JPEG 和其采集时间，避免拿到不同帧的字节与时间。 */
     fun latestJpegSnapshot(): JpegSnapshot = synchronized(this) {
         JpegSnapshot(latestJpeg, latestJpegCapturedAtMs)
     }
 
-    /**
-     * 请求相机回调将下一帧立即转成 JPEG。
-     *
-     * 日常推流仍每 30 帧生成一张快照；只有事件告警等少量调用会
-     * 临时补一张，不会把整条采集链路退回到每帧 YUV 转 JPEG。
-     */
-    fun requestFreshJpeg(timeoutMs: Long): JpegSnapshot? {
-        if (timeoutMs <= 0L || !desiredRunning.get()) return null
-        val deadline = System.currentTimeMillis() + timeoutMs
-        synchronized(jpegMonitor) {
-            val sequence = ++requestedJpegSequence
-            while (desiredRunning.get() && completedJpegSequence < sequence) {
-                val remaining = deadline - System.currentTimeMillis()
-                if (remaining <= 0L) return null
-                try {
-                    jpegMonitor.wait(remaining)
-                } catch (_: InterruptedException) {
-                    Thread.currentThread().interrupt()
-                    return null
-                }
-            }
-            if (completedJpegSequence < sequence) return null
-        }
-        return latestJpegSnapshot().takeIf { it.bytes.isNotEmpty() }
+    /** 多个消费者可共用最近的快照；只有缓存过期才进入采集队列。 */
+    fun requestJpegSnapshot(maxAgeMs: Long = 750L, timeoutMs: Long = 1_500L): JpegSnapshot? {
+        if (!desiredRunning.get()) return null
+        val cached = latestJpegSnapshot()
+        val age = System.currentTimeMillis() - cached.capturedAtMs
+        if (cached.bytes.isNotEmpty() && age in 0..maxAgeMs) return cached
+        return requestFreshJpeg(timeoutMs)
     }
 
-    @Volatile
-    private var camera: CameraDevice? = null
-    @Volatile
+    /** 冻结提交前的请求批次；采集开始后到来的请求必须等下一帧。 */
+    fun requestFreshJpeg(timeoutMs: Long): JpegSnapshot? {
+        if (timeoutMs <= 0L || !desiredRunning.get() || stopped.get() ||
+            Looper.myLooper() == callbackThread.looper) return null
+        val deadline = SystemClock.elapsedRealtime() + timeoutMs
+        synchronized(jpegMonitor) {
+            if (!desiredRunning.get()) return null
+            val epoch = demandEpoch
+            val sequence = demand.enqueue(deadline)
+            handler.post(pumpRunnable)
+            try {
+                while (desiredRunning.get() && epoch == demandEpoch &&
+                    !demand.isCompleted(sequence) && demand.isPending(sequence)) {
+                    val remaining = deadline - SystemClock.elapsedRealtime()
+                    if (remaining <= 0L) return null
+                    try {
+                        jpegMonitor.wait(remaining)
+                    } catch (_: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        return null
+                    }
+                }
+                if (epoch != demandEpoch || !demand.isCompleted(sequence) ||
+                    SystemClock.elapsedRealtime() >= deadline) return null
+                return latestJpegSnapshot().takeIf { it.bytes.isNotEmpty() }
+            } finally {
+                demand.cancel(sequence)
+            }
+        }
+    }
+
+    @Volatile private var camera: CameraDevice? = null
     private var session: CameraCaptureSession? = null
-    @Volatile
     private var imageReader: ImageReader? = null
-    @Volatile
     private var timestampCompositor: VideoTimestampCompositor? = null
+    private var snapshotRequest: CaptureRequest? = null
+    // CameraDevice, session and capture lifecycle are owned exclusively by camera-cb.
+    private var cameraGeneration = 0L
+    private var opening = false
+    private var activeCapture: SnapshotCapture? = null
+    private var unmatchedImage: Image? = null
 
-    /** H.264 硬件编码器（用于 RTSP 推流）*/
-    @Volatile
-    var h264Encoder: H264Encoder? = null
+    private class SnapshotCapture(val sequence: Long, val generation: Long, val reader: ImageReader) {
+        var sensorTimestamp: Long? = null
+        var processing = false
+    }
+
+    /** Called on camera-cb only after a new encoder has started successfully. */
+    @Volatile var onEncoderReady: ((H264Encoder) -> Unit)? = null
+
+    @Volatile var h264Encoder: H264Encoder? = null
         private set
+    val isRunning: Boolean get() = camera != null
 
-    val isRunning: Boolean
-        get() = camera != null
-
-    @SuppressLint("MissingPermission")
     fun start() {
+        if (stopped.get()) return
         desiredRunning.set(true)
-        openCamera()
+        handler.post { openCamera() }
     }
 
     @SuppressLint("MissingPermission")
     private fun openCamera() {
-        if (!desiredRunning.get() || camera != null || !opening.compareAndSet(false, true)) {
-            return
-        }
-
-        // 启动 H.264 编码器
-        if (h264Encoder == null) {
-            val enc = H264Encoder(WIDTH, HEIGHT)
-            enc.start()
-            h264Encoder = enc
-        }
-        val camId = findFrontCamera() ?: run {
-            Log.e(TAG, "找不到摄像头")
-            opening.set(false)
-            scheduleRetry()
-            return
-        }
+        if (!desiredRunning.get() || stopped.get() || camera != null || opening) return
+        opening = true
+        val generation = ++cameraGeneration
         try {
-            cameraManager.openCamera(camId, executor as java.util.concurrent.Executor, object : CameraDevice.StateCallback() {
+            if (h264Encoder == null) {
+                val encoder = H264Encoder(WIDTH, HEIGHT)
+                check(encoder.start()) { "编码器启动失败" }
+                h264Encoder = encoder
+                onEncoderReady?.invoke(encoder)
+            }
+            val camId = findFrontCamera() ?: throw IllegalStateException("找不到摄像头")
+            cameraManager.openCamera(camId, object : CameraDevice.StateCallback() {
                 override fun onOpened(c: CameraDevice) {
-                    opening.set(false)
-                    if (!desiredRunning.get()) {
+                    if (generation != cameraGeneration || !desiredRunning.get() || stopped.get()) {
                         c.close()
                         return
                     }
+                    opening = false
                     camera = c
-                    startCapture(c)
+                    startCapture(c, generation)
                 }
-
-                override fun onDisconnected(c: CameraDevice) {
-                    opening.set(false)
-                    c.close()
-                    camera = null
-                    scheduleRetry()
-                }
-
-                override fun onError(c: CameraDevice, error: Int) {
-                    opening.set(false)
-                    Log.e(TAG, "Camera onError=$error")
-                    c.close()
-                    camera = null
-                    scheduleRetry()
-                }
-            })
+                override fun onDisconnected(c: CameraDevice) = cameraFailed(c, generation, "disconnected")
+                override fun onError(c: CameraDevice, error: Int) = cameraFailed(c, generation, "error=$error")
+            }, handler)
         } catch (e: Exception) {
-            opening.set(false)
+            opening = false
             Log.e(TAG, "openCamera 失败", e)
             scheduleRetry()
         }
     }
 
-    private fun scheduleRetry(delayMs: Long = 1500L) {
-        if (!desiredRunning.get()) return
+    private fun cameraFailed(c: CameraDevice, generation: Long, reason: String) {
+        c.close()
+        if (generation != cameraGeneration) return
+        Log.w(TAG, "摄像头异常 $reason")
+        closeCameraOnly()
+        scheduleRetry()
+    }
+
+    private val retryRunnable = Runnable { openCamera() }
+    private fun scheduleRetry(delayMs: Long = 1_500L) {
+        if (!desiredRunning.get() || stopped.get()) return
         handler.removeCallbacks(retryRunnable)
         handler.postDelayed(retryRunnable, delayMs)
     }
 
-    private val retryRunnable = Runnable {
-        if (desiredRunning.get() && camera == null) {
-            Log.i(TAG, "尝试重新打开摄像头")
-            openCamera()
-        }
-    }
-
-    private fun startCapture(c: CameraDevice) {
-        // 编码器 Surface（零拷贝主路径）
-        val encSurface = h264Encoder?.inputSurface
-        val encodedTarget = if (encSurface != null) {
-            timestampCompositor?.cameraSurface ?: VideoTimestampCompositor(
+    private fun startCapture(c: CameraDevice, generation: Long) {
+        try {
+            val encSurface = h264Encoder?.inputSurface
+                ?: throw IllegalStateException("编码器 Surface 未就绪")
+            val encodedTarget = timestampCompositor?.cameraSurface ?: VideoTimestampCompositor(
                 encSurface, WIDTH, HEIGHT
             ).let { compositor ->
-                val target = compositor.start()
-                if (target != null) {
-                    timestampCompositor = compositor
-                    target
-                } else {
-                    Log.w(TAG, "时间戳合成不可用，回退 Camera2 直连编码器")
-                    encSurface
-                }
+                compositor.start()?.also { timestampCompositor = compositor } ?: encSurface
             }
-        } else null
-
-        // 组装输出 Surface：编码器零拷贝主路径 + 低频 JPEG 快照 + 本地预览。
-        // ImageReader 每帧只做快速丢弃，每 30 帧才压缩一张 JPEG，不回退到
-        // 早期“每帧 YUV 转 JPEG”的高 CPU 路径。
-        val targets = ArrayList<Surface>()
-        if (encodedTarget != null) targets.add(encodedTarget)
-        previewSurface?.let { targets.add(it) }
-        val reader = ImageReader.newInstance(WIDTH, HEIGHT, ImageFormat.YUV_420_888, 2)
-        reader.setOnImageAvailableListener({ onImage(it) }, handler)
-        imageReader = reader
-        targets.add(reader.surface)
-
-        try {
-            c.createCaptureSession(
-                targets,
-                object : CameraCaptureSession.StateCallback() {
-                    override fun onConfigured(s: CameraCaptureSession) {
-                        // Surface 变化可能触发会话重建；旧会话的回调仍可能晚到。
-                        // 此时 CameraDevice 已关闭，必须丢弃旧回调，不能继续创建请求。
-                        if (!desiredRunning.get() || camera !== c) {
-                            Log.i(TAG, "忽略已过期的 CaptureSession 回调")
-                            s.close()
-                            return
-                        }
-                        session = s
-                        LedController.restoreCameraLight()
-                        try {
-                            val req = c.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
-                            if (encodedTarget != null) req.addTarget(encodedTarget)
-                            imageReader?.let { req.addTarget(it.surface) }
-                            previewSurface?.takeIf { it.isValid }?.let { req.addTarget(it) }
-                            req.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
-                            req.set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
-                            req.set(
-                                CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
-                                android.util.Range(30, 30)
-                            )
-                            s.setRepeatingRequest(req.build(), null, handler)
-                            Log.i(
-                                TAG,
-                                "采集已启动 ${WIDTH}x$HEIGHT Surface=${encodedTarget != null} timestamp=${timestampCompositor != null} targets=${targets.size}"
-                            )
-                        } catch (e: IllegalStateException) {
-                            Log.w(TAG, "CameraDevice 状态已变化，重新建立采集会话", e)
-                            s.close()
-                            restartCapture()
-                        } catch (e: IllegalArgumentException) {
-                            Log.w(TAG, "预览 Surface 已失效，重新建立采集会话", e)
-                            s.close()
-                            restartCapture()
-                        }
+            val previewTarget = previewSurface?.takeIf { it.isValid }
+            val reader = ImageReader.newInstance(WIDTH, HEIGHT, ImageFormat.YUV_420_888, 2)
+            reader.setOnImageAvailableListener({ onImage(it) }, handler)
+            imageReader = reader
+            val targets = arrayListOf(encodedTarget, reader.surface)
+            previewTarget?.let { targets.add(it) }
+            c.createCaptureSession(targets, object : CameraCaptureSession.StateCallback() {
+                override fun onConfigured(s: CameraCaptureSession) {
+                    if (generation != cameraGeneration || !desiredRunning.get() || camera !== c) {
+                        s.close()
+                        return
                     }
-
-                    override fun onConfigureFailed(s: CameraCaptureSession) {
-                        Log.e(TAG, "CaptureSession 配置失败")
+                    session = s
+                    try {
+                        fun request(includeYuv: Boolean): CaptureRequest {
+                            return c.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
+                                addTarget(encodedTarget)
+                                previewTarget?.let { addTarget(it) }
+                                if (includeYuv) addTarget(reader.surface)
+                                set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+                                set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
+                                set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, android.util.Range(30, 30))
+                            }.build()
+                        }
+                        snapshotRequest = request(true)
+                        s.setRepeatingRequest(request(false), null, handler)
+                        LedController.restoreRequestedLights()
+                        Log.i(TAG, "采集已启动 ${WIDTH}x$HEIGHT，视频 30fps / YUV 按需")
+                        pumpSnapshot()
+                    } catch (e: Exception) {
+                        Log.w(TAG, "建立采集请求失败", e)
                         restartCapture()
                     }
-                },
-                handler
-            )
+                }
+                override fun onConfigureFailed(s: CameraCaptureSession) {
+                    s.close()
+                    if (generation != cameraGeneration || camera !== c || !desiredRunning.get()) return
+                    Log.e(TAG, "CaptureSession 配置失败")
+                    restartCapture()
+                }
+            }, handler)
         } catch (e: Exception) {
             Log.e(TAG, "startCapture 失败", e)
             restartCapture()
         }
     }
 
-    /**
-     * 重新建立 Camera2 会话，但保留编码器和工作线程。
-     * 用于预览 Surface 变化、摄像头异常恢复，避免旧实现把线程关闭后再次复用。
-     */
+    private val pumpRunnable = Runnable { pumpSnapshot() }
+    private fun pumpSnapshot() {
+        handler.removeCallbacks(pumpRunnable)
+        if (!desiredRunning.get() || stopped.get() || activeCapture != null) return
+        val now = SystemClock.elapsedRealtime()
+        if (!synchronized(jpegMonitor) { demand.hasDemand(now) }) return
+        val s = session
+        val reader = imageReader
+        val request = snapshotRequest
+        if (s == null || reader == null || request == null) {
+            handler.postDelayed(pumpRunnable, 100)
+            return
+        }
+        val sequence = synchronized(jpegMonitor) { demand.claim(now) } ?: return
+        val capture = SnapshotCapture(sequence, cameraGeneration, reader)
+        activeCapture = capture
+        try {
+            // Also targets the encoder/preview, preserving video output for this sensor frame.
+            s.capture(request, object : CameraCaptureSession.CaptureCallback() {
+                override fun onCaptureStarted(s: CameraCaptureSession, r: CaptureRequest, timestamp: Long, frameNumber: Long) {
+                    if (activeCapture !== capture) return
+                    capture.sensorTimestamp = timestamp
+                    unmatchedImage?.let { pending ->
+                        unmatchedImage = null
+                        if (pending.timestamp == timestamp) processImage(pending, capture) else pending.close()
+                    }
+                }
+                override fun onCaptureFailed(s: CameraCaptureSession, r: CaptureRequest, failure: CaptureFailure) {
+                    if (!capture.processing) captureFailed(capture, "capture_failed=${failure.reason}")
+                }
+            }, handler)
+            handler.postDelayed({ captureFailed(capture, "timeout") }, CAPTURE_TIMEOUT_MS)
+        } catch (e: Exception) {
+            Log.w(TAG, "按需快照提交失败", e)
+            captureFailed(capture, "submit_failed")
+        }
+    }
+
+    private fun captureFailed(capture: SnapshotCapture, reason: String) {
+        if (activeCapture !== capture) return
+        Log.w(TAG, "按需快照未完成 $reason")
+        unmatchedImage?.close()
+        unmatchedImage = null
+        activeCapture = null
+        synchronized(jpegMonitor) {
+            demand.release(capture.sequence)
+            jpegMonitor.notifyAll()
+        }
+        handler.postDelayed(pumpRunnable, 100)
+    }
+
+    private fun onImage(reader: ImageReader) {
+        val image = try { reader.acquireNextImage() } catch (_: IllegalStateException) { null } ?: return
+        yuvFrameCount++
+        val capture = activeCapture
+        if (!desiredRunning.get() || imageReader !== reader || capture == null ||
+            capture.reader !== reader || capture.generation != cameraGeneration || capture.processing) {
+            image.close()
+            return
+        }
+        val timestamp = capture.sensorTimestamp
+        if (timestamp == null) {
+            unmatchedImage?.close()
+            unmatchedImage = image
+        } else if (timestamp == image.timestamp) {
+            processImage(image, capture)
+        } else {
+            image.close()
+        }
+    }
+
+    private fun processImage(image: Image, capture: SnapshotCapture) {
+        capture.processing = true
+        val capturedAtMs = System.currentTimeMillis()
+        val nv21 = try { imageToNv21(image) } catch (e: Exception) {
+            Log.w(TAG, "YUV 读取失败", e)
+            captureFailed(capture, "yuv_failed")
+            return
+        } finally {
+            image.close()
+        }
+        jpegExecutor.execute {
+            val jpeg = try {
+                ByteArrayOutputStream().use { out ->
+                    check(android.graphics.YuvImage(nv21, ImageFormat.NV21, WIDTH, HEIGHT, null)
+                        .compressToJpeg(android.graphics.Rect(0, 0, WIDTH, HEIGHT), 30, out))
+                    out.toByteArray()
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "JPEG 转码失败", e)
+                null
+            }
+            handler.post {
+                if (activeCapture !== capture || capture.generation != cameraGeneration || !desiredRunning.get()) return@post
+                if (jpeg == null) {
+                    captureFailed(capture, "jpeg_failed")
+                    return@post
+                }
+                synchronized(jpegMonitor) {
+                    if (demand.complete(capture.sequence)) {
+                        synchronized(this) {
+                            latestJpeg = jpeg
+                            latestJpegCapturedAtMs = capturedAtMs
+                        }
+                        jpegFrameCount++
+                    }
+                    jpegMonitor.notifyAll()
+                }
+                activeCapture = null
+                pumpSnapshot()
+            }
+        }
+    }
+
+    /** Handle padded rows and separate/interleaved chroma planes. */
+    private fun imageToNv21(image: Image): ByteArray {
+        val w = image.width
+        val h = image.height
+        require(w == WIDTH && h == HEIGHT)
+        val out = ByteArray(w * h * 3 / 2)
+        val y = image.planes[0]
+        val u = image.planes[1]
+        val v = image.planes[2]
+        val yBuffer = y.buffer.duplicate()
+        val uBuffer = u.buffer.duplicate()
+        val vBuffer = v.buffer.duplicate()
+        val yRowStride = y.rowStride
+        val yPixelStride = y.pixelStride
+        val uRowStride = u.rowStride
+        val uPixelStride = u.pixelStride
+        val vRowStride = v.rowStride
+        val vPixelStride = v.pixelStride
+        for (row in 0 until h) {
+            val offset = row * yRowStride
+            if (yPixelStride == 1) {
+                yBuffer.position(offset)
+                yBuffer.get(out, row * w, w)
+            } else {
+                for (col in 0 until w) out[row * w + col] = yBuffer.get(offset + col * yPixelStride)
+            }
+        }
+        var offset = w * h
+        for (row in 0 until h / 2) {
+            for (col in 0 until w / 2) {
+                out[offset++] = vBuffer.get(row * vRowStride + col * vPixelStride)
+                out[offset++] = uBuffer.get(row * uRowStride + col * uPixelStride)
+            }
+        }
+        return out
+    }
+
     fun restartCapture() {
-        if (!desiredRunning.get()) return
+        if (!desiredRunning.get() || stopped.get()) return
         handler.post {
+            if (!desiredRunning.get() || stopped.get()) return@post
             closeCameraOnly()
             scheduleRetry(300)
         }
     }
 
-    /** 隐私模式暂停采集；保留工作线程，使摄像头可以原地恢复。 */
-    fun pause() {
-        desiredRunning.set(false)
-        synchronized(jpegMonitor) { jpegMonitor.notifyAll() }
-        handler.removeCallbacks(retryRunnable)
-        closeCameraOnly()
+    private fun invalidateDemand() = synchronized(jpegMonitor) {
+        demandEpoch++
+        demand.clear()
+        jpegMonitor.notifyAll()
+    }
+
+    private fun closeCameraOnly() {
+        cameraGeneration++
+        invalidateDemand()
+        handler.removeCallbacks(pumpRunnable)
+        activeCapture = null
+        unmatchedImage?.close()
+        unmatchedImage = null
+        snapshotRequest = null
+        val oldSession = session.also { session = null }
+        val oldReader = imageReader.also { imageReader = null }
+        val oldCamera = camera.also { camera = null }
+        opening = false
+        for (close in listOf<() -> Unit>({ oldSession?.close() }, { oldReader?.close() }, { oldCamera?.close() })) {
+            try { close() } catch (e: Exception) { Log.w(TAG, "关闭相机会话异常", e) }
+        }
+    }
+
+    private fun closeVideo() {
         timestampCompositor?.stop()
         timestampCompositor = null
         h264Encoder?.stop()
@@ -293,152 +425,36 @@ class CameraStreamer(private val context: Context) {
             latestJpeg = ByteArray(0)
             latestJpegCapturedAtMs = 0L
         }
-        Log.i(TAG, "摄像头已暂停")
     }
 
-    /** 从隐私模式恢复采集。 */
-    fun resume() {
-        start()
-    }
-
-    private fun closeCameraOnly() {
-        try {
-            session?.close()
-            session = null
-            imageReader?.close()
-            imageReader = null
-            camera?.close()
-            camera = null
-            opening.set(false)
-        } catch (e: Exception) {
-            Log.w(TAG, "关闭 Camera2 会话异常", e)
+    fun pause() {
+        desiredRunning.set(false)
+        invalidateDemand()
+        handler.post {
+            handler.removeCallbacks(retryRunnable)
+            closeCameraOnly()
+            closeVideo()
+            Log.i(TAG, "摄像头已暂停")
         }
     }
 
-    private var jpegSkipCounter = 0
+    fun resume() = start()
 
-    private fun onImage(reader: ImageReader) {
-        val image = reader.acquireNextImage() ?: return
-        try {
-            // H.264 编码走 Surface 零拷贝，不需要在这里喂编码器
-            // JPEG 快照：每 30 帧做一次（约每秒一张，大幅省 CPU）
-            jpegSkipCounter++
-            val forcedSequence = requestedJpegSequence
-            if (jpegSkipCounter >= 30 || forcedSequence > completedJpegSequence) {
-                jpegSkipCounter = 0
-                val jpeg = yuvToJpeg(image)
-                synchronized(this) {
-                    latestJpeg = jpeg
-                    latestJpegCapturedAtMs = System.currentTimeMillis()
-                }
-                synchronized(jpegMonitor) {
-                    // 同一张新帧可以满足转码期间累积的多个请求。
-                    completedJpegSequence = requestedJpegSequence
-                    jpegMonitor.notifyAll()
-                }
-            } else {
-                // 不做 JPEG 的帧也要快速丢弃，避免 ImageReader 积压
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "转码失败", e)
-        } finally {
-            image.close()
-        }
-    }
-
-    /** YUV_420_888 → NV21 → JPEG */
-    private fun yuvToJpeg(image: Image): ByteArray {
-        val w = image.width
-        val h = image.height
-        val planes = image.planes
-        // 转 NV21
-        val nv21 = ByteArray(w * h * 3 / 2)
-        // Y
-        val yBuf = planes[0].buffer
-        val yRowStride = planes[0].rowStride
-        val yPixStride = planes[0].pixelStride
-        // U/V 交错的可能，这里用通用方式填充
-        fillPlane(nv21, 0, yBuf, yRowStride, yPixStride, w, h)
-
-        val uBuf = planes[1].buffer
-        val vBuf = planes[2].buffer
-        val uRowStride = planes[1].rowStride
-        val uPixStride = planes[1].pixelStride
-        val vRowStride = planes[2].rowStride
-        val vPixStride = planes[2].pixelStride
-
-        val chromaRowStride = Math.max(uRowStride, vRowStride)
-        val chromaPixStride = Math.max(uPixStride, vPixStride)
-        val chromaW = w / 2
-        val chromaH = h / 2
-        var off = w * h
-        val chromaBuf = ByteArray(chromaW * chromaH * 2)
-        val ub = ByteArray(1)
-        val vb = ByteArray(1)
-        for (row in 0 until chromaH) {
-            for (col in 0 until chromaW) {
-                val uIdx = row * uRowStride + col * uPixStride
-                val vIdx = row * vRowStride + col * vPixStride
-                uBuf.position(uIdx); uBuf.get(ub)
-                vBuf.position(vIdx); vBuf.get(vb)
-                nv21[off] = vb[0]; off++
-                nv21[off] = ub[0]; off++
-            }
-        }
-
-        // NV21 → JPEG
-        val yuvImage = android.graphics.YuvImage(
-            nv21, ImageFormat.NV21, w, h, null
-        )
-        val baos = ByteArrayOutputStream()
-        yuvImage.compressToJpeg(
-            android.graphics.Rect(0, 0, w, h), 30, baos
-        )
-        return baos.toByteArray()
-    }
-
-    private fun fillPlane(
-        out: ByteArray, offset: Int, buf: ByteBuffer,
-        rowStride: Int, pixStride: Int, w: Int, h: Int
-    ) {
-        if (pixStride == rowStride) {
-            buf.position(0)
-            buf.get(out, offset, rowStride * h)
-            return
-        }
-        var rowOff = offset
-        for (r in 0 until h) {
-            buf.position(r * rowStride)
-            buf.get(out, rowOff, w * pixStride)
-            rowOff += w * pixStride
-        }
-    }
-
-    private fun findFrontCamera(): String? {
-        for (id in cameraManager.cameraIdList) {
-            val ch = cameraManager.getCameraCharacteristics(id)
-            val facing = ch.get(CameraCharacteristics.LENS_FACING)
-            if (facing == CameraCharacteristics.LENS_FACING_FRONT) return id
-        }
-        // 退而求其次：第 0 个
-        return cameraManager.cameraIdList.firstOrNull()
-    }
+    private fun findFrontCamera(): String? = cameraManager.cameraIdList.firstOrNull { id ->
+        cameraManager.getCameraCharacteristics(id).get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_FRONT
+    } ?: cameraManager.cameraIdList.firstOrNull()
 
     fun stop() {
+        if (!stopped.compareAndSet(false, true)) return
         desiredRunning.set(false)
-        synchronized(jpegMonitor) { jpegMonitor.notifyAll() }
-        handler.removeCallbacksAndMessages(null)
-        try {
+        invalidateDemand()
+        handler.post {
+            handler.removeCallbacksAndMessages(null)
             closeCameraOnly()
+            closeVideo()
+            jpegExecutor.shutdownNow()
             callbackThread.quitSafely()
-            timestampCompositor?.stop()
-            timestampCompositor = null
-            h264Encoder?.stop()
-            h264Encoder = null
-            executor.shutdownNow()
-        } catch (e: Exception) {
-            Log.w(TAG, "stop 异常", e)
+            Log.i(TAG, "摄像头已停止")
         }
-        Log.i(TAG, "摄像头已停止")
     }
 }

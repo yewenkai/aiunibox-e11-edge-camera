@@ -7,6 +7,7 @@ import android.os.Looper
 import android.util.Log
 import java.io.File
 import java.util.ArrayDeque
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ScheduledExecutorService
@@ -69,6 +70,13 @@ class NpuDetector(
         val snapshot: AlertVisionSnapshot
     )
 
+    /** 每次 start 的独立代次；旧任务只释放自己这一代的在途标记。 */
+    private class SnapshotWorker(
+        val executor: ExecutorService,
+        val scheduler: ScheduledExecutorService,
+        val inFlight: AtomicBoolean = AtomicBoolean(false)
+    )
+
     companion object {
         private const val TAG = "NpuDetector"
         private const val MODEL_FILE = "yolov8n_rk3566.rknn"
@@ -99,6 +107,7 @@ class NpuDetector(
     private val calibrationLock = Any()
     private val adultCalibrationBoxes = mutableListOf<Pair<Float, Float>>()
     private var scheduler: ScheduledExecutorService? = null
+    @Volatile private var snapshotWorker: SnapshotWorker? = null
 
     @Volatile private var adultCalibrationState =
         if (deviceState.adultCalibratedAt > 0L) "complete" else "idle"
@@ -166,15 +175,24 @@ class NpuDetector(
         if (!loadNativeAndModel()) return
         val executor = Executors.newSingleThreadScheduledExecutor()
         scheduler = executor
+        val worker = SnapshotWorker(
+            Executors.newSingleThreadExecutor { task -> Thread(task, "npu-snapshot") },
+            executor
+        )
+        snapshotWorker = worker
         running.set(true)
         // 守护启动会主动预热；常规轮询稍后开始，避免与 YAMNet 初始化抢 CPU。
-        executor.scheduleAtFixedRate({ tick() }, 5, SAMPLE_INTERVAL_SEC, TimeUnit.SECONDS)
+        executor.scheduleAtFixedRate({ tick(worker) }, 5, SAMPLE_INTERVAL_SEC, TimeUnit.SECONDS)
         Log.i(TAG, "NPU 检测已启动（YOLOv8n @${inputW}×${inputH}，每 ${SAMPLE_INTERVAL_SEC}s 一帧）")
     }
 
     @Synchronized
     fun stop() {
-        if (!running.getAndSet(false) && handle == 0L) return
+        val wasRunning = running.getAndSet(false)
+        val worker = snapshotWorker
+        snapshotWorker = null
+        worker?.executor?.shutdownNow()
+        if (!wasRunning && handle == 0L) return
         cancelAdultCalibration()
         scheduler?.shutdownNow()
         scheduler = null
@@ -271,14 +289,48 @@ class NpuDetector(
         outputCount = 0
     }
 
-    private fun tick() {
-        // 已有告警等待时，让队列里的常规轮询主动让路，避免 2 秒任务先占满告警预算。
-        if (!running.get() || pendingAlertRefreshes.get() > 0) return
+    private fun isSnapshotWorkerCurrent(worker: SnapshotWorker): Boolean =
+        running.get() && snapshotWorker === worker && scheduler === worker.scheduler
+
+    private fun tick(worker: SnapshotWorker) {
+        // 取帧不占用告警调度线程；最多一个常规采样在取帧或等待推理。
+        if (!isSnapshotWorkerCurrent(worker) || pendingAlertRefreshes.get() > 0 ||
+            !worker.inFlight.compareAndSet(false, true)) return
         try {
-            val snapshot = streamer.latestJpegSnapshot()
-            if (snapshot.bytes.isEmpty()) return
-            runInference(snapshot, "scheduled")
+            worker.executor.execute snapshot@{
+                var handedOff = false
+                try {
+                    if (!isSnapshotWorkerCurrent(worker) || pendingAlertRefreshes.get() > 0) return@snapshot
+                    val snapshot = streamer.requestJpegSnapshot() ?: return@snapshot
+                    if (!isSnapshotWorkerCurrent(worker) || pendingAlertRefreshes.get() > 0 ||
+                        snapshot.bytes.isEmpty()) return@snapshot
+                    worker.scheduler.execute inference@{
+                        try {
+                            synchronized(inferenceLock) {
+                                if (!isSnapshotWorkerCurrent(worker) || pendingAlertRefreshes.get() > 0) return@inference
+                                runInference(snapshot, "scheduled")
+                            }
+                        } catch (e: Exception) {
+                            if (e is InterruptedException) Thread.currentThread().interrupt()
+                            Log.w(TAG, "常规 NPU 分析异常", e)
+                        } finally {
+                            worker.inFlight.set(false)
+                        }
+                    }
+                    handedOff = true
+                } catch (_: RejectedExecutionException) {
+                    // stop 可以在取帧完成到提交推理之间关闭这一代调度器。
+                } catch (e: Exception) {
+                    if (e is InterruptedException) Thread.currentThread().interrupt()
+                    Log.w(TAG, "请求 NPU 快照异常", e)
+                } finally {
+                    if (!handedOff) worker.inFlight.set(false)
+                }
+            }
+        } catch (_: RejectedExecutionException) {
+            worker.inFlight.set(false)
         } catch (e: Exception) {
+            worker.inFlight.set(false)
             Log.w(TAG, "tick 异常", e)
         }
     }

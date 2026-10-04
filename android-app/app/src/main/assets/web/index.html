@@ -1851,7 +1851,7 @@ async function refreshStatus() {
     $('fpsBadge').textContent = fps > 0 ? `设备 ${fps.toFixed(1)} fps` : '设备帧率 --';
     const capturedAt = Number(j.frameCapturedAt || 0);
     const stale = capturedAt <= 0 || now - capturedAt > 5000;
-    $('frameHealth').textContent = capturedAt > 0 ? (stale ? '设备快照可能卡住' : '设备快照正常') : '等待设备首帧';
+    $('frameHealth').textContent = capturedAt > 0 ? (stale ? '设备画面可能卡住' : '设备画面正常') : '等待设备首帧';
     $('frameHealth').classList.toggle('stale', stale);
     $('status').textContent =
       `IP: ${j.ip} | 摄像头: ${j.cameraOn ? '开' : '恢复中'} | 运行: ${Math.floor(j.uptimeSeconds / 60)} 分钟`;

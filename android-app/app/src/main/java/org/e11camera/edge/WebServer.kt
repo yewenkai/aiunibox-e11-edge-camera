@@ -107,13 +107,7 @@ class WebServer(
 
     /** 单帧 JPEG 快照（前端 JS 定时轮询） */
     private fun serveSnapshot(): Response {
-        var frame = streamer.latestJpeg
-        var wait = 0
-        while (frame.isEmpty() && wait < 100) {
-            Thread.sleep(50)
-            wait++
-            frame = streamer.latestJpeg
-        }
+        val frame = streamer.requestJpegSnapshot(timeoutMs = 5_000L)?.bytes ?: ByteArray(0)
         return if (frame.isEmpty()) {
             newFixedLengthResponse(Response.Status.INTERNAL_ERROR, MIME_PLAINTEXT, "无画面")
         } else {
@@ -269,47 +263,58 @@ class WebServer(
     private fun serveMjpeg(): Response {
         val contentType = "multipart/x-mixed-replace; boundary=$BOUNDARY"
         val stream: InputStream = object : InputStream() {
-            private var running = true
+            @Volatile private var running = true
+            private var part = ByteArrayInputStream(ByteArray(0))
+            private var nextFrameAtMs = 0L
+            private var firstFrame = true
+
             override fun read(): Int {
-                // 不使用，走 read(byte[]) 分支
-                return -1
+                val one = ByteArray(1)
+                return if (read(one, 0, 1) == -1) -1 else one[0].toInt() and 0xff
             }
 
             override fun read(b: ByteArray, off: Int, len: Int): Int {
+                if (off < 0 || len < 0 || off > b.size || len > b.size - off) {
+                    throw IndexOutOfBoundsException()
+                }
+                if (len == 0) return 0
                 if (!running) return -1
                 try {
-                    var frame = streamer.latestJpeg
-                    // 等待第一帧
-                    var wait = 0
-                    while (frame.isEmpty() && wait < 100) {
-                        Thread.sleep(50)
-                        wait++
-                        frame = streamer.latestJpeg
+                    if (part.available() == 0) {
+                        // JPEG 回退保持每秒一帧，分段读取同一 part 不会再次请求相机。
+                        val waitMs = nextFrameAtMs - android.os.SystemClock.elapsedRealtime()
+                        if (waitMs > 0L) Thread.sleep(waitMs)
+                        if (!running) return -1
+                        val timeoutMs = if (firstFrame) 5_000L else 1_500L
+                        val frame = streamer.requestJpegSnapshot(timeoutMs = timeoutMs)?.bytes
+                        if (!running || frame == null || frame.isEmpty()) {
+                            close()
+                            return -1
+                        }
+                        firstFrame = false
+                        nextFrameAtMs = android.os.SystemClock.elapsedRealtime() + 1_000L
+                        val header = ("--$BOUNDARY\r\n" +
+                            "Content-Type: image/jpeg\r\n" +
+                            "Content-Length: ${frame.size}\r\n\r\n")
+                            .toByteArray(Charsets.US_ASCII)
+                        val packet = ByteArray(header.size + frame.size + 2)
+                        System.arraycopy(header, 0, packet, 0, header.size)
+                        System.arraycopy(frame, 0, packet, header.size, frame.size)
+                        packet[packet.lastIndex - 1] = '\r'.code.toByte()
+                        packet[packet.lastIndex] = '\n'.code.toByte()
+                        part = ByteArrayInputStream(packet)
                     }
-                    if (frame.isEmpty()) return -1
-
-                    val sb = StringBuilder()
-                    sb.append("--").append(BOUNDARY).append("\r\n")
-                    sb.append("Content-Type: image/jpeg\r\n")
-                    sb.append("Content-Length: ").append(frame.size).append("\r\n\r\n")
-                    val header = sb.toString().toByteArray(Charsets.US_ASCII)
-                    val tail = "\r\n".toByteArray(Charsets.US_ASCII)
-
-                    val total = header.size + frame.size + tail.size
-                    if (total > len) {
-                        // 缓冲不够，说明客户端断开
-                        running = false
-                        return -1
-                    }
-                    System.arraycopy(header, 0, b, off, header.size)
-                    System.arraycopy(frame, 0, b, off + header.size, frame.size)
-                    System.arraycopy(tail, 0, b, off + header.size + frame.size, tail.size)
-                    Thread.sleep(66) // ~15fps
-                    return total
+                    return part.read(b, off, len)
                 } catch (e: Exception) {
-                    running = false
+                    if (e is InterruptedException) Thread.currentThread().interrupt()
+                    close()
                     return -1
                 }
+            }
+
+            override fun close() {
+                running = false
+                part = ByteArrayInputStream(ByteArray(0))
             }
         }
         val resp = newChunkedResponse(Response.Status.OK, contentType, stream)
@@ -684,7 +689,10 @@ class WebServer(
             .put("streamReady", encoder?.isOutputHealthy() == true)
             .put("rtspPublishing", service?.isRtspPublishing() == true)
             .put("encodedFrames", encoder?.outputFrameCount ?: 0)
-            .put("frameCapturedAt", streamer.latestJpegCapturedAtMs)
+            .put("frameCapturedAt", streamer.latestFrameCapturedAtMs)
+            .put("jpegCapturedAt", streamer.latestJpegCapturedAtMs)
+            .put("yuvFrameCount", streamer.yuvFrameCount)
+            .put("jpegFrameCount", streamer.jpegFrameCount)
             .put("motorBusy", motor.isBusy())
             .put("uptimeSeconds", service?.uptimeSeconds() ?: 0)
             .put("watching", service?.isWatching() == true)

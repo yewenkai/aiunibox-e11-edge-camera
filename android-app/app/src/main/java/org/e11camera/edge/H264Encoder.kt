@@ -74,7 +74,12 @@ class H264Encoder(
     var inputSurface: Surface? = null
         private set
 
-    fun start() {
+    /** 只在 codec 和输入 Surface 均启动成功后发布状态。 */
+    fun start(): Boolean {
+        if (running) return true
+        var startingCodec: MediaCodec? = null
+        var startingSurface: Surface? = null
+        var codecStarted = false
         try {
             val format = MediaFormat.createVideoFormat(MIME, width, height).apply {
                 setInteger(MediaFormat.KEY_COLOR_FORMAT,
@@ -86,16 +91,32 @@ class H264Encoder(
                     MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
             }
             val c = MediaCodec.createEncoderByType(MIME)
+            startingCodec = c
             c.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             // 创建输入 Surface（零拷贝路径）
-            inputSurface = c.createInputSurface()
+            val surface = c.createInputSurface()
+            startingSurface = surface
             c.start()
+            codecStarted = true
             codec = c
+            inputSurface = surface
             running = true
             Thread { drainOutput() }.start()
             Log.i(TAG, "H.264 Surface 编码器启动 ${width}x$height")
+            return true
         } catch (e: Exception) {
+            running = false
+            codec = null
+            inputSurface = null
+            clearOutputState()
+            if (codecStarted) {
+                try { startingCodec?.stop() } catch (_: Exception) {}
+            }
+            // configure/start 任一阶段失败，都须释放局部资源，不能只清空成员引用。
+            try { startingCodec?.release() } catch (_: Exception) {}
+            try { startingSurface?.release() } catch (_: Exception) {}
             Log.e(TAG, "编码器启动失败", e)
+            return false
         }
     }
 
@@ -180,16 +201,25 @@ class H264Encoder(
         } catch (_: Exception) {}
     }
 
+    /** 调用方须先停止 Camera2/GL 向输入 Surface 写入。 */
     fun stop() {
         running = false
-        try {
-            codec?.stop()
-            codec?.release()
-        } catch (_: Exception) {}
-        codec = null
-        inputSurface = null
-        encodedFormat = null
-        nalQueue.clear()
+        val oldCodec = codec.also { codec = null }
+        val oldSurface = inputSurface.also { inputSurface = null }
+        // stop 失败也不能跳过 release；createInputSurface 的 Surface 由应用负责释放。
+        try { oldCodec?.stop() } catch (_: Exception) {}
+        try { oldCodec?.release() } catch (_: Exception) {}
+        try { oldSurface?.release() } catch (_: Exception) {}
+        clearOutputState()
         Log.i(TAG, "H.264 编码器停止")
+    }
+
+    private fun clearOutputState() {
+        encodedFormat = null
+        hasSpsPps = false
+        spsPps = ByteArray(0)
+        outputFrameCount = 0L
+        lastOutputAtMs = 0L
+        nalQueue.clear()
     }
 }

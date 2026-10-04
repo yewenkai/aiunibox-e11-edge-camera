@@ -1,5 +1,7 @@
 # AIUniBOX-E11 Edge Camera
 
+> 1.9.2 更新：保持目标 30fps 硬编码视频，YUV/JPEG 改为快照、MJPEG 和分析需求触发；健康查询不触发 JPEG。全关灯也覆盖存储活动节点并取消自动触发器。按需采集方案与短时真机 CPU 对比见 [节能运行说明](docs/POWER_SAVING.md)。
+
 > 1.9.0 更新：仅保留 HTTP，已移除网页语音对讲，旧版 HTTPS/对讲说明不再适用。新增手动暂停采集和启动后返回主页，见 [节能运行说明](docs/POWER_SAVING.md)。
 
 把一台闲置的 AIUniBOX-E11 RK3566 Android 带屏设备改造成局域网边缘摄像头：复用内置摄像头、水平云台和指示灯，在浏览器中通过 WebRTC 低延迟观看，也可通过同源 HLS 兼容远程网页代理，并通过 RTSP 接入其他家庭网络设备。
