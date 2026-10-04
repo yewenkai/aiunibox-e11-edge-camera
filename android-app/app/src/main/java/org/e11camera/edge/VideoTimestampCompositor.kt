@@ -76,9 +76,22 @@ class VideoTimestampCompositor(
     private var timestampTexture = 0
     private var cameraProgram = 0
     private var bitmapProgram = 0
+    private lateinit var cameraLocations: ProgramLocations
+    private lateinit var bitmapLocations: ProgramLocations
     private var surfaceTexture: SurfaceTexture? = null
     private val transform = FloatArray(16)
     private var timestampBitmap: Bitmap? = null
+    private lateinit var timestampCanvas: Canvas
+    private lateinit var timestampPositionBuffer: FloatBuffer
+    private val timestampBackground = RectF()
+    private val timestampTextPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val timestampBackgroundPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.argb(170, 0, 0, 0)
+    }
+    private val timestampDate = Date()
+    private var timestampPadX = 0f
+    private var timestampTextBaseline = 0f
+    private var timestampCornerRadius = 0f
     private var lastTimestampSecond = -1L
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).apply {
         timeZone = TimeZone.getTimeZone("GMT+08:00")
@@ -87,6 +100,13 @@ class VideoTimestampCompositor(
     private val positionBuffer = floatBuffer(FULL_QUAD)
     private val cameraUvBuffer = floatBuffer(CAMERA_UV)
     private val bitmapUvBuffer = floatBuffer(BITMAP_UV)
+
+    private data class ProgramLocations(
+        val position: Int,
+        val texCoord: Int,
+        val texture: Int,
+        val texMatrix: Int = -1
+    )
 
     /** 初始化成功时返回供 Camera2 输出的 Surface；失败时返回 null，调用方可回退直连。 */
     fun start(): Surface? {
@@ -159,8 +179,19 @@ class VideoTimestampCompositor(
 
         cameraProgram = createProgram(CAMERA_VERTEX_SHADER, CAMERA_FRAGMENT_SHADER)
         bitmapProgram = createProgram(BITMAP_VERTEX_SHADER, BITMAP_FRAGMENT_SHADER)
+        cameraLocations = programLocations(cameraProgram, hasTexMatrix = true)
+        bitmapLocations = programLocations(bitmapProgram, hasTexMatrix = false)
+        // 两个 program 共享固定 attribute 索引，只在画摄像头/时间戳时切换缓冲区。
+        GLES20.glEnableVertexAttribArray(cameraLocations.position)
+        GLES20.glEnableVertexAttribArray(cameraLocations.texCoord)
+        GLES20.glUseProgram(cameraProgram)
+        GLES20.glUniform1i(cameraLocations.texture, 0)
+        GLES20.glUseProgram(bitmapProgram)
+        GLES20.glUniform1i(bitmapLocations.texture, 0)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         cameraTexture = createTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES)
         timestampTexture = createTexture(GLES20.GL_TEXTURE_2D)
+        initializeTimestampTexture()
 
         val st = SurfaceTexture(cameraTexture).apply {
             setDefaultBufferSize(width, height)
@@ -168,9 +199,10 @@ class VideoTimestampCompositor(
         }
         surfaceTexture = st
         cameraSurface = Surface(st)
-        timestampBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         GLES20.glViewport(0, 0, width, height)
-        Log.i(TAG, "GPU 时间戳合成已启动 ${width}x$height")
+        GLES20.glClearColor(0f, 0f, 0f, 1f)
+        GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA)
+        Log.i(TAG, "GPU 时间戳合成已启动 ${width}x$height，文字纹理 ${timestampBitmap?.width}x${timestampBitmap?.height}")
     }
 
     private fun drawFrame() {
@@ -178,8 +210,6 @@ class VideoTimestampCompositor(
         try {
             st.updateTexImage()
             st.getTransformMatrix(transform)
-            GLES20.glViewport(0, 0, width, height)
-            GLES20.glClearColor(0f, 0f, 0f, 1f)
             GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
 
             drawCamera()
@@ -196,74 +226,98 @@ class VideoTimestampCompositor(
 
     private fun drawCamera() {
         GLES20.glUseProgram(cameraProgram)
-        bindQuad(cameraProgram, cameraUvBuffer)
+        bindQuad(cameraLocations, positionBuffer, cameraUvBuffer)
         GLES20.glUniformMatrix4fv(
-            GLES20.glGetUniformLocation(cameraProgram, "uTexMatrix"),
+            cameraLocations.texMatrix,
             1, false, transform, 0
         )
-        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, cameraTexture)
-        GLES20.glUniform1i(GLES20.glGetUniformLocation(cameraProgram, "uTexture"), 0)
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+    }
+
+    private fun initializeTimestampTexture() {
+        val scale = width / 640f
+        val textSize = 20f * scale
+        val left = 12f * scale
+        val top = 12f * scale
+        timestampPadX = 9f * scale
+        val padY = 6f * scale
+        timestampTextPaint.apply {
+            color = Color.WHITE
+            this.textSize = textSize
+            typeface = android.graphics.Typeface.MONOSPACE
+        }
+        // 固定格式的等宽数字始终占同样宽度。保留原像素布局，仅裁掉透明区域。
+        val textWidth = timestampTextPaint.measureText("2000-00-00 00:00:00")
+        val heightPx = textSize + padY * 2
+        val region = TimestampOverlayRegion.around(
+            width, height, left, top, left + textWidth + timestampPadX * 2, top + heightPx
+        )
+        timestampBackground.set(
+            left - region.left, top - region.top,
+            left + textWidth + timestampPadX * 2 - region.left, top + heightPx - region.top
+        )
+        timestampTextBaseline = top + padY + textSize * 0.82f - region.top
+        timestampCornerRadius = 5f * scale
+        timestampPositionBuffer = floatBuffer(region.quad(width, height))
+        val bitmap = Bitmap.createBitmap(region.width, region.height, Bitmap.Config.ARGB_8888)
+        timestampBitmap = bitmap
+        timestampCanvas = Canvas(bitmap)
+        // ARGB_8888 每行四字节对齐；GLES2 的 NPOT 纹理使用 LINEAR + CLAMP_TO_EDGE。
+        GLES20.glPixelStorei(GLES20.GL_UNPACK_ALIGNMENT, 4)
+        GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bitmap, 0)
+        check(GLES20.glGetError() == GLES20.GL_NO_ERROR) { "timestamp texture allocation failed" }
     }
 
     private fun updateTimestampTextureIfNeeded() {
         val now = System.currentTimeMillis()
         val second = now / 1000L
         if (second == lastTimestampSecond) return
-        lastTimestampSecond = second
 
         val bitmap = timestampBitmap ?: return
-        val canvas = Canvas(bitmap)
-        canvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
-        val scale = width / 640f
-        val textSize = 20f * scale
-        val left = 12f * scale
-        val top = 12f * scale
-        val padX = 9f * scale
-        val padY = 6f * scale
-        val text = dateFormat.format(Date(now))
-        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.WHITE
-            this.textSize = textSize
-            typeface = android.graphics.Typeface.MONOSPACE
-        }
-        val textWidth = paint.measureText(text)
-        val heightPx = textSize + padY * 2
-        Paint(Paint.ANTI_ALIAS_FLAG).also {
-            it.color = Color.argb(170, 0, 0, 0)
-            canvas.drawRoundRect(
-                RectF(left, top, left + textWidth + padX * 2, top + heightPx),
-                5f * scale, 5f * scale, it
-            )
-        }
-        canvas.drawText(text, left + padX, top + padY + textSize * 0.82f, paint)
+        timestampCanvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
+        timestampDate.time = now
+        val text = dateFormat.format(timestampDate)
+        timestampCanvas.drawRoundRect(
+            timestampBackground, timestampCornerRadius, timestampCornerRadius, timestampBackgroundPaint
+        )
+        timestampCanvas.drawText(
+            text, timestampBackground.left + timestampPadX, timestampTextBaseline, timestampTextPaint
+        )
 
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, timestampTexture)
-        GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bitmap, 0)
+        GLUtils.texSubImage2D(GLES20.GL_TEXTURE_2D, 0, 0, 0, bitmap)
+        lastTimestampSecond = second
     }
 
     private fun drawTimestamp() {
         GLES20.glEnable(GLES20.GL_BLEND)
-        GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA)
         GLES20.glUseProgram(bitmapProgram)
-        bindQuad(bitmapProgram, bitmapUvBuffer)
-        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        bindQuad(bitmapLocations, timestampPositionBuffer, bitmapUvBuffer)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, timestampTexture)
-        GLES20.glUniform1i(GLES20.glGetUniformLocation(bitmapProgram, "uTexture"), 0)
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
         GLES20.glDisable(GLES20.GL_BLEND)
     }
 
-    private fun bindQuad(program: Int, uv: FloatBuffer) {
-        val position = GLES20.glGetAttribLocation(program, "aPosition")
-        val texCoord = GLES20.glGetAttribLocation(program, "aTexCoord")
-        positionBuffer.position(0)
+    private fun bindQuad(locations: ProgramLocations, positions: FloatBuffer, uv: FloatBuffer) {
+        positions.position(0)
         uv.position(0)
-        GLES20.glEnableVertexAttribArray(position)
-        GLES20.glVertexAttribPointer(position, 2, GLES20.GL_FLOAT, false, 0, positionBuffer)
-        GLES20.glEnableVertexAttribArray(texCoord)
-        GLES20.glVertexAttribPointer(texCoord, 2, GLES20.GL_FLOAT, false, 0, uv)
+        GLES20.glVertexAttribPointer(locations.position, 2, GLES20.GL_FLOAT, false, 0, positions)
+        GLES20.glVertexAttribPointer(locations.texCoord, 2, GLES20.GL_FLOAT, false, 0, uv)
+    }
+
+    private fun programLocations(program: Int, hasTexMatrix: Boolean): ProgramLocations {
+        val locations = ProgramLocations(
+            GLES20.glGetAttribLocation(program, "aPosition"),
+            GLES20.glGetAttribLocation(program, "aTexCoord"),
+            GLES20.glGetUniformLocation(program, "uTexture"),
+            if (hasTexMatrix) GLES20.glGetUniformLocation(program, "uTexMatrix") else -1
+        )
+        check(locations.position == 0 && locations.texCoord == 1 && locations.texture >= 0) {
+            "invalid shader locations"
+        }
+        check(!hasTexMatrix || locations.texMatrix >= 0) { "missing texture transform" }
+        return locations
     }
 
     private fun createTexture(target: Int): Int {
@@ -283,6 +337,8 @@ class VideoTimestampCompositor(
         val program = GLES20.glCreateProgram()
         GLES20.glAttachShader(program, vertex)
         GLES20.glAttachShader(program, fragment)
+        GLES20.glBindAttribLocation(program, 0, "aPosition")
+        GLES20.glBindAttribLocation(program, 1, "aTexCoord")
         GLES20.glLinkProgram(program)
         val status = IntArray(1)
         GLES20.glGetProgramiv(program, GLES20.GL_LINK_STATUS, status, 0)

@@ -8,12 +8,18 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.os.IBinder
+import android.os.SystemClock
+import java.io.File
+import java.util.concurrent.ScheduledFuture
 import android.util.Log
 import fi.iki.elonen.NanoHTTPD
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicBoolean
+import org.json.JSONArray
+import org.json.JSONObject
 
 /**
  * 监控前台服务：持有摄像头采集器 + Web 服务器生命周期。
@@ -28,7 +34,7 @@ class MonitorService : Service() {
         const val PORT = 8080
         const val ACTION_RESTART_CAMERA = "org.e11camera.edge.RESTART_CAMERA"
         private const val POSTURE_ALERT_COOLDOWN_MS = 5L * 60L * 1_000L
-        private const val GUARDIAN_VISION_REFRESH_TIMEOUT_MS = 450L
+        private const val GUARDIAN_VISION_REFRESH_TIMEOUT_MS = 600L
 
         @Volatile
         var instance: MonitorService? = null
@@ -52,6 +58,11 @@ class MonitorService : Service() {
     private var healthDiagnostics: HealthDiagnostics? = null
     private var startedAtMs: Long = 0
     private val healthScheduler = Executors.newSingleThreadScheduledExecutor()
+    private val videoDemand = VideoDemandPolicy()
+    @Volatile private var videoRuntimeMode = VideoDemandPolicy.Mode.MANUAL_PAUSED
+    private var runtimeVideoWanted = false
+    private var runtimeActivatedAtMs = 0L
+    private var runtimeCheckFuture: ScheduledFuture<*>? = null
     private val guardianStartupExecutor = Executors.newSingleThreadExecutor()
     private val guardianStartupGeneration = AtomicLong(0)
     @Volatile private var guardianStartupFuture: Future<*>? = null
@@ -59,6 +70,8 @@ class MonitorService : Service() {
     @Volatile private var lastPostureAlertAt: Long = 0
     @Volatile private var lastPostureSuppressedAt: Long = 0
     @Volatile private var initializing = false
+    @Volatile private var resourcesClosing = true
+    private val visionSelfTestRunning = AtomicBoolean(false)
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -142,19 +155,26 @@ class MonitorService : Service() {
             guardianEventStore = eventStore
             eventClipRecorder = clipRecorder
             healthDiagnostics = diagnostics
+            resourcesClosing = false
             startedAtMs = System.currentTimeMillis()
             diagnostics.recordServiceStart(startedAtMs)
 
-            if (!state.privacyMode && state.captureEnabled) {
-                s.start()
-            } else {
-                Log.i(TAG, "设备处于隐私模式，暂不启动摄像头")
-            }
-
-            // 仅统计观看状态，不自动改变用户灯光设置。
-            val watcher = ViewerWatcher()
-            watcher.start()
+            val watcher = ViewerWatcher(
+                markerPath = File(filesDir, "viewer-state/watchers").absolutePath,
+                onWatchingChanged = {
+                    if (!healthScheduler.isShutdown) {
+                        try {
+                            healthScheduler.execute { onWatchingChanged() }
+                        } catch (_: java.util.concurrent.RejectedExecutionException) { }
+                    }
+                }
+            )
             viewerWatcher = watcher
+            watcher.start()
+            synchronized(this) {
+                if (state.captureEnabled && !state.privacyMode) videoDemand.touch(SystemClock.elapsedRealtime())
+                reconcileVideoRuntime()
+            }
 
             // 宝宝守护：开机若已启用则按实体镜头罩状态恢复。
             if (state.babyMonitorEnabled) {
@@ -165,7 +185,8 @@ class MonitorService : Service() {
 
             healthScheduler.scheduleAtFixedRate({
                 val current = streamer ?: return@scheduleAtFixedRate
-                if (deviceState?.privacyMode == true || deviceState?.captureEnabled == false) return@scheduleAtFixedRate
+                if (!videoRuntimeMode.needsVideo) return@scheduleAtFixedRate
+                if (SystemClock.elapsedRealtime() - runtimeActivatedAtMs < 10_000L) return@scheduleAtFixedRate
                 val encoderHealthy = current.h264Encoder?.isOutputHealthy(10_000) == true
                 if (!current.isRunning || !encoderHealthy) {
                     Log.w(
@@ -198,6 +219,15 @@ class MonitorService : Service() {
     }
 
     private fun cleanupResources() {
+        synchronized(this) {
+            resourcesClosing = true
+            streamer?.onEncoderReady = null
+            runtimeVideoWanted = false
+            videoRuntimeMode = VideoDemandPolicy.Mode.MANUAL_PAUSED
+            runtimeCheckFuture?.cancel(false)
+            runtimeCheckFuture = null
+            videoDemand.clear()
+        }
         cancelGuardianStartup()
         cleanupSafely("HTTP 服务") { server?.stop() }
         cleanupSafely("RTSP 推流") { rtspPublisher?.stop() }
@@ -243,6 +273,7 @@ class MonitorService : Service() {
         if (deviceState?.privacyMode == true || deviceState?.captureEnabled == false) return
         val s = streamer ?: return
         try {
+            synchronized(this) { videoDemand.touch(SystemClock.elapsedRealtime()); reconcileVideoRuntime() }
             s.restartCapture()
             Log.i(TAG, "摄像头会话正在重建（含预览）")
         } catch (e: Exception) {
@@ -278,34 +309,128 @@ class MonitorService : Service() {
 
     fun isRtspPublishing(): Boolean = rtspPublisher?.connected == true
 
+    data class RuntimeHealth(
+        val state: String, val captureEnabled: Boolean, val privacy: Boolean,
+        val cameraExpected: Boolean, val cameraOn: Boolean, val streamReady: Boolean,
+        val rtspPublishing: Boolean, val warmingUp: Boolean,
+        val activeRequests: Int, val externalDemands: Int
+    )
+
+    @Synchronized
+    fun runtimeHealth(): RuntimeHealth {
+        val state = deviceState
+        val s = streamer
+        return RuntimeHealth(
+            videoRuntimeMode.value, state?.captureEnabled == true, state?.privacyMode == true,
+            videoRuntimeMode.needsVideo, s?.isRunning == true,
+            s?.h264Encoder?.isOutputHealthy() == true, isRtspPublishing(),
+            videoRuntimeMode.needsVideo && SystemClock.elapsedRealtime() - runtimeActivatedAtMs < 10_000L,
+            videoDemand.requestCount, videoDemand.externalCount
+        )
+    }
+
+    /** Held until a media response closes; manual pause/privacy still overrides it. */
+    interface VideoLease : AutoCloseable {
+        val isActive: Boolean
+    }
+
+    @Synchronized
+    fun acquireVideoDemand(): VideoLease? {
+        if (resourcesClosing) return null
+        val state = deviceState ?: return null
+        if (!state.captureEnabled || state.privacyMode || streamer == null) return null
+        val lease = videoDemand.acquire(SystemClock.elapsedRealtime())
+        reconcileVideoRuntime()
+        return object : VideoLease {
+            private val closed = java.util.concurrent.atomic.AtomicBoolean(false)
+            override val isActive: Boolean get() = synchronized(this@MonitorService) {
+                !closed.get() && !resourcesClosing && videoDemand.hasRequest(lease) &&
+                    state.captureEnabled && !state.privacyMode
+            }
+            override fun close() {
+                if (!closed.compareAndSet(false, true)) return
+                synchronized(this@MonitorService) {
+                    videoDemand.release(lease, SystemClock.elapsedRealtime())
+                    reconcileVideoRuntime()
+                }
+            }
+        }
+    }
+
+    /** MediaMTX on-demand hook renews this finite lease while its reader exists. */
+    @Synchronized
+    fun renewMediaDemand(enabled: Boolean): Boolean {
+        if (resourcesClosing) return false
+        val state = deviceState ?: return false
+        if (enabled && (!state.captureEnabled || state.privacyMode)) return false
+        videoDemand.renewExternal("mediamtx", enabled, SystemClock.elapsedRealtime())
+        reconcileVideoRuntime()
+        return true
+    }
+
+    @Synchronized
+    private fun onWatchingChanged() {
+        if (streamer == null) return
+        videoDemand.touch(SystemClock.elapsedRealtime())
+        reconcileVideoRuntime()
+    }
+
+    private fun demandInput(): VideoDemandPolicy.Input {
+        val state = deviceState
+        return VideoDemandPolicy.Input(
+            state?.captureEnabled == true, state?.privacyMode == true,
+            GuardianModePolicy.visualEnabled(guardianOperatingMode()),
+            viewerWatcher?.isWatching == true, streamer?.previewSurface?.isValid == true
+        )
+    }
+
+    @Synchronized
+    private fun reconcileVideoRuntime() {
+        val s = streamer ?: return
+        if (resourcesClosing || healthScheduler.isShutdown) return
+        val now = SystemClock.elapsedRealtime()
+        val input = demandInput()
+        val mode = videoDemand.mode(input, now)
+        videoRuntimeMode = mode
+        if (mode.needsVideo != runtimeVideoWanted) {
+            runtimeVideoWanted = mode.needsVideo
+            if (mode.needsVideo) {
+                runtimeActivatedAtMs = now
+                s.resume()
+            } else {
+                rtspPublisher?.stop()
+                rtspPublisher = null
+                eventClipRecorder?.stop()
+                s.pause()
+            }
+            Log.i(TAG, "视频运行状态 ${mode.value}")
+        }
+        runtimeCheckFuture?.cancel(false)
+        runtimeCheckFuture = videoDemand.nextCheckAt(input, now)?.let { deadline ->
+            healthScheduler.schedule({ reconcileVideoRuntime() }, (deadline - now).coerceAtLeast(1L), TimeUnit.MILLISECONDS)
+        }
+    }
+
     fun isWatching(): Boolean = viewerWatcher?.isWatching == true
 
     @Synchronized
     fun setPrivacyMode(enabled: Boolean): Boolean {
         val s = streamer ?: return false
         val state = deviceState ?: return false
-        if (state.privacyMode == enabled) {
-            return true
-        }
-
+        if (state.privacyMode == enabled) return true
         state.privacyMode = enabled
         if (enabled) {
             stopGuardianMonitoring()
-            rtspPublisher?.stop()
-            rtspPublisher = null
-            s.pause()
-        } else {
-            if (state.captureEnabled) {
-                s.resume()
-            }
-            if (state.babyMonitorEnabled) {
-                startConfiguredGuardianMonitoring(s)
-            }
+            videoDemand.clear()
+        } else if (state.captureEnabled) {
+            videoDemand.touch(SystemClock.elapsedRealtime())
         }
+        reconcileVideoRuntime()
+        if (!enabled && state.babyMonitorEnabled) startConfiguredGuardianMonitoring(s)
         return true
     }
 
-    /** 手动采集开关，保留 HTTP 与按需音频守护。 */
+    /** 手动开关决定是否允许采集，自动待机不修改用户选择。 */
     @Synchronized
     fun setCaptureEnabled(enabled: Boolean): Boolean {
         val s = streamer ?: return false
@@ -313,13 +438,8 @@ class MonitorService : Service() {
         if (state.captureEnabled == enabled) return true
         state.captureEnabled = enabled
         stopGuardianMonitoring()
-        if (!enabled) {
-            rtspPublisher?.stop()
-            rtspPublisher = null
-            s.pause()
-        } else if (!state.privacyMode) {
-            s.resume()
-        }
+        if (enabled && !state.privacyMode) videoDemand.touch(SystemClock.elapsedRealtime()) else videoDemand.clear()
+        reconcileVideoRuntime()
         if (state.babyMonitorEnabled && !state.privacyMode) startConfiguredGuardianMonitoring(s)
         return true
     }
@@ -335,11 +455,12 @@ class MonitorService : Service() {
         } else {
             stopGuardianMonitoring()
         }
+        reconcileVideoRuntime()
         return true
     }
 
     /**
-     * 记录实体镜头罩的实际状态。镜头罩关闭不等于软件隐私：摄像头基础链路继续运行，
+     * 记录实体镜头罩的实际状态。关闭后仅保留音频守护，无观看需求时视频可自动待机，
      * 但宝宝守护停用 NPU、动作检测和事件短片，只保留哭声检测。
      */
     @Synchronized
@@ -351,6 +472,7 @@ class MonitorService : Service() {
         if (state.babyMonitorEnabled && !state.privacyMode) {
             streamer?.let { startConfiguredGuardianMonitoring(it) }
         }
+        reconcileVideoRuntime()
         Log.i(TAG, "实体镜头罩状态已更新 closed=$closed mode=${guardianOperatingMode().apiValue}")
         return true
     }
@@ -363,6 +485,7 @@ class MonitorService : Service() {
         npu: NpuDetector? = npuDetector,
         pose: PoseDetector? = poseDetector
     ) {
+        reconcileVideoRuntime()
         when (guardianOperatingMode()) {
             GuardianOperatingMode.NORMAL ->
                 startGuardianMonitoring(currentStreamer, clipRecorder, motion, cry, npu, pose)
@@ -576,7 +699,9 @@ class MonitorService : Service() {
 
     fun adultLikePersonCount(): Int = npuDetector?.adultLikePersonCount ?: 0
 
-    fun caregiverEvidenceNow(): Boolean = npuDetector?.caregiverEvidenceNow == true
+    fun caregiverEvidenceNow(): Boolean = npuDetector?.currentDecisionSnapshot()?.let {
+        it.personCount >= 2 || it.adultLikePersonCount > 0
+    } == true
 
     fun personBoxes(): List<FloatArray> = npuDetector?.personBoxes ?: emptyList()
 
@@ -589,6 +714,16 @@ class MonitorService : Service() {
     fun npuAlertRefreshStatus(): String = npuDetector?.lastAlertRefreshStatus ?: "unavailable"
 
     fun npuAlertRefreshAt(): Long = npuDetector?.lastAlertRefreshAt ?: 0L
+
+    fun npuAlertRefreshDiagnostics(): JSONObject {
+        val npu = npuDetector
+        return JSONObject()
+            .put("queueMs", npu?.lastAlertRefreshQueueMs ?: 0L)
+            .put("captureMs", npu?.lastAlertRefreshCaptureMs ?: 0L)
+            .put("totalWaitMs", npu?.lastAlertRefreshTotalMs ?: 0L)
+            .put("sourceAgeMs", npu?.lastAlertSourceAgeMs ?: -1L)
+            .put("degradedReason", npu?.lastAlertDegradedReason ?: "unavailable")
+    }
 
     fun isPoseModelAvailable(): Boolean = poseDetector?.poseModelAvailable == true
 
@@ -605,8 +740,63 @@ class MonitorService : Service() {
     fun recordPoseFeedback(value: String): Boolean = poseDetector?.recordFeedback(value) == true
 
     fun runPoseSelfTest(): PoseAnalysisSnapshot? {
-        if (deviceState?.privacyMode == true || deviceState?.captureEnabled == false) return null
-        return poseDetector?.selfTest()
+        val lease = acquireVideoDemand() ?: return null
+        return try {
+            poseDetector?.selfTest()
+        } finally {
+            lease.close()
+        }
+    }
+
+    /** 独立人体模型和告警取帧自测；不启动真实守护、不保存图像、不接入通知回调。 */
+    fun runVisionSelfTest(): JSONObject {
+        fun failure(reason: String) = JSONObject().put("ok", false).put("error", reason)
+        if (!visionSelfTestRunning.compareAndSet(false, true)) return failure("self_test_busy")
+        var lease: AutoCloseable? = null
+        var detector: NpuDetector? = null
+        try {
+            val state = deviceState ?: return failure("service_unavailable")
+            val currentStreamer = streamer ?: return failure("service_unavailable")
+            if (GuardianModePolicy.visualEnabled(guardianOperatingMode())) return failure("guardian_running")
+            lease = acquireVideoDemand() ?: return failure("capture_disabled_or_privacy")
+            val isolated = NpuDetector(this, currentStreamer, state) { _, _, _ -> }
+            detector = isolated
+            isolated.start()
+            if (!isolated.modelLoaded) return failure("model_unavailable")
+            val warmed = isolated.warmUpForGuard()
+            val samples = JSONArray()
+            var allRefreshed = warmed
+            repeat(3) {
+                if (!state.captureEnabled || state.privacyMode) return failure("capture_disabled_or_privacy")
+                if (GuardianModePolicy.visualEnabled(guardianOperatingMode())) return failure("guardian_running")
+                val result = isolated.refreshForAlert(GUARDIAN_VISION_REFRESH_TIMEOUT_MS, forceFresh = true)
+                allRefreshed = allRefreshed && result.refreshStatus == "refreshed"
+                samples.put(
+                    JSONObject().put("refreshStatus", result.refreshStatus)
+                        .put("sourceCapturedAt", result.sourceCapturedAt)
+                        .put("analyzedAt", result.analyzedAt)
+                        .put("sourceAgeMs", result.sourceAgeMs)
+                        .put("queueMs", result.queueMs)
+                        .put("captureMs", result.captureMs)
+                        .put("inferenceMs", result.inferenceMs)
+                        .put("totalWaitMs", result.totalWaitMs)
+                        .put("degradedReason", result.degradedReason)
+                )
+            }
+            return JSONObject().put("ok", allRefreshed).put("modelLoaded", isolated.modelLoaded)
+                .put("warmupSucceeded", warmed).put("timeoutMs", GUARDIAN_VISION_REFRESH_TIMEOUT_MS)
+                .put("sampleCount", samples.length()).put("samples", samples)
+        } catch (e: Exception) {
+            if (e is InterruptedException) Thread.currentThread().interrupt()
+            Log.w(TAG, "无通知视觉取帧自测失败", e)
+            return failure(e.javaClass.simpleName)
+        } finally {
+            try {
+                detector?.stop()
+            } finally {
+                try { lease?.close() } finally { visionSelfTestRunning.set(false) }
+            }
+        }
     }
 
     fun startAmbientCalibration(): Boolean =
@@ -642,14 +832,14 @@ class MonitorService : Service() {
         )
 
     fun supervisionState(): String = if (GuardianModePolicy.visualEnabled(guardianOperatingMode())) {
-        (npuDetector?.supervisionState ?: SupervisionStateMachine.State.UNKNOWN).name.lowercase()
+        (npuDetector?.currentDecisionSnapshot()?.supervisionState ?: SupervisionStateMachine.State.UNKNOWN).name.lowercase()
     } else {
         SupervisionStateMachine.State.UNKNOWN.name.lowercase()
     }
 
     fun notificationsArmed(): Boolean =
         !GuardianModePolicy.visualEnabled(guardianOperatingMode()) ||
-            npuDetector?.notificationsSuppressed != true
+            npuDetector?.currentDecisionSnapshot()?.notificationsSuppressed != true
 
     fun lastSuppressedAlertAt(): Long = lastSuppressedAlertAt
 
@@ -711,15 +901,11 @@ class MonitorService : Service() {
     private fun recordHealthSample() {
         try {
             val diagnostics = healthDiagnostics ?: return
-            val state = deviceState ?: return
+            if (deviceState == null) return
             val currentStreamer = streamer ?: return
             val encoder = currentStreamer.h264Encoder
-            val cameraExpected = !state.privacyMode && state.captureEnabled
-            val guardianMode = GuardianModePolicy.resolve(
-                guardianEnabled = state.babyMonitorEnabled,
-                privacyMode = state.privacyMode,
-                lensCoverClosed = state.lensCoverClosed
-            )
+            val cameraExpected = videoRuntimeMode.needsVideo
+            val guardianMode = guardianOperatingMode()
             diagnostics.sample(
                 DeviceHealthInput(
                     cameraExpected = cameraExpected,
@@ -748,20 +934,50 @@ class MonitorService : Service() {
         if (!GuardianModePolicy.clipEnabled(guardianOperatingMode())) return false
         val store = guardianEventStore ?: return false
         val recorder = eventClipRecorder ?: return false
-        val npu = npuDetector
+        val vision = npuDetector?.currentDecisionSnapshot()
         val event = store.addTriggered(
             kind = "test",
             title = "短片录制测试",
             summary = "手动发起端侧画面短片测试",
             decision = "recorded",
             reason = "仅验证事件前后画面的保存和播放，不会发送 Bark 通知",
-            personCount = npu?.personCount ?: 0,
-            adultLikePersonCount = npu?.adultLikePersonCount ?: 0,
-            supervisionState = (npu?.supervisionState ?: SupervisionStateMachine.State.UNKNOWN)
+            personCount = vision?.personCount ?: 0,
+            adultLikePersonCount = vision?.adultLikePersonCount ?: 0,
+            supervisionState = (vision?.supervisionState ?: SupervisionStateMachine.State.UNKNOWN)
                 .name.lowercase(),
             cryScore = null
         )
         return recorder.capture(event.id)
+    }
+
+    private fun checkedVisionDecision(vision: AlertVisionSnapshot?): AlertVisionSnapshot? {
+        vision ?: return null
+        val maxAgeMs = if (vision.refreshStatus in setOf(
+                "refreshed", "latest_frame", "current_state", "supervision_transition"
+            )) AlertVisionRefreshPolicy.MAX_SOURCE_AGE_MS else AlertVisionRefreshPolicy.RECENT_SOURCE_REUSE_MS
+        return AlertVisionRefreshPolicy.safeDecision(
+            vision,
+            AlertVisionRefreshPolicy.sourceAgeMs(
+                System.currentTimeMillis(), vision.sourceCapturedAt,
+                SystemClock.elapsedRealtime(), vision.sourceCapturedElapsedMs
+            ),
+            npuDetector?.modelLoaded == true, maxAgeMs
+        )
+    }
+
+    private fun visionDegradedReason(vision: AlertVisionSnapshot?): String? {
+        val current = vision ?: return null
+        val reason = when (current.degradedReason) {
+            "" -> return null
+            "source_expired" -> "源画面过期，历史成人证据已排除"
+            "detector_stopped" -> "人体检测已停止，本次陪护未知"
+            "fresh_capture_timeout_used_cache" -> "新帧等待到期，使用时效范围内已有画面"
+            "queue_deadline" -> "排队耗尽等待预算，未增加额外采集"
+            "capture_deadline", "total_deadline" -> "已用完视觉复核等待预算"
+            "no_analysis", "no_frame" -> "没有有效人体分析画面"
+            else -> "本次视觉复核未完整完成"
+        }
+        return if (current.sourceAgeMs >= 0L) "$reason，源画面年龄 ${current.sourceAgeMs}ms" else reason
     }
 
     /**
@@ -782,15 +998,18 @@ class MonitorService : Service() {
 
         val audioOnly = operatingMode == GuardianOperatingMode.AUDIO_ONLY
         val npu = npuDetector
-        val vision = if (audioOnly) null else {
+        val obtainedVision = if (audioOnly) null else {
             visionOverride ?: npu?.refreshForAlert(GUARDIAN_VISION_REFRESH_TIMEOUT_MS)
+                ?: npu?.currentDecisionSnapshot("unavailable")
         }
-        val personCount = if (audioOnly) 0 else vision?.personCount ?: npu?.personCount ?: 0
+        if (guardianOperatingMode() != operatingMode) return
+        val vision = checkedVisionDecision(obtainedVision)
+        val personCount = if (audioOnly) 0 else vision?.personCount ?: 0
         val adultLikeCount = if (audioOnly) 0 else {
-            vision?.adultLikePersonCount ?: npu?.adultLikePersonCount ?: 0
+            vision?.adultLikePersonCount ?: 0
         }
         val suppressed = if (audioOnly) false else {
-            vision?.notificationsSuppressed ?: (npu?.notificationsSuppressed == true)
+            vision?.notificationsSuppressed == true
         }
         val configured = barkNotifier?.configured == true
         val decision = when {
@@ -822,12 +1041,13 @@ class MonitorService : Service() {
             "latest_frame" -> "未在限时内取到新帧，已用最近画面补跑 NPU"
             "supervision_transition" -> "成人离开后使用刚完成的陪护分析重新决策"
             "timeout" ->
-                "NPU 补跑等待超过 ${GUARDIAN_VISION_REFRESH_TIMEOUT_MS}ms，本次按最近可用结果判断"
-            "no_frame" -> "当前没有可用新画面，本次按最近可用结果判断"
-            "unavailable" -> "NPU 当前不可用，不将单次人体结果作为绝对依据"
+                "NPU 补跑等待超过 ${GUARDIAN_VISION_REFRESH_TIMEOUT_MS}ms，仅接受 0.5 秒内已有证据，过期结果不抑制通知"
+            "no_frame" -> "当前没有可用新画面，过期人体结果不参与通知抑制"
+            "stale_frame" -> "源画面已过期，历史成人结果已排除，本次陪护未知"
+            "unavailable", "failed", "interrupted" -> "NPU 补跑不可用，过期人体结果不参与通知抑制"
             else -> "NPU 补跑状态：$refreshStatus"
         }
-        val reason = listOfNotNull(decisionReason, refreshReason, decisionContext)
+        val reason = listOfNotNull(decisionReason, refreshReason, visionDegradedReason(vision), decisionContext)
             .joinToString("；")
         val mutation = guardianEventStore?.addOrMergeTriggered(
             kind = kind,
@@ -840,7 +1060,6 @@ class MonitorService : Service() {
                 SupervisionStateMachine.State.UNKNOWN.name.lowercase()
             } else {
                 (vision?.supervisionState
-                    ?: npu?.supervisionState
                     ?: SupervisionStateMachine.State.UNKNOWN).name.lowercase()
             },
             cryScore = cryScore,
@@ -893,9 +1112,16 @@ class MonitorService : Service() {
 
         val now = System.currentTimeMillis()
         val npu = npuDetector
-        val poseAdultPresent = snapshot.personCount >= 2 || snapshot.adultLikePersonCount > 0
-        val currentNpuAdultPresent = (npu?.personCount ?: 0) >= 2 ||
-            (npu?.adultLikePersonCount ?: 0) > 0 || npu?.notificationsSuppressed == true
+        val currentNpuVision = npu?.currentDecisionSnapshot()
+        val poseSourceAge = AlertVisionRefreshPolicy.sourceAgeMs(
+            now, snapshot.sourceCapturedAt, SystemClock.elapsedRealtime(), 0L
+        )
+        val poseEvidenceUsable = AlertVisionRefreshPolicy.sourceUsable(poseSourceAge)
+        val poseAdultPresent = poseEvidenceUsable &&
+            (snapshot.personCount >= 2 || snapshot.adultLikePersonCount > 0)
+        val currentNpuAdultPresent = (currentNpuVision?.personCount ?: 0) >= 2 ||
+            (currentNpuVision?.adultLikePersonCount ?: 0) > 0 ||
+            currentNpuVision?.notificationsSuppressed == true
 
         // 已有成人证据时无需为通知补跑；证据消失且冷却期已过，才取新帧做最后复核。
         if (!poseAdultPresent && !currentNpuAdultPresent &&
@@ -905,21 +1131,28 @@ class MonitorService : Service() {
             return
         }
         val vision = if (poseAdultPresent || currentNpuAdultPresent) {
-            null
+            currentNpuVision
         } else {
             npu?.refreshForAlert(GUARDIAN_VISION_REFRESH_TIMEOUT_MS)
-        }
+        }.let { checkedVisionDecision(it) }
+        if (!state.poseNotificationsEnabled || !GuardianModePolicy.visualEnabled(guardianOperatingMode())) return
         val refreshedAdultPresent = (vision?.personCount ?: 0) >= 2 ||
             (vision?.adultLikePersonCount ?: 0) > 0 || vision?.notificationsSuppressed == true
-        val adultPresent = poseAdultPresent || currentNpuAdultPresent || refreshedAdultPresent
+        val poseEvidenceStillUsable = AlertVisionRefreshPolicy.sourceUsable(
+            AlertVisionRefreshPolicy.sourceAgeMs(
+                System.currentTimeMillis(), snapshot.sourceCapturedAt, SystemClock.elapsedRealtime(), 0L
+            )
+        )
+        val adultPresent = (poseEvidenceStillUsable &&
+            (snapshot.personCount >= 2 || snapshot.adultLikePersonCount > 0)) || refreshedAdultPresent
 
         val personCount = maxOf(
-            snapshot.personCount,
-            vision?.personCount ?: npu?.personCount ?: 0
+            if (poseEvidenceStillUsable) snapshot.personCount else 0,
+            vision?.personCount ?: 0
         )
         val adultLikeCount = maxOf(
-            snapshot.adultLikePersonCount,
-            vision?.adultLikePersonCount ?: npu?.adultLikePersonCount ?: 0
+            if (poseEvidenceStillUsable) snapshot.adultLikePersonCount else 0,
+            vision?.adultLikePersonCount ?: 0
         )
         if (adultPresent && transition.previous == transition.current &&
             now - lastPostureSuppressedAt < POSTURE_ALERT_COOLDOWN_MS
@@ -954,9 +1187,11 @@ class MonitorService : Service() {
             "recent_frame" -> "最近一次人体 NPU 画面不足 0.5 秒，直接复用"
             "latest_frame" -> "未及时取得新帧，已用最近画面补跑人体 NPU"
             "timeout" ->
-                "人体 NPU 补跑超过 ${GUARDIAN_VISION_REFRESH_TIMEOUT_MS}ms，按最近可用陪护证据判断"
-            "no_frame" -> "当前没有可用新画面，按最近可用陪护证据判断"
-            "unavailable", "failed", "interrupted" -> "人体 NPU 补跑不可用，保留现有陪护证据"
+                "人体 NPU 补跑超过 ${GUARDIAN_VISION_REFRESH_TIMEOUT_MS}ms，仅接受 0.5 秒内已有证据，过期结果不抑制通知"
+            "no_frame" -> "当前没有可用新画面，过期人体结果不参与通知抑制"
+            "stale_frame" -> "源画面已过期，历史成人结果已排除"
+            "unavailable", "failed", "interrupted" -> "人体 NPU 补跑不可用，过期人体结果不参与通知抑制"
+            "current_state" -> "使用时效范围内当前人体结果，无需重复补跑"
             null -> "已有成人或陪护证据，无需为通知重复补跑人体 NPU"
             else -> "人体 NPU 补跑状态：${vision.refreshStatus}"
         }
@@ -972,10 +1207,11 @@ class MonitorService : Service() {
             title = "宝宝守护：${postureName}候选",
             summary = "连续 6 次分析中至少 5 次得到${postureName}标签",
             decision = decision,
-            reason = "$adultReason；$refreshReason；$faceReason；这是 2D 关键点启发式，不是医学判断",
+            reason = listOfNotNull(adultReason, refreshReason, visionDegradedReason(vision), faceReason,
+                "这是 2D 关键点启发式，不是医学判断").joinToString("；"),
             personCount = personCount,
             adultLikePersonCount = adultLikeCount,
-            supervisionState = (npu?.supervisionState ?: SupervisionStateMachine.State.UNKNOWN)
+            supervisionState = (vision?.supervisionState ?: SupervisionStateMachine.State.UNKNOWN)
                 .name.lowercase(),
             cryScore = null
         )
@@ -1060,7 +1296,7 @@ class MonitorService : Service() {
     private fun startEncoderConsumers(s: CameraStreamer, encoder: H264Encoder) {
         // 内置 RTSP 直推：使用 MediaCodec 原始 PTS，避免裸流经过
         // HTTP/ffmpeg 后时间戳成批、浏览器出现周期性停顿。
-        if (streamer !== s || s.h264Encoder !== encoder ||
+        if (resourcesClosing || healthScheduler.isShutdown || streamer !== s || s.currentStreamingEncoder !== encoder || !videoRuntimeMode.needsVideo ||
             deviceState?.captureEnabled != true || deviceState?.privacyMode != false) return
         rtspPublisher?.stop()
         val pub = RtspPublisher(encoder, path = "cam")

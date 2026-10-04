@@ -21,6 +21,8 @@ hlsAlwaysRemux: no
 hlsVariant: fmp4
 hlsSegmentCount: 4
 hlsSegmentDuration: 1s
+# 关闭网页后及时释放 HLS reader；连续播放的分段请求会保持 muxer 活跃。
+hlsMuxerCloseAfter: 15s
 srt: no
 
 webrtc: yes
@@ -36,5 +38,10 @@ pathDefaults:
 
 paths:
   cam:
+    # MediaMTX v1.9.0：无 publisher 时先通知 app 唤醒，再等待首帧。
+    runOnDemand: /data/local/tmp/bin/stream_demand.sh
+    runOnDemandRestart: yes
+    runOnDemandStartTimeout: 15s
+    runOnDemandCloseAfter: 10s
     runOnRead: /data/local/tmp/bin/hook_on.sh
     runOnUnread: /data/local/tmp/bin/hook_off.sh

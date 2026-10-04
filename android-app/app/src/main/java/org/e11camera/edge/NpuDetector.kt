@@ -4,6 +4,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import java.io.File
 import java.util.ArrayDeque
@@ -27,7 +28,14 @@ data class AlertVisionSnapshot(
     val personCount: Int,
     val adultLikePersonCount: Int,
     val supervisionState: SupervisionStateMachine.State,
-    val notificationsSuppressed: Boolean
+    val notificationsSuppressed: Boolean,
+    val queueMs: Long = 0L,
+    val captureMs: Long = 0L,
+    val totalWaitMs: Long = 0L,
+    val sourceAgeMs: Long = -1L,
+    val degradedReason: String = "",
+    val sourceCapturedElapsedMs: Long = 0L,
+    val sourceMaxAgeMs: Long = AlertVisionRefreshPolicy.MAX_SOURCE_AGE_MS
 )
 
 data class AdultCalibrationStatus(
@@ -67,7 +75,9 @@ class NpuDetector(
         val available: Boolean,
         val boxes: List<FloatArray>,
         val inferenceMs: Long,
-        val snapshot: AlertVisionSnapshot
+        val snapshot: AlertVisionSnapshot,
+        val source: CameraStreamer.JpegSnapshot? = null,
+        val sourceMaxAgeMs: Long = AlertVisionRefreshPolicy.MAX_SOURCE_AGE_MS
     )
 
     /** 每次 start 的独立代次；旧任务只释放自己这一代的在途标记。 */
@@ -81,9 +91,7 @@ class NpuDetector(
         private const val TAG = "NpuDetector"
         private const val MODEL_FILE = "yolov8n_rk3566.rknn"
         private const val SAMPLE_INTERVAL_SEC = 2L
-        private const val ALERT_FRESH_FRAME_TIMEOUT_MS = 180L
-        private const val DEFAULT_ALERT_TIMEOUT_MS = 450L
-        private const val ALERT_RECENT_SOURCE_REUSE_MS = 500L
+        private const val DEFAULT_ALERT_TIMEOUT_MS = AlertVisionRefreshPolicy.DEFAULT_TIMEOUT_MS
         private const val INPUT_SIZE = 640
 
         /** COCO class 0 = person；只关心人 */
@@ -108,6 +116,11 @@ class NpuDetector(
     private val adultCalibrationBoxes = mutableListOf<Pair<Float, Float>>()
     private var scheduler: ScheduledExecutorService? = null
     @Volatile private var snapshotWorker: SnapshotWorker? = null
+    private data class PublishedAnalysis(
+        val snapshot: AlertVisionSnapshot,
+        val sourceElapsedMs: Long
+    )
+    @Volatile private var publishedAnalysis: PublishedAnalysis? = null
 
     @Volatile private var adultCalibrationState =
         if (deviceState.adultCalibratedAt > 0L) "complete" else "idle"
@@ -149,7 +162,7 @@ class NpuDetector(
         get() = supervision.state
 
     val notificationsSuppressed: Boolean
-        get() = caregiverEvidenceNow || supervision.notificationsSuppressed
+        get() = currentSnapshot("current_state").notificationsSuppressed
 
     @Volatile var lastSeenAt: Long = 0
         private set
@@ -167,6 +180,17 @@ class NpuDetector(
         private set
 
     @Volatile var lastAlertRefreshAt: Long = 0L
+        private set
+
+    @Volatile var lastAlertRefreshQueueMs: Long = 0L
+        private set
+    @Volatile var lastAlertRefreshCaptureMs: Long = 0L
+        private set
+    @Volatile var lastAlertRefreshTotalMs: Long = 0L
+        private set
+    @Volatile var lastAlertSourceAgeMs: Long = -1L
+        private set
+    @Volatile var lastAlertDegradedReason: String = ""
         private set
 
     @Synchronized
@@ -308,7 +332,7 @@ class NpuDetector(
                         try {
                             synchronized(inferenceLock) {
                                 if (!isSnapshotWorkerCurrent(worker) || pendingAlertRefreshes.get() > 0) return@inference
-                                runInference(snapshot, "scheduled")
+                                runInference(snapshot, "scheduled", worker)
                             }
                         } catch (e: Exception) {
                             if (e is InterruptedException) Thread.currentThread().interrupt()
@@ -336,48 +360,91 @@ class NpuDetector(
     }
 
     /**
-     * 告警前尝试强制取下一帧并补跑 NPU。调用方最多等待 [timeoutMs]，
-     * 超时后按安全侧继续事件流程，已开始的推理可以在后台完成并更新状态。
+     * 告警排队、取帧和推理共用一个单调时钟截止时间。取帧动态预留推理时间；
+     * 超时后已开始的 native 推理可结束，但过期排队任务不再取帧或启动新推理。
      */
-    fun refreshForAlert(timeoutMs: Long = DEFAULT_ALERT_TIMEOUT_MS): AlertVisionSnapshot {
+    fun refreshForAlert(
+        timeoutMs: Long = DEFAULT_ALERT_TIMEOUT_MS,
+        forceFresh: Boolean = false
+    ): AlertVisionSnapshot {
         val requestedAt = System.currentTimeMillis()
-        val executor = scheduler
-        if (!running.get() || !modelLoaded || executor == null) {
-            return recordAlertRefresh(currentSnapshot("unavailable"), requestedAt)
+        val startedElapsed = SystemClock.elapsedRealtime()
+        val deadline = startedElapsed + timeoutMs.coerceAtLeast(1L)
+        val worker = snapshotWorker
+        if (worker == null || !isSnapshotWorkerCurrent(worker) || !modelLoaded) {
+            return recordAlertRefresh(currentSnapshot("unavailable"), requestedAt, startedElapsed, worker)
         }
-        val sourceAge = requestedAt - lastSourceCapturedAt
-        if (lastAnalyzedAt > 0L && sourceAge in 0..ALERT_RECENT_SOURCE_REUSE_MS) {
-            return recordAlertRefresh(currentSnapshot("recent_frame"), requestedAt)
+        val recent = currentSnapshot("recent_frame", AlertVisionRefreshPolicy.RECENT_SOURCE_REUSE_MS)
+        if (!forceFresh && recent.analyzedAt > 0L && recent.degradedReason.isEmpty()) {
+            return recordAlertRefresh(recent, requestedAt, startedElapsed, worker)
         }
+        val cancelled = AtomicBoolean(false)
+        val taskStarted = AtomicBoolean(false)
+        val queueMs = java.util.concurrent.atomic.AtomicLong(0L)
+        val captureMs = java.util.concurrent.atomic.AtomicLong(0L)
+        fun fallback(status: String, reason: String = status): AlertVisionSnapshot =
+            currentSnapshot(status, AlertVisionRefreshPolicy.RECENT_SOURCE_REUSE_MS).copy(
+                queueMs = if (taskStarted.get()) queueMs.get() else SystemClock.elapsedRealtime() - startedElapsed,
+                captureMs = captureMs.get(), degradedReason = reason
+            )
+        fun canContinue(): Boolean = !cancelled.get() && isSnapshotWorkerCurrent(worker) &&
+            AlertVisionRefreshPolicy.remainingMs(deadline, SystemClock.elapsedRealtime()) > 0L
+
         pendingAlertRefreshes.incrementAndGet()
         return try {
             try {
-                val future = executor.submit<AlertVisionSnapshot> {
-                    val fresh = streamer.requestFreshJpeg(ALERT_FRESH_FRAME_TIMEOUT_MS)
+                val future = worker.scheduler.submit<AlertVisionSnapshot> {
+                    queueMs.set(SystemClock.elapsedRealtime() - startedElapsed)
+                    taskStarted.set(true)
+                    if (!canContinue()) return@submit fallback("timeout", "queue_deadline")
+                    val remaining = AlertVisionRefreshPolicy.remainingMs(deadline, SystemClock.elapsedRealtime())
+                    val captureBudget = AlertVisionRefreshPolicy.captureWaitMs(remaining, lastInferenceMs)
+                    val captureStarted = SystemClock.elapsedRealtime()
+                    val fresh = if (captureBudget > 0L) streamer.requestFreshJpeg(captureBudget) else null
+                    captureMs.set(SystemClock.elapsedRealtime() - captureStarted)
+                    if (!canContinue()) return@submit fallback("timeout", "capture_deadline")
                     val source = fresh ?: streamer.latestJpegSnapshot()
-                    if (source.bytes.isEmpty()) {
-                        currentSnapshot("no_frame")
-                    } else {
-                        runInference(source, if (fresh != null) "refreshed" else "latest_frame")
+                    if (source.bytes.isEmpty()) return@submit fallback("no_frame", "no_frame")
+                    val refreshStatus = if (fresh != null) "refreshed" else "latest_frame"
+                    val sourceLimit = AlertVisionRefreshPolicy.maxAgeForAlert(refreshStatus)
+                    val sourceAge = sourceAgeMs(source)
+                    if (!AlertVisionRefreshPolicy.sourceUsable(sourceAge, sourceLimit)) {
+                        return@submit fallback("stale_frame", "source_expired")
                     }
+                    val result = executeInference(
+                        source,
+                        refreshStatus,
+                        publishPresence = true,
+                        worker = worker,
+                        canContinue = ::canContinue
+                    )
+                    if (!result.available) return@submit fallback("unavailable", "inference_unavailable")
+                    result.snapshot.copy(
+                        queueMs = queueMs.get(),
+                        captureMs = captureMs.get(),
+                        degradedReason = if (fresh == null) "fresh_capture_timeout_used_cache" else result.snapshot.degradedReason
+                    )
                 }
                 try {
-                    recordAlertRefresh(
-                        future.get(timeoutMs.coerceAtLeast(1L), TimeUnit.MILLISECONDS),
-                        requestedAt
-                    )
+                    val remaining = AlertVisionRefreshPolicy.remainingMs(deadline, SystemClock.elapsedRealtime())
+                    if (remaining <= 0L) throw TimeoutException()
+                    recordAlertRefresh(future.get(remaining, TimeUnit.MILLISECONDS), requestedAt, startedElapsed, worker)
                 } catch (_: TimeoutException) {
+                    cancelled.set(true)
                     future.cancel(false)
-                    recordAlertRefresh(currentSnapshot("timeout"), requestedAt)
+                    recordAlertRefresh(fallback("timeout", "total_deadline"), requestedAt, startedElapsed, worker)
+                } catch (e: InterruptedException) {
+                    cancelled.set(true)
+                    future.cancel(false)
+                    Thread.currentThread().interrupt()
+                    recordAlertRefresh(fallback("interrupted"), requestedAt, startedElapsed, worker)
                 }
             } catch (_: RejectedExecutionException) {
-                recordAlertRefresh(currentSnapshot("unavailable"), requestedAt)
-            } catch (e: InterruptedException) {
-                Thread.currentThread().interrupt()
-                recordAlertRefresh(currentSnapshot("interrupted"), requestedAt)
+                recordAlertRefresh(fallback("unavailable"), requestedAt, startedElapsed, worker)
             } catch (e: Exception) {
+                cancelled.set(true)
                 Log.w(TAG, "告警前 NPU 补跑失败", e)
-                recordAlertRefresh(currentSnapshot("failed"), requestedAt)
+                recordAlertRefresh(fallback("failed"), requestedAt, startedElapsed, worker)
             }
         } finally {
             pendingAlertRefreshes.decrementAndGet()
@@ -386,21 +453,28 @@ class NpuDetector(
 
     /**
      * 守护启动时先完成一次可能较慢的首轮推理，避免第一个真实
-     * 告警把 RKNN/Bitmap 预热时间算进 450ms 等待上限。
+     * 告警把 RKNN/Bitmap 预热时间算进 600ms 等待上限。
      */
     fun warmUpForGuard(timeoutMs: Long = 8_000L): Boolean {
         if (Looper.myLooper() == Looper.getMainLooper()) {
             Log.e(TAG, "拒绝在主线程等待 NPU 预热")
             return false
         }
-        val executor = scheduler
-        if (!running.get() || !modelLoaded || executor == null) return false
+        val worker = snapshotWorker
+        if (worker == null || !isSnapshotWorkerCurrent(worker) || !modelLoaded) return false
+        val deadline = SystemClock.elapsedRealtime() + timeoutMs.coerceAtLeast(1L)
+        val cancelled = AtomicBoolean(false)
+        fun canContinue(): Boolean = !cancelled.get() && isSnapshotWorkerCurrent(worker) &&
+            AlertVisionRefreshPolicy.remainingMs(deadline, SystemClock.elapsedRealtime()) > 0L
         return try {
-            val future = executor.submit<Boolean> {
+            val future = worker.scheduler.submit<Boolean> {
+                if (!canContinue()) return@submit false
                 // 开机时 HTTP 服务可能早于 Camera HAL 就绪，给首帧恢复留足时间。
-                val fresh = streamer.requestFreshJpeg(5_000L)
+                val captureBudget = minOf(5_000L, AlertVisionRefreshPolicy.remainingMs(deadline, SystemClock.elapsedRealtime()))
+                val fresh = streamer.requestFreshJpeg(captureBudget)
                 val source = fresh ?: streamer.latestJpegSnapshot()
-                if (source.bytes.isEmpty()) false
+                val sourceLimit = AlertVisionRefreshPolicy.maxAgeForAlert(if (fresh != null) "refreshed" else "latest_frame")
+                if (source.bytes.isEmpty() || !canContinue()) false
                 else {
                     var passes = 0
                     var stable = false
@@ -408,24 +482,31 @@ class NpuDetector(
                     while (passes < 4 && !stable) {
                         // 多轮可复用同一画面做性能预热，但不能把同一帧重复
                         // 计入陪护防抖，否则一次成人命中会被误当成连续多帧证据。
-                        val result = executeInference(source, "warmup", publishPresence = false)
+                        val result = executeInference(
+                            source, "warmup", publishPresence = false, worker = worker,
+                            canContinue = ::canContinue, maxSourceAgeMs = sourceLimit
+                        )
                         if (!result.available) return@submit false
                         finalPass = result
                         passes++
                         // 至少两轮；某些 RK3566 运行时需要第三轮才进入稳定时延。
                         stable = passes >= 2 && result.inferenceMs in 1L..250L
                     }
-                    val published = finalPass?.let { publishWarmupPresence(it) } == true
+                    val published = canContinue() && finalPass?.let { publishWarmupPresence(it, worker) } == true
                     Log.i(TAG, "NPU 预热完成 passes=$passes stable=$stable last=${lastInferenceMs}ms")
                     published
                 }
             }
             try {
-                future.get(timeoutMs.coerceAtLeast(1L), TimeUnit.MILLISECONDS)
+                val remaining = AlertVisionRefreshPolicy.remainingMs(deadline, SystemClock.elapsedRealtime())
+                if (remaining <= 0L) throw TimeoutException()
+                future.get(remaining, TimeUnit.MILLISECONDS)
             } catch (_: TimeoutException) {
+                cancelled.set(true)
                 future.cancel(false)
                 false
             } catch (_: InterruptedException) {
+                cancelled.set(true)
                 future.cancel(false)
                 Thread.currentThread().interrupt()
                 false
@@ -439,73 +520,135 @@ class NpuDetector(
 
     private fun runInference(
         source: CameraStreamer.JpegSnapshot,
-        refreshStatus: String
-    ): AlertVisionSnapshot = executeInference(source, refreshStatus, publishPresence = true).snapshot
+        refreshStatus: String,
+        worker: SnapshotWorker
+    ): AlertVisionSnapshot = executeInference(source, refreshStatus, true, worker).snapshot
+
+    private fun sourceAgeMs(source: CameraStreamer.JpegSnapshot): Long =
+        AlertVisionRefreshPolicy.sourceAgeMs(
+            System.currentTimeMillis(), source.capturedAtMs,
+            SystemClock.elapsedRealtime(), source.capturedElapsedMs
+        )
 
     private fun executeInference(
         source: CameraStreamer.JpegSnapshot,
         refreshStatus: String,
-        publishPresence: Boolean
+        publishPresence: Boolean,
+        worker: SnapshotWorker,
+        canContinue: () -> Boolean = { isSnapshotWorkerCurrent(worker) },
+        maxSourceAgeMs: Long = AlertVisionRefreshPolicy.maxAgeForAlert(refreshStatus)
     ): InferencePass = synchronized(inferenceLock) {
-        if (!running.get() || handle == 0L) {
-            return@synchronized InferencePass(
-                available = false,
-                boxes = emptyList(),
-                inferenceMs = 0L,
-                snapshot = currentSnapshot("unavailable")
-            )
+        fun unavailable(status: String) = InferencePass(
+            available = false, boxes = emptyList(), inferenceMs = 0L,
+            snapshot = currentSnapshot(status)
+        )
+        if (!isSnapshotWorkerCurrent(worker) || handle == 0L || !canContinue()) {
+            return@synchronized unavailable("unavailable")
         }
-        val t0 = System.currentTimeMillis()
-        val boxes = detectPersons(source.bytes)
-        val cost = System.currentTimeMillis() - t0
+        if (!AlertVisionRefreshPolicy.sourceUsable(sourceAgeMs(source), maxSourceAgeMs)) {
+            return@synchronized unavailable("stale_frame")
+        }
+        val t0 = SystemClock.elapsedRealtime()
+        val boxes = detectPersons(source.bytes, canContinue)
+            ?: return@synchronized unavailable("unavailable")
+        val cost = SystemClock.elapsedRealtime() - t0
+        // stop/start 或采集迟滞期间返回的旧推理不能给新一代发布陪护证据。
+        if (!isSnapshotWorkerCurrent(worker) || !AlertVisionRefreshPolicy.sourceUsable(sourceAgeMs(source), maxSourceAgeMs)) {
+            return@synchronized unavailable("stale_frame")
+        }
         lastSourceCapturedAt = source.capturedAtMs
         lastInferenceMs = cost
         lastAnalyzedAt = System.currentTimeMillis()
-        if (publishPresence) updatePresence(boxes, cost)
+        if (publishPresence) {
+            updatePresence(boxes, cost) { publishAnalysis(source, refreshStatus, maxSourceAgeMs) }
+        }
         InferencePass(
-            available = true,
-            boxes = boxes,
-            inferenceMs = cost,
-            snapshot = currentSnapshot(refreshStatus)
+            available = true, boxes = boxes, inferenceMs = cost,
+            snapshot = currentSnapshot(refreshStatus), source = source, sourceMaxAgeMs = maxSourceAgeMs
         )
     }
 
-    private fun publishWarmupPresence(result: InferencePass): Boolean = synchronized(inferenceLock) {
-        if (!running.get() || handle == 0L) return@synchronized false
-        updatePresence(result.boxes, result.inferenceMs)
+    private fun publishAnalysis(source: CameraStreamer.JpegSnapshot, refreshStatus: String, maxSourceAgeMs: Long) {
+        publishedAnalysis = PublishedAnalysis(
+            AlertVisionSnapshot(
+                refreshStatus = refreshStatus,
+                analyzedAt = lastAnalyzedAt,
+                sourceCapturedAt = source.capturedAtMs,
+                inferenceMs = lastInferenceMs,
+                personCount = personCount,
+                adultLikePersonCount = adultLikePersonCount,
+                supervisionState = supervisionState,
+                notificationsSuppressed = caregiverEvidenceNow || supervision.notificationsSuppressed,
+                sourceCapturedElapsedMs = source.capturedElapsedMs,
+                sourceMaxAgeMs = maxSourceAgeMs
+            ),
+            sourceElapsedMs = source.capturedElapsedMs
+        )
+    }
+
+    private fun publishWarmupPresence(result: InferencePass, worker: SnapshotWorker): Boolean = synchronized(inferenceLock) {
+        val source = result.source ?: return@synchronized false
+        if (!isSnapshotWorkerCurrent(worker) || handle == 0L ||
+            !AlertVisionRefreshPolicy.sourceUsable(sourceAgeMs(source), result.sourceMaxAgeMs)) return@synchronized false
+        updatePresence(result.boxes, result.inferenceMs) { publishAnalysis(source, "warmup", result.sourceMaxAgeMs) }
         true
     }
 
-    private fun currentSnapshot(refreshStatus: String): AlertVisionSnapshot = AlertVisionSnapshot(
-        refreshStatus = refreshStatus,
-        analyzedAt = lastAnalyzedAt,
-        sourceCapturedAt = lastSourceCapturedAt,
-        inferenceMs = lastInferenceMs,
-        personCount = personCount,
-        adultLikePersonCount = adultLikePersonCount,
-        supervisionState = supervisionState,
-        notificationsSuppressed = notificationsSuppressed
-    )
+    private fun currentSnapshot(
+        refreshStatus: String,
+        maxSourceAgeMs: Long = AlertVisionRefreshPolicy.MAX_SOURCE_AGE_MS
+    ): AlertVisionSnapshot {
+        val published = publishedAnalysis
+        if (published == null) {
+            return AlertVisionSnapshot(
+                refreshStatus, 0L, 0L, 0L, 0, 0,
+                SupervisionStateMachine.State.UNKNOWN, false, degradedReason = "no_analysis"
+            )
+        }
+        val snapshot = published.snapshot
+        val age = AlertVisionRefreshPolicy.sourceAgeMs(
+            System.currentTimeMillis(), snapshot.sourceCapturedAt,
+            SystemClock.elapsedRealtime(), published.sourceElapsedMs
+        )
+        return AlertVisionRefreshPolicy.safeDecision(
+            snapshot.copy(refreshStatus = refreshStatus), age, running.get(), maxSourceAgeMs
+        )
+    }
 
-    /**
-     * 仅复制刚完成的陪护结果，不排队补跑。用于 NPU 状态回调线程内重新决策，
-     * 避免在同一个单线程执行器上等待自己而死锁。
-     */
+    /** 复制同一份完整分析；源过期时返回 UNKNOWN，而不为历史成人结果重新贴当前时间。 */
     fun currentDecisionSnapshot(refreshStatus: String = "current_state"): AlertVisionSnapshot =
         currentSnapshot(refreshStatus)
 
     private fun recordAlertRefresh(
         snapshot: AlertVisionSnapshot,
-        requestedAt: Long
+        requestedAt: Long,
+        startedElapsed: Long,
+        expectedWorker: SnapshotWorker?
     ): AlertVisionSnapshot {
-        lastAlertRefreshStatus = snapshot.refreshStatus
+        val maxSourceAge = AlertVisionRefreshPolicy.maxAgeForAlert(snapshot.refreshStatus)
+        // 调用线程醒来时再次检查，不把 Future 完成之后的等待漏出证据时效限制。
+        val result = AlertVisionRefreshPolicy.safeDecision(
+            snapshot,
+            AlertVisionRefreshPolicy.sourceAgeMs(
+                System.currentTimeMillis(), snapshot.sourceCapturedAt,
+                SystemClock.elapsedRealtime(), snapshot.sourceCapturedElapsedMs
+            ),
+            expectedWorker != null && isSnapshotWorkerCurrent(expectedWorker), maxSourceAge
+        ).copy(totalWaitMs = SystemClock.elapsedRealtime() - startedElapsed)
+        lastAlertRefreshStatus = result.refreshStatus
         lastAlertRefreshAt = requestedAt
-        return snapshot
+        lastAlertRefreshQueueMs = result.queueMs
+        lastAlertRefreshCaptureMs = result.captureMs
+        lastAlertRefreshTotalMs = result.totalWaitMs
+        lastAlertSourceAgeMs = result.sourceAgeMs
+        lastAlertDegradedReason = result.degradedReason
+        return result
     }
 
     /** JPEG → letterbox 640 → NPU 推理 → yolov8 解码 → NMS → person 框（归一化 x,y,w,h,conf）。 */
-    private fun detectPersons(jpeg: ByteArray): List<FloatArray> {
-        val bmp = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size) ?: return emptyList()
+    private fun detectPersons(jpeg: ByteArray, canContinue: () -> Boolean): List<FloatArray>? {
+        if (!canContinue()) return null
+        val bmp = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size) ?: return null
         val srcW = bmp.width
         val srcH = bmp.height
         val scale = min(inputW.toFloat() / srcW, inputH.toFloat() / srcH)
@@ -534,9 +677,11 @@ class NpuDetector(
         }
 
         val outputs = synchronized(NpuExecutionGate.lock) {
+            // 与姿态模型共用 NPU 时，等锁耗时也算入同一 deadline；超时不启动 nativeRun。
+            if (!canContinue()) return@synchronized null
             nativeRun(handle, rgb, inputW, inputH)
-        } ?: return emptyList()
-        if (outputs.size != outputCount || outputs.size !in setOf(6, 9)) return emptyList()
+        } ?: return null
+        if (outputs.size != outputCount || outputs.size !in setOf(6, 9)) return null
         val candidates = mutableListOf<FloatArray>()
         val outputPerBranch = outputs.size / 3
         for (branch in 0 until 3) {
@@ -608,7 +753,7 @@ class NpuDetector(
         }
     }
 
-    private fun updatePresence(boxes: List<FloatArray>, costMs: Long) {
+    private fun updatePresence(boxes: List<FloatArray>, costMs: Long, publish: () -> Unit) {
         val now = System.currentTimeMillis()
         val detected = boxes.isNotEmpty()
         val immutableBoxes = boxes.map { it.copyOf() }
@@ -671,6 +816,8 @@ class NpuDetector(
                 "detect=$detected count=$personCount supervision=$currentSupervision (${costMs}ms)"
             )
         }
+        // 在状态回调之前发布原子快照，回调不会混用上一帧人数和本帧时间。
+        publish()
         if (currentSupervision != previousSupervision) {
             try {
                 onSupervisionChanged(previousSupervision, currentSupervision, observation)
@@ -737,6 +884,12 @@ class NpuDetector(
         lastInferenceMs = 0L
         lastAlertRefreshStatus = "never"
         lastAlertRefreshAt = 0L
+        lastAlertRefreshQueueMs = 0L
+        lastAlertRefreshCaptureMs = 0L
+        lastAlertRefreshTotalMs = 0L
+        lastAlertSourceAgeMs = -1L
+        lastAlertDegradedReason = ""
+        publishedAnalysis = null
         supervision.reset()
     }
 

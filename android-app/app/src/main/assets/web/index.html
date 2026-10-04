@@ -1846,15 +1846,17 @@ async function refreshStatus() {
     lastStatusAt = now;
 
     const live = j.cameraOn && j.streamReady && j.rtspPublishing;
-    $('liveBadge').textContent = j.captureEnabled === false ? '● 视频采集已暂停' : (live ? '● 设备 LIVE' : '● 设备恢复中');
+    const standby = j.videoStandby === true;
+    const paused = j.captureEnabled === false || j.privacy === true;
+    $('liveBadge').textContent = paused ? '● 视频采集已暂停' : (standby ? '● 按需待机' : (live ? '● 设备 LIVE' : '● 设备恢复中'));
     $('liveBadge').classList.toggle('off', !live);
     $('fpsBadge').textContent = fps > 0 ? `设备 ${fps.toFixed(1)} fps` : '设备帧率 --';
     const capturedAt = Number(j.frameCapturedAt || 0);
-    const stale = capturedAt <= 0 || now - capturedAt > 5000;
-    $('frameHealth').textContent = capturedAt > 0 ? (stale ? '设备画面可能卡住' : '设备画面正常') : '等待设备首帧';
+    const stale = !standby && !paused && (capturedAt <= 0 || now - capturedAt > 5000);
+    $('frameHealth').textContent = paused ? '视频采集已暂停' : (standby ? '待机，打开画面后唤醒' : (capturedAt > 0 ? (stale ? '设备画面可能卡住' : '设备画面正常') : '等待设备首帧'));
     $('frameHealth').classList.toggle('stale', stale);
     $('status').textContent =
-      `IP: ${j.ip} | 摄像头: ${j.cameraOn ? '开' : '恢复中'} | 运行: ${Math.floor(j.uptimeSeconds / 60)} 分钟`;
+      `IP: ${j.ip} | 摄像头: ${j.cameraOn ? '开' : (paused ? '暂停' : (standby ? '待机' : '恢复中'))} | 运行: ${Math.floor(j.uptimeSeconds / 60)} 分钟`;
 
     // 宝宝守护面板
     $('babyModeVal').textContent = j.babyMonitorEnabled ? '开' : '关';

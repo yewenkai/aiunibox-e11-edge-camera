@@ -20,6 +20,7 @@ import android.view.Surface
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 /** Camera2 视频持续送硬件编码器；YUV/JPEG 仅在快照或分析需要新帧时采集。 */
 class CameraStreamer(private val context: Context) {
@@ -30,7 +31,7 @@ class CameraStreamer(private val context: Context) {
         private const val CAPTURE_TIMEOUT_MS = 1_500L
     }
 
-    data class JpegSnapshot(val bytes: ByteArray, val capturedAtMs: Long)
+    data class JpegSnapshot(val bytes: ByteArray, val capturedAtMs: Long, val capturedElapsedMs: Long = 0L)
 
     @Volatile var previewSurface: Surface? = null
     private val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
@@ -39,6 +40,7 @@ class CameraStreamer(private val context: Context) {
     private val jpegExecutor = Executors.newSingleThreadExecutor { task -> Thread(task, "jpeg-worker") }
     private val desiredRunning = AtomicBoolean(false)
     private val stopped = AtomicBoolean(false)
+    private val pendingVideoCloses = AtomicInteger(0)
     private val jpegMonitor = Object()
     private val demand = SnapshotDemandQueue()
     private var demandEpoch = 0L // Protected by jpegMonitor.
@@ -47,6 +49,7 @@ class CameraStreamer(private val context: Context) {
         private set
     @Volatile var latestJpegCapturedAtMs: Long = 0L
         private set
+    @Volatile private var latestJpegCapturedElapsedMs: Long = 0L
     @Volatile var yuvFrameCount: Long = 0L
         private set
     @Volatile var jpegFrameCount: Long = 0L
@@ -57,15 +60,18 @@ class CameraStreamer(private val context: Context) {
         get() = maxOf(h264Encoder?.lastOutputAtMs ?: 0L, latestJpegCapturedAtMs)
 
     fun latestJpegSnapshot(): JpegSnapshot = synchronized(this) {
-        JpegSnapshot(latestJpeg, latestJpegCapturedAtMs)
+        JpegSnapshot(latestJpeg, latestJpegCapturedAtMs, latestJpegCapturedElapsedMs)
     }
 
     /** 多个消费者可共用最近的快照；只有缓存过期才进入采集队列。 */
     fun requestJpegSnapshot(maxAgeMs: Long = 750L, timeoutMs: Long = 1_500L): JpegSnapshot? {
-        if (!desiredRunning.get()) return null
+        if (!desiredRunning.get() || stopped.get()) return null
+        if (pendingVideoCloses.get() > 0) return requestFreshJpeg(timeoutMs)
         val cached = latestJpegSnapshot()
-        val age = System.currentTimeMillis() - cached.capturedAtMs
-        if (cached.bytes.isNotEmpty() && age in 0..maxAgeMs) return cached
+        val age = if (cached.capturedElapsedMs > 0L) SystemClock.elapsedRealtime() - cached.capturedElapsedMs
+            else System.currentTimeMillis() - cached.capturedAtMs
+        if (cached.bytes.isNotEmpty() && age in 0..maxAgeMs && desiredRunning.get() &&
+            pendingVideoCloses.get() == 0 && !stopped.get()) return cached
         return requestFreshJpeg(timeoutMs)
     }
 
@@ -75,7 +81,19 @@ class CameraStreamer(private val context: Context) {
             Looper.myLooper() == callbackThread.looper) return null
         val deadline = SystemClock.elapsedRealtime() + timeoutMs
         synchronized(jpegMonitor) {
-            if (!desiredRunning.get()) return null
+            // resume 可以先于 camera-cb 的旧 pause 清理完成；必须先等旧代次关闭，
+            // 再记录 epoch/入队，否则旧 closeCameraOnly 会取消刚唤醒的首帧请求。
+            while (pendingVideoCloses.get() > 0 && desiredRunning.get() && !stopped.get()) {
+                val remaining = deadline - SystemClock.elapsedRealtime()
+                if (remaining <= 0L) return null
+                try {
+                    jpegMonitor.wait(remaining)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    return null
+                }
+            }
+            if (!desiredRunning.get() || stopped.get() || SystemClock.elapsedRealtime() >= deadline) return null
             val epoch = demandEpoch
             val sequence = demand.enqueue(deadline)
             handler.post(pumpRunnable)
@@ -91,7 +109,8 @@ class CameraStreamer(private val context: Context) {
                         return null
                     }
                 }
-                if (epoch != demandEpoch || !demand.isCompleted(sequence) ||
+                if (!desiredRunning.get() || stopped.get() || pendingVideoCloses.get() > 0 ||
+                    epoch != demandEpoch || !demand.isCompleted(sequence) ||
                     SystemClock.elapsedRealtime() >= deadline) return null
                 return latestJpegSnapshot().takeIf { it.bytes.isNotEmpty() }
             } finally {
@@ -121,6 +140,10 @@ class CameraStreamer(private val context: Context) {
 
     @Volatile var h264Encoder: H264Encoder? = null
         private set
+    /** 排除等待异步关闭的旧编码器，供刚唤醒的媒体连接等待当前代次。 */
+    val currentStreamingEncoder: H264Encoder?
+        get() = if (desiredRunning.get() && !stopped.get() && pendingVideoCloses.get() == 0)
+            h264Encoder else null
     val isRunning: Boolean get() = camera != null
 
     fun start() {
@@ -131,7 +154,8 @@ class CameraStreamer(private val context: Context) {
 
     @SuppressLint("MissingPermission")
     private fun openCamera() {
-        if (!desiredRunning.get() || stopped.get() || camera != null || opening) return
+        if (!desiredRunning.get() || stopped.get() || pendingVideoCloses.get() > 0 ||
+            camera != null || opening) return
         opening = true
         val generation = ++cameraGeneration
         try {
@@ -307,6 +331,7 @@ class CameraStreamer(private val context: Context) {
     private fun processImage(image: Image, capture: SnapshotCapture) {
         capture.processing = true
         val capturedAtMs = System.currentTimeMillis()
+        val capturedElapsedMs = SystemClock.elapsedRealtime()
         val nv21 = try { imageToNv21(image) } catch (e: Exception) {
             Log.w(TAG, "YUV 读取失败", e)
             captureFailed(capture, "yuv_failed")
@@ -336,6 +361,7 @@ class CameraStreamer(private val context: Context) {
                         synchronized(this) {
                             latestJpeg = jpeg
                             latestJpegCapturedAtMs = capturedAtMs
+                            latestJpegCapturedElapsedMs = capturedElapsedMs
                         }
                         jpegFrameCount++
                     }
@@ -424,17 +450,31 @@ class CameraStreamer(private val context: Context) {
         synchronized(this) {
             latestJpeg = ByteArray(0)
             latestJpegCapturedAtMs = 0L
+            latestJpegCapturedElapsedMs = 0L
         }
     }
 
     fun pause() {
+        if (stopped.get()) return
+        pendingVideoCloses.incrementAndGet()
         desiredRunning.set(false)
         invalidateDemand()
-        handler.post {
-            handler.removeCallbacks(retryRunnable)
-            closeCameraOnly()
-            closeVideo()
-            Log.i(TAG, "摄像头已暂停")
+        val posted = handler.post {
+            try {
+                handler.removeCallbacks(retryRunnable)
+                closeCameraOnly()
+                closeVideo()
+                Log.i(TAG, "摄像头已暂停")
+            } finally {
+                pendingVideoCloses.decrementAndGet()
+                synchronized(jpegMonitor) { jpegMonitor.notifyAll() }
+            }
+            // 并发 resume 的 open 消息也可能排在此次 close 前，补一次当前代次启动。
+            if (desiredRunning.get() && !stopped.get() && pendingVideoCloses.get() == 0) openCamera()
+        }
+        if (!posted) {
+            pendingVideoCloses.decrementAndGet()
+            synchronized(jpegMonitor) { jpegMonitor.notifyAll() }
         }
     }
 

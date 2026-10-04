@@ -1,18 +1,27 @@
 #!/system/bin/sh
 # AIUniBOX-E11 Edge Camera 自启脚本（Magisk service.d 或模块 service.sh，开机后 root 执行）
-BIN_DIR=/data/local/tmp/bin
+BIN_DIR=${E11_BIN_DIR:-/data/local/tmp/bin}
 LOG=/data/local/tmp/e11_camera_service.log
 MEDIAMTX_LOG=/data/local/tmp/e11_camera_mediamtx.log
 STATE_DIR=/data/local/tmp/e11-edge-camera
 WATCHDOG_STATE="$STATE_DIR/watchdog.state"
 LEGACY_WATCHDOG_PID=/data/local/tmp/e11_camera_watchdog.pid
 APP_PKG=org.e11camera.edge
-TOKEN_FILE="$STATE_DIR/api_token"
 BOOT_ID=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)
 [ -n "$BOOT_ID" ] || BOOT_ID=$(awk '/^btime / { print $2 }' /proc/stat 2>/dev/null)
 MEDIAMTX_GUARD_PID=
 
 log() { echo "$(date '+%m-%d %H:%M:%S') $1" >> "$LOG"; }
+
+if [ ! -r "$BIN_DIR/camera_common.sh" ]; then
+    log "缺少 camera_common.sh，请完整更新部署脚本"
+    exit 1
+fi
+. "$BIN_DIR/camera_common.sh"
+if [ -z "$E11_HTTP_KIND" ] || [ -z "$E11_LOCK_BUSYBOX" ]; then
+    log "缺少支持 Bearer header 的 HTTP 客户端或 BusyBox flock"
+    exit 1
+fi
 
 pid_is_our_watchdog() {
     PID=$1
@@ -34,8 +43,8 @@ media_ports_ready() {
     # 部分定制固件的 nc 不支持 -z，即使端口已监听也会返回失败。
     # ss 来自 Android toybox/iproute2，在本设备上可稳定读取监听表。
     LISTENING=$(ss -lnt 2>/dev/null)
-    echo "$LISTENING" | grep -q ':8554[[:space:]]' &&
-        echo "$LISTENING" | grep -q ':8888[[:space:]]'
+    case "$LISTENING" in *:8554[[:space:]]*) ;; *) return 1 ;; esac
+    case "$LISTENING" in *:8888[[:space:]]*) return 0 ;; *) return 1 ;; esac
 }
 
 start_monitor_app() {
@@ -71,6 +80,9 @@ echo "$BOOT_ID $$" > "$WATCHDOG_STATE"
 cleanup() {
     [ -n "$MEDIAMTX_GUARD_PID" ] && kill "$MEDIAMTX_GUARD_PID" 2>/dev/null
     stop_mediamtx
+    E11_MEDIA_GENERATION="$BOOT_ID-$$-stopped"
+    e11_reset_viewers
+    e11_api_get '/api/stream-demand?on=false' >/dev/null
     rm -f "$WATCHDOG_STATE" "$LEGACY_WATCHDOG_PID"
 }
 trap cleanup EXIT
@@ -78,9 +90,8 @@ trap 'exit 0' INT TERM
 
 log "===== AIUniBOX-E11 Edge Camera 自启脚本开始 ====="
 mkdir -p "$BIN_DIR"
-rm -rf /data/local/tmp/e11_edge_camera_viewers
-mkdir -p /data/local/tmp/e11_edge_camera_viewers
-echo 0 > /sdcard/e11_edge_camera_watching
+E11_MEDIA_GENERATION="$BOOT_ID-$$-starting"
+e11_reset_viewers
 
 # 等待系统启动完成
 until [ "$(getprop sys.boot_completed)" = "1" ]; do
@@ -98,14 +109,24 @@ done
 # 1) MediaMTX 单进程守护：先清理孤儿进程，退出后由本循环重启。
 stop_mediamtx
 (
+    MEDIA_GENERATION_INDEX=0
     while true; do
         if [ ! -x "$BIN_DIR/mediamtx" ] || [ ! -r "$BIN_DIR/mediamtx.yml" ]; then
             log "MediaMTX 文件缺失或权限错误，3 秒后重试"
             sleep 3
             continue
         fi
+        MEDIA_GENERATION_INDEX=$((MEDIA_GENERATION_INDEX + 1))
+        E11_MEDIA_GENERATION="$BOOT_ID-$$-$MEDIA_GENERATION_INDEX"
+        export E11_MEDIA_GENERATION
+        e11_reset_viewers
         log "启动 MediaMTX"
         "$BIN_DIR/mediamtx" "$BIN_DIR/mediamtx.yml" >> "$MEDIAMTX_LOG" 2>&1
+        # 使上一轮未完成的 read/unread/demand hook 立即失效。
+        E11_MEDIA_GENERATION="$BOOT_ID-$$-$MEDIA_GENERATION_INDEX-stopped"
+        export E11_MEDIA_GENERATION
+        e11_reset_viewers
+        e11_api_get '/api/stream-demand?on=false' >/dev/null
         log "mediamtx 已退出，3 秒后重启"
         sleep 3
     done
@@ -126,25 +147,18 @@ log "启动监控 App: $APP_PKG"
 start_monitor_app
 sleep 8
 
-# 4) 同时检查正确的 App 进程、MediaMTX 端口和 RTSP 发布状态。
+# 4) 只读取最小运行健康状态，并为 app 的观看状态租约续期。
+# 隐私、手动暂停和自动待机由 API 明确报告为健康，不能因无编码帧而重启。
 # 连续失败时重建 App；MediaMTX 异常时先触发其守护循环重启。
 FAIL_COUNT=0
 while true; do
-    TOKEN=$(cat "$TOKEN_FILE" 2>/dev/null)
-    STATUS_URL=http://127.0.0.1:8080/api/status
-    [ -n "$TOKEN" ] && STATUS_URL="$STATUS_URL?token=$TOKEN"
-    STATUS=$(/system/bin/busybox wget -qO- "$STATUS_URL" 2>/dev/null)
-    CAPTURE_HEALTHY=0
-    if echo "$STATUS" | grep -q '"captureEnabled":false' ||
-        echo "$STATUS" | grep -q '"privacy":true'; then
-        CAPTURE_HEALTHY=1
-    elif echo "$STATUS" | grep -q '"streamReady":true' &&
-        echo "$STATUS" | grep -q '"rtspPublishing":true'; then
-        CAPTURE_HEALTHY=1
-    fi
+    e11_refresh_viewers
+    STATUS=$(e11_api_get '/api/runtime-health')
+    RUNTIME_HEALTHY=0
+    case "$STATUS" in *'"healthy":true'*) RUNTIME_HEALTHY=1 ;; esac
     if pidof "$APP_PKG" >/dev/null 2>&1 &&
         media_ports_ready &&
-        [ "$CAPTURE_HEALTHY" -eq 1 ]; then
+        [ "$RUNTIME_HEALTHY" -eq 1 ]; then
         FAIL_COUNT=0
     else
         FAIL_COUNT=$((FAIL_COUNT + 1))

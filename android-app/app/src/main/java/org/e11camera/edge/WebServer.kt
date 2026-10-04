@@ -70,6 +70,15 @@ class WebServer(
                 uri == "/stream" -> serveMjpeg()
                 uri == "/snapshot" -> serveSnapshot()
                 uri == "/h264" -> serveH264()
+                uri == "/api/runtime-health" -> apiRuntimeHealth()
+                uri == "/api/stream-demand" -> {
+                    val enabled = params["on"]?.toBooleanStrictOrNull()
+                    json(JSONObject().put("ok", enabled != null &&
+                        MonitorService.instance?.renewMediaDemand(enabled) == true).toString())
+                }
+                uri == "/api/vision-selftest" -> json(
+                    MonitorService.instance?.runVisionSelfTest()?.toString()
+                        ?: """{"ok":false,"error":"service_unavailable"}""")
                 uri == "/event-clip" -> serveEventClip(params["id"], session.headers["range"])
                 uri.startsWith("/api/motor") -> apiMotor(params)
                 uri.startsWith("/api/preset") -> apiPreset(params)
@@ -107,7 +116,12 @@ class WebServer(
 
     /** 单帧 JPEG 快照（前端 JS 定时轮询） */
     private fun serveSnapshot(): Response {
-        val frame = streamer.requestJpegSnapshot(timeoutMs = 5_000L)?.bytes ?: ByteArray(0)
+        val lease = MonitorService.instance?.acquireVideoDemand() ?: return mediaPaused()
+        val frame = try {
+            val captured = streamer.requestJpegSnapshot(timeoutMs = 5_000L)?.bytes ?: ByteArray(0)
+            if (!lease.isActive) return mediaPaused()
+            captured
+        } finally { lease.close() }
         return if (frame.isEmpty()) {
             newFixedLengthResponse(Response.Status.INTERNAL_ERROR, MIME_PLAINTEXT, "无画面")
         } else {
@@ -120,29 +134,46 @@ class WebServer(
 
     /** H.264 裸流端点（供 ffmpeg -c copy 转推 RTSP，支持多客户端） */
     private fun serveH264(): Response {
-        val enc = streamer.h264Encoder ?: return newFixedLengthResponse(
-            Response.Status.SERVICE_UNAVAILABLE, MIME_PLAINTEXT, "编码器未启动"
-        )
+        val lease = MonitorService.instance?.acquireVideoDemand() ?: return mediaPaused()
+        val deadline = android.os.SystemClock.elapsedRealtime() + 5_000L
+        try {
+            while (streamer.currentStreamingEncoder == null && state.captureEnabled && !state.privacyMode &&
+                android.os.SystemClock.elapsedRealtime() < deadline) Thread.sleep(20L)
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            lease.close()
+            return mediaPaused()
+        }
+        val enc = streamer.currentStreamingEncoder
+        if (enc == null || !state.captureEnabled || state.privacyMode) {
+            lease.close()
+            return mediaPaused()
+        }
 
         // 每个客户端注册独立订阅队列
         val subQueue = enc.subscribe()
+        enc.requestKeyFrame()
 
         val pipeOut = java.io.PipedOutputStream()
         val pipeIn = java.io.PipedInputStream(pipeOut, 1024 * 1024)
 
+        val closed = java.util.concurrent.atomic.AtomicBoolean(false)
         Thread {
             try {
                 var waitCount = 0
-                while (!enc.hasSpsPps && waitCount < 200) {
+                while (!enc.hasSpsPps && !closed.get() && streamer.currentStreamingEncoder === enc && waitCount < 200) {
                     Thread.sleep(20); waitCount++
                 }
-                if (enc.hasSpsPps) {
+                if (enc.hasSpsPps && streamer.currentStreamingEncoder === enc &&
+                    state.captureEnabled && !state.privacyMode) {
                     pipeOut.write(enc.getSpsPps())
                 }
-                while (!Thread.currentThread().isInterrupted) {
+                while (!Thread.currentThread().isInterrupted && !closed.get() &&
+                    streamer.currentStreamingEncoder === enc && state.captureEnabled && !state.privacyMode) {
                     // 从该客户端专属队列取数据（不影响其他客户端）
                     val nal = subQueue.poll(50, java.util.concurrent.TimeUnit.MILLISECONDS)
-                    if (nal != null) {
+                    if (nal != null && streamer.currentStreamingEncoder === enc &&
+                        state.captureEnabled && !state.privacyMode) {
                         pipeOut.write(nal.data)
                     }
                 }
@@ -150,11 +181,17 @@ class WebServer(
             } finally {
                 enc.unsubscribe(subQueue)
                 try { pipeOut.close() } catch (_: Exception) {}
+                lease.close()
             }
-        }.start()
+        }.apply { name = "http-h264" }.start()
 
         val resp = newChunkedResponse(
-            Response.Status.OK, "video/h264", pipeIn
+            Response.Status.OK, "video/h264", object : FilterInputStream(pipeIn) {
+                override fun close() {
+                    closed.set(true)
+                    try { super.close() } finally { lease.close() }
+                }
+            }
         )
         resp.addHeader("Cache-Control", "no-cache, private")
         resp.addHeader("Connection", "close")
@@ -194,6 +231,7 @@ class WebServer(
             "无效的 HLS 路径"
         )
 
+        val lease = MonitorService.instance?.acquireVideoDemand() ?: return mediaPaused()
         var connection: HttpURLConnection? = null
         return try {
             val upstreamConnection = URL(upstreamUrl).openConnection() as HttpURLConnection
@@ -211,7 +249,8 @@ class WebServer(
             val rawStream = if (code >= 400) upstreamConnection.errorStream else upstreamConnection.inputStream
             val body = DisconnectingInputStream(
                 rawStream ?: ByteArrayInputStream(ByteArray(0)),
-                upstreamConnection
+                upstreamConnection,
+                lease
             )
             val length = upstreamConnection.contentLengthLong
             val mimeType = upstreamConnection.contentType ?: "application/octet-stream"
@@ -234,6 +273,7 @@ class WebServer(
             response
         } catch (e: Exception) {
             connection?.disconnect()
+            lease.close()
             Log.w(TAG, "HLS 同源代理不可用: $upstreamUrl", e)
             newFixedLengthResponse(
                 Response.Status.SERVICE_UNAVAILABLE,
@@ -248,19 +288,43 @@ class WebServer(
 
     private class DisconnectingInputStream(
         delegate: InputStream,
-        private val connection: HttpURLConnection
+        private val connection: HttpURLConnection,
+        private val lease: MonitorService.VideoLease
     ) : FilterInputStream(delegate) {
+        override fun read(): Int = if (lease.isActive) super.read() else { close(); -1 }
+        override fun read(b: ByteArray, off: Int, len: Int): Int =
+            if (lease.isActive) super.read(b, off, len) else { close(); -1 }
         override fun close() {
             try {
                 super.close()
             } finally {
                 connection.disconnect()
+                lease.close()
             }
         }
     }
 
+    private fun mediaPaused(): Response = newFixedLengthResponse(
+        Response.Status.SERVICE_UNAVAILABLE, MIME_PLAINTEXT, "视频采集已暂停或隐私模式已开启"
+    ).apply { addHeader("Cache-Control", "no-store") }
+
+    private fun apiRuntimeHealth(): Response {
+        val health = MonitorService.instance?.runtimeHealth()
+            ?: return json("""{"ok":false,"healthy":false,"error":"service_unavailable"}""")
+        return json(JSONObject().put("ok", true)
+            .put("state", health.state).put("captureEnabled", health.captureEnabled)
+            .put("privacy", health.privacy).put("cameraExpected", health.cameraExpected)
+            .put("cameraOn", health.cameraOn).put("streamReady", health.streamReady)
+            .put("rtspPublishing", health.rtspPublishing).put("warmingUp", health.warmingUp)
+            .put("healthy", !health.cameraExpected || health.warmingUp ||
+                (health.cameraOn && health.streamReady && health.rtspPublishing))
+            .put("activeRequests", health.activeRequests).put("externalDemands", health.externalDemands)
+            .toString())
+    }
+
     /** MJPEG 流：multipart/x-mixed-replace */
     private fun serveMjpeg(): Response {
+        val lease = MonitorService.instance?.acquireVideoDemand() ?: return mediaPaused()
         val contentType = "multipart/x-mixed-replace; boundary=$BOUNDARY"
         val stream: InputStream = object : InputStream() {
             @Volatile private var running = true
@@ -279,15 +343,16 @@ class WebServer(
                 }
                 if (len == 0) return 0
                 if (!running) return -1
+                if (!lease.isActive) { close(); return -1 }
                 try {
                     if (part.available() == 0) {
                         // JPEG 回退保持每秒一帧，分段读取同一 part 不会再次请求相机。
                         val waitMs = nextFrameAtMs - android.os.SystemClock.elapsedRealtime()
                         if (waitMs > 0L) Thread.sleep(waitMs)
-                        if (!running) return -1
+                        if (!running || !lease.isActive) { close(); return -1 }
                         val timeoutMs = if (firstFrame) 5_000L else 1_500L
                         val frame = streamer.requestJpegSnapshot(timeoutMs = timeoutMs)?.bytes
-                        if (!running || frame == null || frame.isEmpty()) {
+                        if (!running || !lease.isActive || frame == null || frame.isEmpty()) {
                             close()
                             return -1
                         }
@@ -315,6 +380,7 @@ class WebServer(
             override fun close() {
                 running = false
                 part = ByteArrayInputStream(ByteArray(0))
+                lease.close()
             }
         }
         val resp = newChunkedResponse(Response.Status.OK, contentType, stream)
@@ -664,6 +730,7 @@ class WebServer(
         val ip = NetworkUtil.getIpAddress(context)
         val encoder = streamer.h264Encoder
         val service = MonitorService.instance
+        val runtime = service?.runtimeHealth()
         val leds = JSONObject()
         for (name in LedController.allLeds) leds.put(name, LedController.getLed(name))
         val lastBabyEvent: Any = service?.babyLastEventAt() ?: JSONObject.NULL
@@ -698,6 +765,11 @@ class WebServer(
             .put("watching", service?.isWatching() == true)
             .put("privacy", state.privacyMode)
             .put("captureEnabled", state.captureEnabled)
+            .put("videoRuntimeState", runtime?.state ?: "unavailable")
+            .put("videoStandby", runtime?.state == "standby")
+            .put("videoWarmingUp", runtime?.warmingUp == true)
+            .put("activeVideoRequests", runtime?.activeRequests ?: 0)
+            .put("externalVideoDemands", runtime?.externalDemands ?: 0)
             .put("lensCoverClosed", state.lensCoverClosed)
             .put("guardianMode", service?.guardianOperatingMode()?.apiValue ?: GuardianOperatingMode.OFF.apiValue)
             .put(
@@ -732,6 +804,7 @@ class WebServer(
             .put("npuInferenceMs", service?.npuInferenceMs() ?: 0L)
             .put("npuAlertRefreshStatus", service?.npuAlertRefreshStatus() ?: "unavailable")
             .put("npuAlertRefreshAt", service?.npuAlertRefreshAt() ?: 0L)
+            .put("npuAlertRefreshDiagnostics", service?.npuAlertRefreshDiagnostics() ?: JSONObject())
             .put("poseAnalysisEnabled", state.poseAnalysisEnabled)
             .put("poseNotificationsEnabled", state.poseNotificationsEnabled)
             .put("poseDebugOverlayEnabled", state.poseDebugOverlayEnabled)

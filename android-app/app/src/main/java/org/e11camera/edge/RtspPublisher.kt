@@ -33,168 +33,198 @@ class RtspPublisher(
     }
 
     private val executor = Executors.newSingleThreadExecutor()
-    @Volatile private var running = AtomicBoolean(false)
-    @Volatile private var subscribed = false
+    private val running = AtomicBoolean(false)
+    private val lifecycleLock = Any()
+    private var stopped = false // lifecycleLock
+    private var activeSocket: Socket? = null // lifecycleLock
+    private var subscriberQueue: java.util.concurrent.LinkedBlockingQueue<EncodedFrame>? = null // lifecycleLock
+    private var attemptReachedRecord = false // publish executor only
     @Volatile
     var connected = false
         private set
 
     fun start() {
-        if (running.get()) return
-        running.set(true)
-        executor.submit { publishLoop() }
+        synchronized(lifecycleLock) {
+            if (stopped || !running.compareAndSet(false, true)) return
+            executor.submit { publishLoop() }
+        }
         Log.i(TAG, "RTSP 推流器启动 → $host:$port/$path")
     }
 
     private fun publishLoop() {
         var retryDelay = 1000L
-        while (running.get()) {
+        while (running.get() && !Thread.currentThread().isInterrupted) {
             try {
                 publishOnce()
                 retryDelay = 1000L
             } catch (e: Exception) {
-                val hadActiveSession = connected
-                connected = false
-                if (hadActiveSession) {
+                if (!running.get() || Thread.currentThread().isInterrupted || e is InterruptedException) {
+                    if (e is InterruptedException) Thread.currentThread().interrupt()
+                    break
+                }
+                if (attemptReachedRecord) {
                     retryDelay = 1000L
                 }
                 Log.w(TAG, "推流中断: ${e.message}，${retryDelay}ms 后重试")
-                if (subscribed) {
-                    subscriberQueue?.let { encoder.unsubscribe(it) }
-                    subscriberQueue = null
-                    subscribed = false
+                try {
+                    Thread.sleep(retryDelay)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    break
                 }
-                Thread.sleep(retryDelay)
                 retryDelay = minOf(retryDelay * 2, 10000)
             }
         }
     }
 
-    private var subscriberQueue: java.util.concurrent.LinkedBlockingQueue<EncodedFrame>? = null
-
     private fun publishOnce() {
         val socket = Socket()
-        socket.connect(InetSocketAddress(host, port), 5000)
-        socket.soTimeout = 10000
-        val os = socket.getOutputStream()
-        val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
-
-        // 等 SPS/PPS
-        var wait = 0
-        while (!encoder.hasSpsPps && wait < 100) {
-            Thread.sleep(50); wait++
-        }
-        val spsPps = encoder.getSpsPps()
-        if (spsPps.isEmpty()) throw Exception("无 SPS/PPS")
-
-        // 解析 SPS（提取 sps 用于 SDP）
-        val sps = extractNal(spsPps, 7) ?: throw Exception("无 SPS")
-        val pps = extractNal(spsPps, 8)
-        val spsB64 = base64Encode(sps)
-        val ppsB64 = if (pps != null) base64Encode(pps) else ""
-
-        // 构建 SDP
-        val sdp = buildSdp(spsB64, ppsB64)
-
-        // RTSP 握手
-        var cseq = 1
-        // OPTIONS
-        sendRtsp(os, "OPTIONS rtsp://$host:$port/$path RTSP/1.0", cseq++, "")
-        val optionsResp = readResponse(reader)
-        ensureOk("OPTIONS", optionsResp)
-        Log.d(TAG, "OPTIONS resp: ${optionsResp.take(100)}")
-        // ANNOUNCE
-        sendRtsp(os, "ANNOUNCE rtsp://$host:$port/$path RTSP/1.0", cseq++,
-            "Content-Type: application/sdp\r\nContent-Length: ${sdp.length}\r\n\r\n$sdp")
-        val announceResp = readResponse(reader)
-        ensureOk("ANNOUNCE", announceResp)
-        Log.d(TAG, "ANNOUNCE resp: ${announceResp.take(100)}")
-        // SETUP（TCP interleaved 模式）
-        val setupResp = sendAndRead(os, reader, cseq++,
-            "SETUP rtsp://$host:$port/$path/streamid=0 RTSP/1.0",
-            "Transport: RTP/AVP/TCP;unicast;interleaved=0-1;mode=record")
-        ensureOk("SETUP", setupResp)
-        Log.d(TAG, "SETUP resp: $setupResp")
-        val session = extractHeader(setupResp, "Session")?.split(";")?.get(0)
-            ?: throw Exception("无 Session: $setupResp")
-        Log.i(TAG, "RTSP 会话建立 session=$session")
-
-        // RECORD
-        sendRtsp(os, "RECORD rtsp://$host:$port/$path RTSP/1.0", cseq++,
-            "Session: $session\r\nRange: npt=0.000-")
-        val recordResp = readResponse(reader)
-        ensureOk("RECORD", recordResp)
-        connected = true
-
-        // gortsplib 会通过同一 TCP 连接发送 RTCP Receiver Report。
-        // 持续排空输入，避免长时间运行后接收缓冲区占满。
-        socket.soTimeout = 0
-        Thread({
-            val buf = ByteArray(2048)
-            try {
-                val input = socket.getInputStream()
-                while (running.get() && !socket.isClosed) {
-                    if (input.read(buf) < 0) break
-                }
-            } catch (_: Exception) {
-            }
-        }, "rtsp-rtcp-reader").apply {
-            isDaemon = true
-            start()
-        }
-
-        // 订阅编码器输出
-        subscriberQueue = encoder.subscribe()
-        subscribed = true
-
-        // TCP interleaved 模式：RTP 通过 RTSP TCP 连接发送
-        // 格式: '$' + channel(1B) + length(2B big-endian) + RTP data
-        val rtpPacker = RtpPacker()
-        val rtpChannel = 0 // video RTP channel
-
-        fun sendInterleaved(data: ByteArray) {
-            synchronized(os) {
-                val header = ByteArray(4)
-                header[0] = '$'.code.toByte()
-                header[1] = rtpChannel.toByte()
-                header[2] = ((data.size ushr 8) and 0xff).toByte()
-                header[3] = (data.size and 0xff).toByte()
-                os.write(header)
-                os.write(data)
-                os.flush()
-            }
-        }
-
-        var frameCount = 0
-        var fpsTime = System.currentTimeMillis()
-
-        while (running.get()) {
-            val frame = subscriberQueue?.poll(100, TimeUnit.MILLISECONDS) ?: continue
-            for (pkt in rtpPacker.packAccessUnit(frame.data, frame.presentationTimeUs)) {
-                sendInterleaved(pkt)
-            }
-
-            frameCount++
-            val now = System.currentTimeMillis()
-            if (now - fpsTime > 5000) {
-                val fps = frameCount * 1000.0 / (now - fpsTime)
-                Log.i(TAG, "推流帧率: ${"%.1f".format(fps)} fps")
-                frameCount = 0
-                fpsTime = now
-            }
-        }
-
-        // TEARDOWN
+        var queue: java.util.concurrent.LinkedBlockingQueue<EncodedFrame>? = null
+        attemptReachedRecord = false
         try {
-            sendRtsp(os, "TEARDOWN rtsp://$host:$port/$path RTSP/1.0", cseq++,
-                "Session: $session")
-        } catch (_: Exception) {}
-        socket.close()
-        connected = false
-        if (subscribed) {
-            subscriberQueue?.let { encoder.unsubscribe(it) }
-            subscriberQueue = null
-            subscribed = false
+            synchronized(lifecycleLock) {
+                if (!running.get() || stopped) return
+                // connect 前登记，让 stop 也能取消尚在握手/连接中的 socket。
+                activeSocket = socket
+            }
+            socket.connect(InetSocketAddress(host, port), 5000)
+            socket.soTimeout = 10000
+            val os = socket.getOutputStream()
+            val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
+
+            // 等 SPS/PPS
+            var wait = 0
+            while (running.get() && !encoder.hasSpsPps && wait < 100) {
+                Thread.sleep(50); wait++
+            }
+            if (!running.get()) return
+            val spsPps = encoder.getSpsPps()
+            if (spsPps.isEmpty()) throw Exception("无 SPS/PPS")
+
+            // 解析 SPS（提取 sps 用于 SDP）
+            val sps = extractNal(spsPps, 7) ?: throw Exception("无 SPS")
+            val pps = extractNal(spsPps, 8)
+            val spsB64 = base64Encode(sps)
+            val ppsB64 = if (pps != null) base64Encode(pps) else ""
+
+            // 构建 SDP
+            val sdp = buildSdp(spsB64, ppsB64)
+
+            // RTSP 握手
+            var cseq = 1
+            // OPTIONS
+            sendRtsp(os, "OPTIONS rtsp://$host:$port/$path RTSP/1.0", cseq++, "")
+            val optionsResp = readResponse(reader)
+            ensureOk("OPTIONS", optionsResp)
+            Log.d(TAG, "OPTIONS resp: ${optionsResp.take(100)}")
+            // ANNOUNCE
+            sendRtsp(os, "ANNOUNCE rtsp://$host:$port/$path RTSP/1.0", cseq++,
+                "Content-Type: application/sdp\r\nContent-Length: ${sdp.length}\r\n\r\n$sdp")
+            val announceResp = readResponse(reader)
+            ensureOk("ANNOUNCE", announceResp)
+            Log.d(TAG, "ANNOUNCE resp: ${announceResp.take(100)}")
+            // SETUP（TCP interleaved 模式）
+            val setupResp = sendAndRead(os, reader, cseq++,
+                "SETUP rtsp://$host:$port/$path/streamid=0 RTSP/1.0",
+                "Transport: RTP/AVP/TCP;unicast;interleaved=0-1;mode=record")
+            ensureOk("SETUP", setupResp)
+            Log.d(TAG, "SETUP resp: $setupResp")
+            val session = extractHeader(setupResp, "Session")?.split(";")?.get(0)
+                ?: throw Exception("无 Session: $setupResp")
+            Log.i(TAG, "RTSP 会话建立 session=$session")
+
+            // RECORD
+            sendRtsp(os, "RECORD rtsp://$host:$port/$path RTSP/1.0", cseq++,
+                "Session: $session\r\nRange: npt=0.000-")
+            val recordResp = readResponse(reader)
+            ensureOk("RECORD", recordResp)
+            synchronized(lifecycleLock) {
+                if (!running.get() || activeSocket !== socket) return
+                connected = true
+                attemptReachedRecord = true
+            }
+
+            // gortsplib 会通过同一 TCP 连接发送 RTCP Receiver Report。
+            // 持续排空输入，避免长时间运行后接收缓冲区占满。
+            socket.soTimeout = 0
+            Thread({
+                val buf = ByteArray(2048)
+                try {
+                    val input = socket.getInputStream()
+                    while (running.get() && !socket.isClosed) {
+                        if (input.read(buf) < 0) break
+                    }
+                } catch (_: Exception) {
+                }
+            }, "rtsp-rtcp-reader").apply {
+                isDaemon = true
+                start()
+            }
+
+            // 订阅编码器输出
+            val subscribedQueue = encoder.subscribe()
+            queue = subscribedQueue
+            synchronized(lifecycleLock) {
+                if (!running.get() || activeSocket !== socket) return
+                subscriberQueue = subscribedQueue
+            }
+            // 每次建立发布会话立即发 IDR，减少 cold start 等待自然关键帧的时间。
+            encoder.requestKeyFrame()
+
+            // TCP interleaved 模式：RTP 通过 RTSP TCP 连接发送
+            // 格式: '$' + channel(1B) + length(2B big-endian) + RTP data
+            val rtpPacker = RtpPacker()
+            val rtpChannel = 0 // video RTP channel
+
+            fun sendInterleaved(data: ByteArray) {
+                synchronized(os) {
+                    val header = ByteArray(4)
+                    header[0] = '$'.code.toByte()
+                    header[1] = rtpChannel.toByte()
+                    header[2] = ((data.size ushr 8) and 0xff).toByte()
+                    header[3] = (data.size and 0xff).toByte()
+                    os.write(header)
+                    os.write(data)
+                    os.flush()
+                }
+            }
+
+            var frameCount = 0
+            var fpsTime = System.currentTimeMillis()
+
+            while (running.get()) {
+                val frame = subscribedQueue.poll(100, TimeUnit.MILLISECONDS) ?: continue
+                for (pkt in rtpPacker.packAccessUnit(frame.data, frame.presentationTimeUs)) {
+                    sendInterleaved(pkt)
+                }
+
+                frameCount++
+                val now = System.currentTimeMillis()
+                if (now - fpsTime > 5000) {
+                    val fps = frameCount * 1000.0 / (now - fpsTime)
+                    Log.i(TAG, "推流帧率: ${"%.1f".format(fps)} fps")
+                    frameCount = 0
+                    fpsTime = now
+                }
+            }
+
+            // TEARDOWN
+            try {
+                sendRtsp(os, "TEARDOWN rtsp://$host:$port/$path RTSP/1.0", cseq++,
+                    "Session: $session")
+            } catch (_: Exception) {}
+        } finally {
+            synchronized(lifecycleLock) {
+                // 只摘掉本次资源，stop 或未来会话已换绑时不能清理新实例。
+                if (activeSocket === socket) {
+                    activeSocket = null
+                    connected = false
+                }
+                if (subscriberQueue === queue) subscriberQueue = null
+            }
+            queue?.let { encoder.unsubscribe(it) }
+            // 关闭输入端会解除 RTCP reader 的 read，也覆盖握手失败和线程中断。
+            try { socket.close() } catch (_: Exception) { }
         }
     }
 
@@ -300,13 +330,19 @@ class RtspPublisher(
     }
 
     fun stop() {
-        running.set(false)
-        connected = false
-        if (subscribed) {
-            subscriberQueue?.let { encoder.unsubscribe(it) }
+        val socket: Socket?
+        val queue: java.util.concurrent.LinkedBlockingQueue<EncodedFrame>?
+        synchronized(lifecycleLock) {
+            stopped = true
+            running.set(false)
+            connected = false
+            socket = activeSocket
+            activeSocket = null
+            queue = subscriberQueue
             subscriberQueue = null
-            subscribed = false
         }
+        queue?.let { encoder.unsubscribe(it) }
+        try { socket?.close() } catch (_: Exception) { }
         executor.shutdownNow()
         Log.i(TAG, "RTSP 推流器停止")
     }
