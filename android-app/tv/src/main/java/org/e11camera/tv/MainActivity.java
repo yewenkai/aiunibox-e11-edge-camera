@@ -28,7 +28,6 @@ import androidx.media3.ui.AspectRatioFrameLayout;
 /** 电视端原生 WebRTC 接收器，RTSP 可在菜单手动选择。 */
 @androidx.media3.common.util.UnstableApi
 public final class MainActivity extends Activity {
-    private static final String DEFAULT_ENDPOINT = "";
     private final Handler handler = new Handler(Looper.getMainLooper());
     private NativeRtcPlayer rtc;
     private PlayerView nativeView;
@@ -37,7 +36,9 @@ public final class MainActivity extends Activity {
     private int playbackGeneration;
     private TextView status;
     private boolean active;
-    private boolean menuOpen;
+    private AlertDialog menuDialog;
+    private AlertDialog addressDialog;
+    private boolean initialAddressPrompted;
     private boolean muted = true;
     private boolean fill;
     private long lastProgress;
@@ -46,10 +47,14 @@ public final class MainActivity extends Activity {
     private final java.util.concurrent.ExecutorService motorRequests = java.util.concurrent.Executors.newSingleThreadExecutor();
     private volatile boolean motorBusy;
     private long lastMotorAt = -1000;
-    private final Runnable hideStatus = () -> status.setVisibility(View.GONE);
+    private final Runnable hideStatus = () -> { if (hasEndpoint()) status.setVisibility(View.GONE); };
     private final Runnable watchdog = new Runnable() {
         @Override public void run() {
             if (!active) return;
+            if (!hasEndpoint() || hasOpenDialog()) {
+                handler.postDelayed(this, 3000);
+                return;
+            }
             if (useRtsp) {
                 if (nativePlayer != null) {
                     double position = nativePlayer.getCurrentPosition();
@@ -73,8 +78,9 @@ public final class MainActivity extends Activity {
             | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
             | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
             | View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
-        endpoint = getPreferences(MODE_PRIVATE).getString("endpoint", DEFAULT_ENDPOINT);
-        if (endpoint == null || endpoint.trim().isEmpty()) endpoint = DEFAULT_ENDPOINT;
+        endpoint = getPreferences(MODE_PRIVATE).getString("endpoint", "");
+        endpoint = endpoint == null ? "" : endpoint.trim();
+        initialAddressPrompted = state != null && state.getBoolean("initialAddressPrompted", false);
         FrameLayout root = new FrameLayout(this);
         root.setBackgroundColor(Color.BLACK);
         rtc = new NativeRtcPlayer(this, message -> { if (active && !useRtsp) showStatus(message); });
@@ -96,7 +102,8 @@ public final class MainActivity extends Activity {
     }
 
     private void loadStream() {
-        if (endpoint.isEmpty()) return;
+        if (!hasEndpoint()) { showUnconfigured(); return; }
+        if (!active || hasOpenDialog()) return;
         playbackGeneration++;
         lastProgress = SystemClock.elapsedRealtime();
         lastTime = -1;
@@ -157,19 +164,30 @@ public final class MainActivity extends Activity {
     }
 
     private void showStatus(String text) {
+        if (!hasEndpoint()) { showUnconfigured(); return; }
         status.setText(text);
         status.setVisibility(View.VISIBLE);
         handler.removeCallbacks(hideStatus);
         handler.postDelayed(hideStatus, 7000);
     }
 
+    private boolean hasEndpoint() { return endpoint != null && !endpoint.isEmpty(); }
+
+    private boolean hasOpenDialog() { return menuDialog != null || addressDialog != null; }
+
+    private void showUnconfigured() {
+        handler.removeCallbacks(hideStatus);
+        status.setText("未设置设备地址 · 按确认键或菜单键打开菜单设置");
+        status.setVisibility(View.VISIBLE);
+    }
+
     private void menu() {
-        if (menuOpen) return;
-        menuOpen = true;
-        new AlertDialog.Builder(this).setTitle("宝宝监控 · " + (useRtsp ? "原生 RTSP" : "WebRTC"))
+        if (hasOpenDialog()) return;
+        AlertDialog dialog = new AlertDialog.Builder(this).setTitle("宝宝监控 · " + (useRtsp ? "原生 RTSP" : "WebRTC"))
             .setItems(new String[]{"重新连接", "设置设备地址", fill ? "显示完整画面" : "铺满屏幕（裁剪边缘）",
-                muted ? "打开流内声音" : "静音", "退出应用", useRtsp ? "重新尝试 WebRTC" : "切换原生 RTSP"}, (dialog, which) -> {
-                menuOpen = false;
+                muted ? "打开流内声音" : "静音", "退出应用", useRtsp ? "重新尝试 WebRTC" : "切换原生 RTSP"}, (selected, which) -> {
+                menuDialog = null;
+                selected.dismiss();
                 switch (which) {
                     case 0: loadStream(); break;
                     case 1: editAddress(); break;
@@ -179,10 +197,14 @@ public final class MainActivity extends Activity {
                     case 5: useRtsp = !useRtsp; loadStream(); break;
                     default: break;
                 }
-            }).setOnDismissListener(dialog -> menuOpen = false).show();
+            }).create();
+        dialog.setOnDismissListener(ignored -> { if (menuDialog == dialog) menuDialog = null; });
+        menuDialog = dialog;
+        dialog.show();
     }
 
     private void editAddress() {
+        if (addressDialog != null || isFinishing() || isDestroyed()) return;
         EditText input = new EditText(this);
         input.setSingleLine(true);
         input.setText(endpoint);
@@ -190,6 +212,11 @@ public final class MainActivity extends Activity {
         AlertDialog dialog = new AlertDialog.Builder(this).setTitle("设置设备地址")
             .setMessage("输入控制页地址将自动使用同设备的 8889/cam/ WebRTC。也可输入完整 WebRTC 播放页地址。")
             .setView(input).setPositiveButton("保存并播放", null).setNegativeButton("取消", null).create();
+        addressDialog = dialog;
+        dialog.setOnDismissListener(ignored -> {
+            if (addressDialog == dialog) addressDialog = null;
+            if (!hasEndpoint()) showUnconfigured();
+        });
         dialog.setOnShowListener(ignored -> dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> {
             try {
                 String raw = input.getText().toString().trim();
@@ -198,6 +225,7 @@ public final class MainActivity extends Activity {
                 if (!"http".equals(uri.getScheme()) || uri.getHost() == null || uri.getUserInfo() != null
                     || uri.getQuery() != null || uri.getFragment() != null) throw new IllegalArgumentException();
                 int port = uri.getPort();
+                if (port == 0 || port > 65535) throw new IllegalArgumentException();
                 String path = uri.getPath();
                 if (port == -1 || port == 8080) { port = 8889; path = "/cam/"; }
                 else if (path == null || path.isEmpty() || path.equals("/")) path = "/cam/";
@@ -205,8 +233,9 @@ public final class MainActivity extends Activity {
                 endpoint = new URI("http", null, uri.getHost(), port, path, null, null).toString();
                 useRtsp = false;
                 getPreferences(MODE_PRIVATE).edit().putString("endpoint", endpoint).apply();
-                loadStream();
+                addressDialog = null;
                 dialog.dismiss();
+                loadStream();
             } catch (Exception exception) {
                 input.setError("请输入有效的局域网 HTTP 地址");
             }
@@ -215,9 +244,10 @@ public final class MainActivity extends Activity {
     }
 
     @Override public boolean onKeyDown(int keyCode, KeyEvent event) {
+        if (hasOpenDialog()) return super.onKeyDown(keyCode, event);
         if (keyCode == KeyEvent.KEYCODE_DPAD_LEFT || keyCode == KeyEvent.KEYCODE_DPAD_RIGHT) {
             // 只响应点按首次事件；系统长按重复事件不积压运动命令。
-            if (event.getRepeatCount() == 0 && active && !menuOpen) moveMotor(keyCode == KeyEvent.KEYCODE_DPAD_LEFT);
+            if (event.getRepeatCount() == 0 && active) moveMotor(keyCode == KeyEvent.KEYCODE_DPAD_LEFT);
             return true;
         }
         if (keyCode == KeyEvent.KEYCODE_DPAD_CENTER || keyCode == KeyEvent.KEYCODE_ENTER
@@ -229,11 +259,14 @@ public final class MainActivity extends Activity {
     }
 
     @Override public boolean onKeyUp(int keyCode, KeyEvent event) {
+        if (hasOpenDialog()) return super.onKeyUp(keyCode, event);
         if (keyCode == KeyEvent.KEYCODE_DPAD_LEFT || keyCode == KeyEvent.KEYCODE_DPAD_RIGHT) return true;
         return super.onKeyUp(keyCode, event);
     }
 
     private void moveMotor(boolean left) {
+        if (!hasEndpoint()) { showUnconfigured(); return; }
+        if (!active || hasOpenDialog()) return;
         long now = SystemClock.elapsedRealtime();
         if (motorBusy || now - lastMotorAt < 450) return;
         final String address;
@@ -271,7 +304,14 @@ public final class MainActivity extends Activity {
     @Override protected void onResume() {
         super.onResume();
         active = true;
-        loadStream();
+        if (hasEndpoint()) loadStream();
+        else {
+            showUnconfigured();
+            if (!initialAddressPrompted) {
+                initialAddressPrompted = true;
+                editAddress();
+            }
+        }
         handler.removeCallbacks(watchdog);
         handler.postDelayed(watchdog, 3000);
     }
@@ -287,8 +327,15 @@ public final class MainActivity extends Activity {
 
     @Override protected void onDestroy() {
         handler.removeCallbacksAndMessages(null);
+        if (menuDialog != null) menuDialog.dismiss();
+        if (addressDialog != null) addressDialog.dismiss();
         rtc.release();
         motorRequests.shutdown();
         super.onDestroy();
+    }
+
+    @Override protected void onSaveInstanceState(Bundle outState) {
+        outState.putBoolean("initialAddressPrompted", initialAddressPrompted);
+        super.onSaveInstanceState(outState);
     }
 }

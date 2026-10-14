@@ -34,6 +34,7 @@ calibration/
 captures/
 device-data/
 guardian-events/
+diagnostics/
 
 # Do not commit third-party firmware, extracted applications or native binaries.
 apk/

@@ -22,7 +22,7 @@
 alias: 中屏摄像头在家隐私
 triggers:
   - trigger: state
-    entity_id: person.yewenkai
+    entity_id: person.example
 actions:
   - choose:
       - conditions: "{{ trigger.to_state.state == 'home' }}"
@@ -45,7 +45,7 @@ mode: restart
 alias: 扫地机异常时查看充电座
 triggers:
   - trigger: state
-    entity_id: vacuum.mijia_m40
+    entity_id: vacuum.example
     to: error
 actions:
   - action: button.press
@@ -62,9 +62,9 @@ mode: single
 
 ## 观看提示
 
-设备侧默认在 MediaMTX 检测到读取者时点亮 camera LED。Home Assistant 中还可以用
-“正在观看”二元传感器触发手机通知或状态灯，但不建议在频繁打开仪表盘的场景中
-启用通知，以免产生噪声。
+设备侧全部可控指示灯默认关闭，MediaMTX 检测到读取者时也不会自动亮灯。
+“正在观看”二元传感器仅报告观看状态；如果自行在 Home Assistant 中添加通知或灯光
+自动化，这些动作由该自动化控制。希望保持全关灯时，不要配置观看联动灯光。
 
 ## 已知边界
 

@@ -78,9 +78,8 @@ dependencies {
     implementation "androidx.compose.material3:material3"
     implementation "androidx.compose.material:material-icons-extended"
 
-    // HTTP + WebSocket server（局域网双向语音）
+    // 局域网 HTTP 控制服务；网页语音对讲已移除。
     implementation 'org.nanohttpd:nanohttpd:2.3.1'
-    implementation 'org.nanohttpd:nanohttpd-websocket:2.3.1'
 
     // 哭声分类（YAMNet 本地推理）
     implementation 'org.tensorflow:tensorflow-lite:2.14.0'
